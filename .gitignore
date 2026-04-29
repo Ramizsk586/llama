@@ -1,0 +1,12 @@
+env.yml
+__pycache__
+llama.dev.log
+llama.log
+llama.pid
+llama.pi.closed
+tmp*/
+.test_tmp/
+dist
+build
+llama.spec
+llama_bridge.egg-info
