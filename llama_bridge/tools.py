@@ -104,6 +104,7 @@ class ToolRegistry:
         self.config = config
         self._client = httpx.AsyncClient(timeout=30.0)
         self._tools: dict[str, ToolDefinition] = {}
+        self._unavailable_tools: dict[str, str] = {}
         self._cache = ToolCache()
         if config.tools.enabled:
             self._register_default_tools()
@@ -117,11 +118,13 @@ class ToolRegistry:
     def openai_tools(self) -> list[dict[str, Any]]:
         return [tool.as_openai_tool() for tool in self._tools.values()]
 
+    def unavailable_tools(self) -> dict[str, str]:
+        return dict(self._unavailable_tools)
+
     async def call(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         tool = self._tools.get(name)
         if tool is None:
-            available = ", ".join(sorted(self._tools))
-            raise KeyError(f"Unknown tool '{name}'. Available tools: {available}")
+            raise KeyError(self._unknown_tool_message(name))
         return await tool.handler(arguments or {})
 
     async def call_structured(
@@ -133,8 +136,7 @@ class ToolRegistry:
         started_at = datetime.now(UTC)
         try:
             if name not in self._tools:
-                available = ", ".join(sorted(self._tools))
-                raise UnknownToolError(f"Unknown tool '{name}'. Available tools: {available}")
+                raise UnknownToolError(self._unknown_tool_message(name))
             validated_args = validate_tool_arguments(name, arguments or {})
             cache_key = self._cache_key(name, validated_args)
             if cache_key:
@@ -169,6 +171,17 @@ class ToolRegistry:
         body = json.dumps(arguments, sort_keys=True, ensure_ascii=True, default=str)
         return hashlib.sha256(f"{name}:{body}".encode("utf-8")).hexdigest()
 
+    def _unknown_tool_message(self, name: str) -> str:
+        available = ", ".join(sorted(self._tools)) or "none"
+        message = f"Unknown tool '{name}'. Available tools: {available}"
+        if self._unavailable_tools:
+            unavailable = ", ".join(
+                f"{tool_name} ({reason})"
+                for tool_name, reason in sorted(self._unavailable_tools.items())
+            )
+            message = f"{message}. Unavailable tools: {unavailable}"
+        return message
+
     async def _request_with_retries(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         last_exc: Exception | None = None
         for attempt in range(3):
@@ -191,10 +204,13 @@ class ToolRegistry:
     def _register(self, tool: ToolDefinition, *, provider: ExternalToolProviderConfig | None = None) -> None:
         include = self.config.tools.include
         if include and tool.name not in include:
+            self._unavailable_tools[tool.name] = "not included by tools.include"
             return
         if provider is not None and not provider.enabled:
+            self._unavailable_tools[tool.name] = "provider disabled"
             return
         self._tools[tool.name] = tool
+        self._unavailable_tools.pop(tool.name, None)
 
     def _register_default_tools(self) -> None:
         self._register(
@@ -432,97 +448,96 @@ class ToolRegistry:
             ),
             provider=self.config.tools.tavily,
         )
-        if self.config.tools.serpapi.enabled or self.config.tools.tavily.enabled:
-            self._register(
-                ToolDefinition(
-                    name="source_research",
-                    description=(
-                        "Advanced source-backed research using SerpAPI and Tavily together, followed by parallel source verification workers.\n"
-                        "USE WHEN: User asks for current, high-stakes, source-backed, markdown/report, buying, travel, technical, or factual answers that need citations.\n"
-                        "GUARDRAILS: Treat results as evidence, not truth. Prefer primary/official sources. If fewer than the requested number of independent sources verify the topic, say evidence is insufficient.\n"
-                        "RESULT FORMAT: Verified source records, rejected/weak records, optional image candidates, and a conservative verdict for use in final answers."
-                    ),
-                    parameters={
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Research question or search query to investigate.",
-                            },
-                            "max_results": {
-                                "type": "integer",
-                                "description": "Maximum results to gather from each provider (1-10).",
-                                "default": 5,
-                                "minimum": 1,
-                                "maximum": 10,
-                            },
-                            "required_verified_sources": {
-                                "type": "integer",
-                                "description": "Minimum independent reachable sources required before the result is considered well-supported.",
-                                "default": 2,
-                                "minimum": 1,
-                                "maximum": 5,
-                            },
-                            "include_images": {
-                                "type": "boolean",
-                                "description": "Also collect image candidates with source/provenance metadata.",
-                                "default": False,
-                            },
-                            "include_domains": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional domains to prefer/include when Tavily is configured.",
-                            },
-                            "exclude_domains": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional domains to exclude when Tavily is configured.",
-                            },
+        self._register(
+            ToolDefinition(
+                name="source_research",
+                description=(
+                    "Advanced source-backed research using SerpAPI and Tavily together, followed by parallel source verification workers.\n"
+                    "USE WHEN: User asks for current, high-stakes, source-backed, markdown/report, buying, travel, technical, or factual answers that need citations.\n"
+                    "GUARDRAILS: Treat results as evidence, not truth. Prefer primary/official sources. If fewer than the requested number of independent sources verify the topic, say evidence is insufficient.\n"
+                    "RESULT FORMAT: Verified source records, rejected/weak records, optional image candidates, and a conservative verdict for use in final answers."
+                ),
+                parameters={
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Research question or search query to investigate.",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum results to gather from each provider (1-10).",
+                            "default": 5,
+                            "minimum": 1,
+                            "maximum": 10,
+                        },
+                        "required_verified_sources": {
+                            "type": "integer",
+                            "description": "Minimum independent reachable sources required before the result is considered well-supported.",
+                            "default": 2,
+                            "minimum": 1,
+                            "maximum": 5,
+                        },
+                        "include_images": {
+                            "type": "boolean",
+                            "description": "Also collect image candidates with source/provenance metadata.",
+                            "default": False,
+                        },
+                        "include_domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional domains to prefer/include when Tavily is configured.",
+                        },
+                        "exclude_domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional domains to exclude when Tavily is configured.",
                         },
                     },
-                    handler=self._source_research,
-                )
+                },
+                handler=self._source_research,
             )
-            self._register(
-                ToolDefinition(
-                    name="image_research",
-                    description=(
-                        "Find images for markdown/report generation using Tavily image results and SerpAPI image search.\n"
-                        "USE WHEN: The model needs image URLs with provenance for a .md file, article, report, product/place/person page, or visual comparison.\n"
-                        "GUARDRAILS: Do not invent image URLs. Use returned image_url/thumbnail/source_url only. Prefer images with a source page and cite that page near the image in markdown.\n"
-                        "RESULT FORMAT: Image candidates with title, image URL, thumbnail, source page, provider, and markdown embed examples."
-                    ),
-                    parameters={
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Image search query, ideally including the subject and needed visual style/context.",
-                            },
-                            "max_results": {
-                                "type": "integer",
-                                "description": "Maximum image candidates to return (1-20).",
-                                "default": 8,
-                                "minimum": 1,
-                                "maximum": 20,
-                            },
-                            "include_domains": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional domains to prefer/include when Tavily is configured.",
-                            },
-                            "exclude_domains": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional domains to exclude when Tavily is configured.",
-                            },
+        )
+        self._register(
+            ToolDefinition(
+                name="image_research",
+                description=(
+                    "Find images for markdown/report generation using Tavily image results and SerpAPI image search.\n"
+                    "USE WHEN: The model needs image URLs with provenance for a .md file, article, report, product/place/person page, or visual comparison.\n"
+                    "GUARDRAILS: Do not invent image URLs. Use returned image_url/thumbnail/source_url only. Prefer images with a source page and cite that page near the image in markdown.\n"
+                    "RESULT FORMAT: Image candidates with title, image URL, thumbnail, source page, provider, and markdown embed examples."
+                ),
+                parameters={
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Image search query, ideally including the subject and needed visual style/context.",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum image candidates to return (1-20).",
+                            "default": 8,
+                            "minimum": 1,
+                            "maximum": 20,
+                        },
+                        "include_domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional domains to prefer/include when Tavily is configured.",
+                        },
+                        "exclude_domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional domains to exclude when Tavily is configured.",
                         },
                     },
-                    handler=self._image_research,
-                )
+                },
+                handler=self._image_research,
             )
+        )
         self._register(
             ToolDefinition(
                 name="verify_sources",

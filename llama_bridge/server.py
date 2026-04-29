@@ -1470,10 +1470,12 @@ def _with_tool_instructions(
 def _bridge_tools_response(registry: ToolRegistry) -> dict[str, Any]:
     tools = registry.list_tools()
     openai_tools = registry.openai_tools()
+    unavailable_tools = registry.unavailable_tools()
     return {
         "object": "list",
         "tools": tools,
         "data": tools,
+        "unavailable_tools": unavailable_tools,
         "openai_tools": openai_tools,
         "ollama_tools": openai_tools,
         "anthropic_tools": [
@@ -3354,15 +3356,28 @@ async def _call_bridge_tool(
     arguments: dict[str, Any],
 ) -> JSONResponse:
     if name not in app.state.tools._tools:
-        available = ", ".join(sorted(app.state.tools._tools))
+        available = ", ".join(sorted(app.state.tools._tools)) or "none"
+        unavailable_tools = app.state.tools.unavailable_tools()
+        detail = f"Unknown tool '{name}'. Available tools: {available}"
+        if unavailable_tools:
+            unavailable = ", ".join(
+                f"{tool_name} ({reason})"
+                for tool_name, reason in sorted(unavailable_tools.items())
+            )
+            detail = f"{detail}. Unavailable tools: {unavailable}"
         _write_dev_log(
             app.state.bridge_config,
             "direct_tool_unknown",
-            {"tool": name, "arguments": arguments, "available_tools": sorted(app.state.tools._tools)},
+            {
+                "tool": name,
+                "arguments": arguments,
+                "available_tools": sorted(app.state.tools._tools),
+                "unavailable_tools": unavailable_tools,
+            },
         )
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown tool '{name}'. Available tools: {available}",
+            detail=detail,
         )
     structured = await app.state.tools.call_structured(name, arguments)
     _write_dev_log(

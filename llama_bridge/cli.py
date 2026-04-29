@@ -1336,10 +1336,19 @@ def _cmd_tools_list(config_path: Path) -> None:
             ]
         )
         print()
+        if tools:
+            print("available:")
         for tool in tools:
             function = tool["function"]
             print(f"- {function['name']}")
             print(f"  {function.get('description', '').splitlines()[0]}")
+        unavailable = registry.unavailable_tools()
+        if unavailable:
+            print()
+            print("unavailable:")
+            for name, reason in sorted(unavailable.items()):
+                print(f"- {name}")
+                print(f"  {reason}")
     finally:
         asyncio.run(registry.aclose())
 
