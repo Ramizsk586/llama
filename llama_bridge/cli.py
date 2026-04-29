@@ -2473,11 +2473,16 @@ function formatImageResults(result: any) {{
     image.provider ? `   Provider: ${{image.provider}}` : "",
   ].filter(Boolean).join("\\n"));
   if (examples.length) {{
+    if (result.markdown_css) {{
+      lines.push("", "Compact image CSS:", result.markdown_css);
+    }}
     lines.push("", "Markdown examples:");
-    for (const item of examples.slice(0, 5)) {{
+    lines.push('<div class="image-grid">');
+    for (const item of examples.slice(0, 3)) {{
       lines.push(item.markdown ?? pretty(item));
       if (item.source_note) lines.push(item.source_note);
     }}
+    lines.push("</div>");
   }}
   if (Array.isArray(result.guardrails) && result.guardrails.length) {{
     lines.push("", "Guardrails:", ...result.guardrails.map((item: string) => `- ${{item}}`));
@@ -2721,17 +2726,17 @@ export default function (pi: ExtensionAPI) {{
   pi.registerTool({{
     name: "image_research",
     label: "Image Research",
-    description: "Find image candidates with source/provenance metadata through Tavily and SerpAPI via the local llama bridge.",
+    description: "Find 2-3 compact image candidates with source/provenance metadata. SerpAPI image search is used only as fallback when the preferred image path fails or returns no images.",
     parameters: Type.Object({{
       query: Type.String({{ description: "Image search query, including subject and visual context." }}),
-      max_results: Type.Optional(Type.Number({{ description: "Maximum image candidates to return.", default: 8 }})),
+      max_results: Type.Optional(Type.Number({{ description: "Maximum image candidates to return.", default: 3 }})),
       include_domains: Type.Optional(Type.Array(Type.String({{ description: "Optional domains to include or prefer." }}))),
       exclude_domains: Type.Optional(Type.Array(Type.String({{ description: "Optional domains to exclude." }}))),
     }}),
     async execute(_toolCallId, params, signal) {{
       const result = await callBridgeTool("image_research", {{
         query: params.query,
-        max_results: params.max_results ?? 8,
+        max_results: params.max_results ?? 3,
         include_domains: params.include_domains,
         exclude_domains: params.exclude_domains,
       }}, signal);
@@ -2749,6 +2754,197 @@ export default function (pi: ExtensionAPI) {{
     }},
   }});
 
+  function commandSignal(ctx: any): AbortSignal {{
+    return ctx?.signal ?? new AbortController().signal;
+  }}
+
+  function sendCommandResult(title: string, text: string, details: unknown) {{
+    pi.sendMessage({{
+      customType: "llama_bridge_tool_result",
+      content: `## ${{title}}\\n\\n${{text}}`,
+      display: true,
+      details,
+    }}, {{ triggerTurn: false }});
+  }}
+
+  async function sendToolCommand(args: string, ctx: any, options: {{
+    title: string;
+    placeholder: string;
+    emptyMessage: string;
+    execute: (input: string, signal: AbortSignal) => Promise<{{ text: string; details: unknown }}>;
+  }}) {{
+    let input = args.trim();
+    if (!input) {{
+      const entered = await ctx.ui.input(options.title, options.placeholder);
+      input = String(entered ?? "").trim();
+      if (!input) {{
+        ctx.ui.notify(options.emptyMessage, "warning");
+        return;
+      }}
+    }}
+    try {{
+      ctx.ui.notify(`${{options.title}} running...`, "info");
+      const result = await options.execute(input, commandSignal(ctx));
+      sendCommandResult(options.title, result.text, result.details);
+    }} catch (error) {{
+      ctx.ui.notify(`${{options.title}} failed: ${{String(error)}}`, "error");
+    }}
+  }}
+
+  function registerToolCommand(name: string, description: string, options: {{
+    title: string;
+    placeholder: string;
+    emptyMessage: string;
+    execute: (input: string, signal: AbortSignal) => Promise<{{ text: string; details: unknown }}>;
+  }}) {{
+    pi.registerCommand(name, {{
+      description,
+      handler: async (args, ctx) => sendToolCommand(args, ctx, options),
+    }});
+  }}
+
+  registerToolCommand("web", "Run llama bridge web_search", {{
+    title: "Web search query",
+    placeholder: "Search query",
+    emptyMessage: "Web search cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await postJson("/api/web_search", {{ query: input, max_results: 5 }}, signal);
+      return {{ text: formatSearchResults(details.results || []) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("web_search", "Run llama bridge web_search", {{
+    title: "Web search query",
+    placeholder: "Search query",
+    emptyMessage: "Web search cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await postJson("/api/web_search", {{ query: input, max_results: 5 }}, signal);
+      return {{ text: formatSearchResults(details.results || []) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("fetch", "Fetch a URL through llama bridge web_fetch", {{
+    title: "URL to fetch",
+    placeholder: "https://example.com/page",
+    emptyMessage: "Web fetch cancelled: no URL entered.",
+    execute: async (input, signal) => {{
+      const details = await postJson("/api/web_fetch", {{ url: input }}, signal);
+      const text = details.text ? String(details.text).slice(0, 12000) : pretty(details);
+      return {{ text, details }};
+    }},
+  }});
+  registerToolCommand("serp", "Run SerpAPI search through llama bridge", {{
+    title: "SerpAPI search query",
+    placeholder: "Search query",
+    emptyMessage: "SerpAPI search cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("serpapi_search", {{ query: input, num: 5 }}, signal);
+      const errorText = toolErrorText("serpapi_search", details);
+      return {{ text: errorText || formatSearchResults(details.organic_results || details.results || []) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("serp_search", "Run SerpAPI search through llama bridge", {{
+    title: "SerpAPI search query",
+    placeholder: "Search query",
+    emptyMessage: "SerpAPI search cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("serpapi_search", {{ query: input, num: 5 }}, signal);
+      const errorText = toolErrorText("serpapi_search", details);
+      return {{ text: errorText || formatSearchResults(details.organic_results || details.results || []) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("serp-sarch", "Alias for /serp_search", {{
+    title: "SerpAPI search query",
+    placeholder: "Search query",
+    emptyMessage: "SerpAPI search cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("serpapi_search", {{ query: input, num: 5 }}, signal);
+      const errorText = toolErrorText("serpapi_search", details);
+      return {{ text: errorText || formatSearchResults(details.organic_results || details.results || []) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("tavily", "Run Tavily search through llama bridge", {{
+    title: "Tavily search query",
+    placeholder: "Search query",
+    emptyMessage: "Tavily search cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("tavily_search", {{ query: input, max_results: 5, include_answer: true }}, signal);
+      const errorText = toolErrorText("tavily_search", details);
+      const answer = details.answer ? `Answer:\\n${{details.answer}}\\n\\n` : "";
+      return {{ text: errorText || answer + (formatSearchResults(details.results || []) || pretty(details)), details }};
+    }},
+  }});
+  registerToolCommand("image", "Run image_research through llama bridge", {{
+    title: "Image research query",
+    placeholder: "Image search query",
+    emptyMessage: "Image research cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("image_research", {{ query: input, max_results: 3 }}, signal);
+      const errorText = toolErrorText("image_research", details);
+      return {{ text: errorText || formatImageResults(details) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("image_search", "Run image_research through llama bridge", {{
+    title: "Image research query",
+    placeholder: "Image search query",
+    emptyMessage: "Image research cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("image_research", {{ query: input, max_results: 3 }}, signal);
+      const errorText = toolErrorText("image_research", details);
+      return {{ text: errorText || formatImageResults(details) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("image-sarch", "Alias for /image_search", {{
+    title: "Image research query",
+    placeholder: "Image search query",
+    emptyMessage: "Image research cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("image_research", {{ query: input, max_results: 3 }}, signal);
+      const errorText = toolErrorText("image_research", details);
+      return {{ text: errorText || formatImageResults(details) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("wiki", "Search Wikipedia through llama bridge", {{
+    title: "Wikipedia search query",
+    placeholder: "Topic or title",
+    emptyMessage: "Wikipedia search cancelled: no query entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("wikipedia_search", {{ query: input, limit: 5, language: "en" }}, signal);
+      const errorText = toolErrorText("wikipedia_search", details);
+      return {{ text: errorText || formatSearchResults(details.results || []) || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("wiki_page", "Fetch a Wikipedia page through llama bridge", {{
+    title: "Wikipedia page title",
+    placeholder: "Exact page title",
+    emptyMessage: "Wikipedia page cancelled: no title entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("wikipedia_page", {{ title: input, language: "en" }}, signal);
+      const errorText = toolErrorText("wikipedia_page", details);
+      const text = details.summary ? `${{details.title || input}}\\n${{details.url || ""}}\\n\\n${{details.summary}}` : pretty(details);
+      return {{ text: errorText || text, details }};
+    }},
+  }});
+  registerToolCommand("weather", "Get current weather through llama bridge", {{
+    title: "Weather location",
+    placeholder: "City or place",
+    emptyMessage: "Weather lookup cancelled: no location entered.",
+    execute: async (input, signal) => {{
+      const details = await callBridgeTool("weather_current", {{ location: input }}, signal);
+      const errorText = toolErrorText("weather_current", details);
+      return {{ text: errorText || pretty(details), details }};
+    }},
+  }});
+  registerToolCommand("time", "Get current time through llama bridge", {{
+    title: "Timezone or country",
+    placeholder: "Asia/Calcutta, UTC, or a country",
+    emptyMessage: "Time lookup cancelled: no timezone or country entered.",
+    execute: async (input, signal) => {{
+      const looksLikeTimezone = input.includes("/") || input.toUpperCase() === "UTC" || /^[+-]\\d{{2}}:?\\d{{2}}$/.test(input);
+      const details = await callBridgeTool("datetime_now", looksLikeTimezone ? {{ timezone: input }} : {{ country: input }}, signal);
+      const errorText = toolErrorText("datetime_now", details);
+      return {{ text: errorText || pretty(details), details }};
+    }},
+  }});
+
 }}
 """
 
@@ -2761,14 +2957,88 @@ import {{ Type }} from "typebox";
 
 const BRIDGE_URL = {json.dumps(bridge_url)};
 const API_KEY = {json.dumps(api_key)};
+const SOLID_SOURCE_GUIDE = [
+  "Prefer primary/official sources: government departments, election commissions, courts, regulators, police/health/education agencies, company filings, official datasets, parliamentary records, central-bank/statistics offices, and original reports.",
+  "Prefer international institutions when relevant: UN agencies, World Bank, IMF, OECD, WHO, WTO, IEA, IPCC, ILO, UNESCO, and recognized regional bodies.",
+  "Prefer academic and research sources when relevant: peer-reviewed papers, university pages, SSRN/arXiv with caution, think-tank reports with named authors and methodology, official survey datasets, and reputable fact-checkers.",
+  "Prefer established news/wire sources for current events: Reuters, Associated Press, AFP, BBC, NPR, PBS, Financial Times, The Economist, The Guardian, New York Times, Washington Post, Wall Street Journal, Bloomberg, CNBC, Al Jazeera, DW, France24, Nikkei Asia, The Hindu, Indian Express, Hindustan Times, NDTV, India Today, Scroll, The Wire, Frontline, LiveMint, Business Standard, and Economic Times when relevant.",
+  "Avoid using low-quality sources as main evidence: SEO pages, copied press releases, anonymous blogs, social-media posts, YouTube-only commentary, forums, content farms, AI-generated summaries, and pages without author/date/source transparency.",
+].join("\\n");
+
+const PREFERRED_SOURCE_DOMAINS = [
+  "reuters.com", "apnews.com", "afp.com", "bbc.com", "bbc.co.uk", "npr.org", "pbs.org",
+  "ft.com", "economist.com", "theguardian.com", "nytimes.com", "washingtonpost.com",
+  "wsj.com", "bloomberg.com", "cnbc.com", "aljazeera.com", "dw.com", "france24.com",
+  "nikkei.com", "thehindu.com", "indianexpress.com", "hindustantimes.com", "ndtv.com",
+  "indiatoday.in", "scroll.in", "thewire.in", "frontline.thehindu.com", "livemint.com",
+  "business-standard.com", "economictimes.indiatimes.com", "pib.gov.in", "eci.gov.in",
+  "rbi.org.in", "mospi.gov.in", "data.gov.in", "prsindia.org", "adrindia.org",
+  "worldbank.org", "imf.org", "oecd.org", "who.int", "un.org", "unesco.org", "ilo.org",
+  "wto.org", "iea.org", "ipcc.ch", "nature.com", "science.org", "nejm.org", "thelancet.com",
+  "jamanetwork.com", "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "scholar.google.com",
+];
+
 const DEEP_RESEARCH_REPORT_INSTRUCTIONS = [
   "Deep research reporting workflow:",
   "- First run deep_research and use its fetched evidence as the base brief.",
-  "- After deep_research completes, verify the important claims and sources with separate serpapi_search and tavily_search calls; compare both providers instead of treating one provider as enough.",
-  "- Use image_research after source verification to collect relevant image URLs with source/provenance metadata.",
+  "- Deep research must use at least 10 SerpAPI search passes when serpapi_search is enabled.",
+  "- Deep research must use at least 5 Tavily search passes when tavily_search is enabled.",
+  "- After the primary deep-search passes finish, run at least 6 web_search verification/recheck passes against important claims, source titles, and conflicting points.",
+  "- After deep_research completes, verify important claims and sources with separate web_search, serpapi_search, and tavily_search calls when those tools are available; compare providers instead of treating one provider as enough.",
+  "- Source quality matters more than search rank. Prefer official/primary sources, international institutions, academic/research sources, reputable fact-checkers, and established news/wire outlets. Use weak sources only as leads, not as main citations.",
+  SOLID_SOURCE_GUIDE,
+  "- Use image_research after source verification to collect only 2-3 relevant image URLs with source/provenance metadata.",
   "- After all sources and images are collected, create report.md in the current working directory.",
-  "- The report.md file must be detailed, include inline source URLs/citations, embed selected images with nearby source links, and clearly separate verified findings from uncertain or conflicting evidence.",
+  "- Write report.md as a detailed prepared research report, not a short answer or bullet-only summary.",
+  "- Match this report structure: H1 title beginning with 'Research brief:' or 'Research report:', Executive summary, 5-8 numbered analytical sections, Evidence gaps/limitations/recommended sources, Conclusion (synthesis), and References.",
+  "- Number analytical headings like '## 1. ...', '## 2. ...'; use paragraphs plus focused bullets inside sections when they improve readability.",
+  "- Use inline numbered citations such as [1], [2], [3] throughout the report; every major factual claim, date, statistic, quote, or contested point needs a nearby citation.",
+  "- End with a clean, well-structured References section. Put every source on its own line as a numbered Markdown list item: '1. [Source title](https://example.com/full-url) - publisher or site, date if known.' Never place multiple references on one paragraph line.",
+  "- Keep citation numbers consistent: inline [1] must map to References item 1, inline [2] to item 2, and so on. Do not skip numbers unless the skipped source was removed everywhere.",
+  "- Use descriptive link text in References, not raw bare URLs as the visible text. The URL must still be inside the Markdown link target.",
+  "- Explicitly call out uncertainty, conflicting figures, missing official datasets, and evidence limitations instead of smoothing them over.",
+  "- Write report.md like a normal sourced article: use the search/source data for article text, headings, citations, and claims; use images only as compact supporting visuals near the relevant section.",
+  "- Include the compact image CSS returned by image_research once near the top of report.md, then wrap selected image figures in <div class=\\\"image-grid\\\">...</div>.",
+  "- Attach images only if they are clean, clear, readable, well sourced, and help the report: maps, timelines, locations, people, products, charts, event photos, or visual comparisons. Skip blurry thumbnails, low-resolution previews, cropped charts/maps, decorative stock images, or weakly sourced images.",
+  "- Prefer the full image_url from image_research over thumbnails. Do not use an image if the source page is missing unless the report explicitly warns that provenance is weak.",
+  "- For each image, include a short caption and a source link/citation beside or inside the figure caption.",
+  "- The report.md file must be detailed, include inline source URLs/citations, embed selected compact images with nearby source links, and clearly separate verified findings from uncertain or conflicting evidence.",
   "- End report.md with this exact warning: Warning: This report only uses available sources and may contain wrong or incomplete information. Do not blindly believe it; verify important claims independently.",
+].join("\\n");
+
+const DEEP_RESEARCH_REPORT_TEMPLATE = [
+  "# Research brief: <specific topic>",
+  "",
+  "Executive summary",
+  "<3-6 dense paragraphs summarizing the answer, the strongest evidence, major caveats, and what could not be verified. Use numbered citations like [1].>",
+  "",
+  "<!-- If images are useful, place the compact CSS from image_research here once. -->",
+  "<!-- Then embed 2-3 clean, readable, sourced figures inside <div class=\\\"image-grid\\\">...</div> near the relevant section. Skip unclear or weakly sourced images. -->",
+  "",
+  "## 1. Background and context",
+  "<Explain the baseline facts, timeline, actors, and why the topic matters.>",
+  "",
+  "## 2. Main findings",
+  "<Develop the central findings with evidence, dates, figures, and citations.>",
+  "",
+  "## 3. Key actors, mechanisms, or causes",
+  "<Explain stakeholders, causes, incentives, technical mechanisms, policy forces, or market dynamics as relevant.>",
+  "",
+  "## 4. Timeline, geography, data, or operational details",
+  "<Use whichever dimensions fit the topic. Include compact tables only when they add clarity.>",
+  "",
+  "## 5. Results, implications, and consequences",
+  "<Explain outcomes, short-term effects, long-term implications, and who is affected.>",
+  "",
+  "## Evidence gaps, limitations and recommended data sources",
+  "<List missing primary data, conflicting reports, weak sources, and what should be checked next.>",
+  "",
+  "## Conclusion (synthesis)",
+  "<Pull the evidence together without adding unsupported claims.>",
+  "",
+  "## References",
+  "1. [Descriptive source title](https://example.com/source) - publisher/site, date if known.",
+  "2. [Descriptive source title](https://example.com/source) - publisher/site, date if known.",
 ].join("\\n");
 
 async function postJson(path: string, body: unknown, signal: AbortSignal) {{
@@ -2825,6 +3095,16 @@ function compactText(value: unknown, maxLength = 900) {{
   return text.length > maxLength ? `${{text.slice(0, maxLength)}}...` : text;
 }}
 
+function callMaybe(owner: any, method: unknown, args: unknown[]) {{
+  if (typeof method !== "function") return false;
+  try {{
+    method.apply(owner, args);
+    return true;
+  }} catch (error) {{
+    return false;
+  }}
+}}
+
 function createResearchProgress(piApi: any, toolCallId: string) {{
   type StepState = "queued" | "running" | "done" | "error";
   type Step = {{ id: string; title: string; detail: string; state: StepState; startedAt: number; endedAt?: number }};
@@ -2854,16 +3134,6 @@ function createResearchProgress(piApi: any, toolCallId: string) {{
       return `${{marker}} ${{step.title}}${{step.detail ? ` - ${{step.detail}}` : ""}} (${{elapsed}}s)`;
     }});
     return ["Deep research is working", ...lines].join("\\n");
-  }}
-
-  function callMaybe(owner: any, method: unknown, args: unknown[]) {{
-    if (typeof method !== "function") return false;
-    try {{
-      method.apply(owner, args);
-      return true;
-    }} catch (error) {{
-      return false;
-    }}
   }}
 
   function emit() {{
@@ -2940,6 +3210,22 @@ function pushUnique(values: string[], value: unknown) {{
   }}
 }}
 
+function hasProvider(providers: string[], provider: string) {{
+  return providers.some((item) => item === provider);
+}}
+
+function expandQueries(baseQueries: string[], topic: string, minimum: number, variants: string[]) {{
+  const expanded: string[] = [];
+  for (const query of baseQueries) pushUnique(expanded, query);
+  for (const variant of variants) pushUnique(expanded, variant.replaceAll("{{topic}}", topic));
+  let index = 1;
+  while (expanded.length < minimum) {{
+    pushUnique(expanded, `${{topic}} verification angle ${{index}}`);
+    index += 1;
+  }}
+  return expanded.slice(0, Math.max(minimum, baseQueries.length));
+}}
+
 function normalizeSearchResults(provider: string, query: string, data: any) {{
   const rawResults =
     Array.isArray(data?.results) ? data.results :
@@ -2953,6 +3239,37 @@ function normalizeSearchResults(provider: string, query: string, data: any) {{
     url: item.url ?? item.link ?? item.source_url ?? "",
     snippet: compactText(item.snippet ?? item.content ?? item.summary ?? item.extract ?? ""),
   }})).filter((item: any) => item.title || item.url || item.snippet);
+}}
+
+function sourceDomain(url: string) {{
+  try {{
+    return new URL(url).hostname.replace(/^www\\./, "").toLowerCase();
+  }} catch (error) {{
+    return "";
+  }}
+}}
+
+function sourceQualityScore(item: any) {{
+  const domain = sourceDomain(String(item?.url || ""));
+  const text = `${{item?.title || ""}} ${{item?.snippet || ""}} ${{item?.url || ""}}`.toLowerCase();
+  let score = 0;
+  if (domain) score += 1;
+  if (PREFERRED_SOURCE_DOMAINS.some((preferred) => domain === preferred || domain.endsWith(`.${{preferred}}`))) score += 8;
+  if (/\\.(gov|edu)(\\.|$)/i.test(domain) || domain.endsWith(".gov.in") || domain.endsWith(".ac.in")) score += 7;
+  if (/(official|government|commission|ministry|department|regulator|court|parliament|dataset|statistics|filing|annual report)/i.test(text)) score += 4;
+  if (/(reuters|associated press|\\bap news\\b|afp|bbc|bloomberg|financial times|the hindu|indian express|associated)/i.test(text)) score += 3;
+  if (/(wikipedia|youtube|facebook|twitter|x\\.com|reddit|quora|medium\\.com|blogspot|wordpress|pinterest)/i.test(domain)) score -= 5;
+  if (/(liveblog|live updates|opinion|editorial|youtube|watch\\?v=|viral|rumor|rumour)/i.test(text)) score -= 2;
+  return score;
+}}
+
+function sortFindingsByQuality(findings: any[]) {{
+  findings.sort((left, right) => {{
+    const quality = sourceQualityScore(right) - sourceQualityScore(left);
+    if (quality !== 0) return quality;
+    return String(left.title || "").localeCompare(String(right.title || ""));
+  }});
+  return findings;
 }}
 
 async function searchProvider(provider: string, query: string, maxResults: number, signal: AbortSignal) {{
@@ -3031,7 +3348,7 @@ export default function (pi: ExtensionAPI) {{
   pi.registerTool({{
     name: "deep_research",
     label: "Deep Research",
-    description: "Pi-only research agent: run multiple parallel web searches across bridge providers, fetch top pages, and return a structured evidence brief. Afterward, verify with separate SerpAPI and Tavily searches, collect images, and create report.md.",
+    description: "Pi-only research agent: run at least 10 SerpAPI searches, 5 Tavily searches when enabled, then 6 web_search verification passes, fetch top pages, and return a structured evidence brief for report.md.",
     parameters: Type.Object({{
       topic: Type.String({{ description: "Research topic, question, or claim to investigate." }}),
       questions: Type.Optional(Type.Array(Type.String({{ description: "Optional sub-questions to investigate in parallel." }}))),
@@ -3062,22 +3379,68 @@ export default function (pi: ExtensionAPI) {{
       }}
       if (depth >= 3) {{
         pushUnique(queries, `${{params.topic}} primary sources data`);
+        pushUnique(queries, `${{params.topic}} official report data`);
+        pushUnique(queries, `${{params.topic}} Reuters OR AP OR BBC`);
         pushUnique(queries, `${{params.topic}} expert analysis`);
         pushUnique(queries, `${{params.topic}} timeline`);
-        pushUnique(queries, `${{params.topic}} site:edu OR site:gov`);
+        pushUnique(queries, `${{params.topic}} site:gov OR site:edu`);
       }}
-      progress.step("plan", "Building research plan", `${{queries.slice(0, 12).length}} queries, ${{providers.length}} providers`, "done");
-
-      const searchJobs = queries.slice(0, 12).flatMap((query) =>
-        providers.map((provider: string) =>
-          progress.track(
-            `search:${{provider}}:${{query}}`,
-            `Searching ${{provider}}`,
-            query,
-            searchProvider(provider, query, maxResults, signal)
-          )
-        )
+      const baseQueries = queries.slice(0, 12);
+      const serpapiQueries = hasProvider(providers, "serpapi_search")
+        ? expandQueries(baseQueries, String(params.topic), 10, [
+          "{{topic}} evidence",
+          "{{topic}} sources",
+          "{{topic}} facts",
+          "{{topic}} latest",
+          "{{topic}} expert analysis",
+          "{{topic}} criticism",
+          "{{topic}} timeline",
+          "{{topic}} statistics",
+          "{{topic}} official source",
+          "{{topic}} official report data",
+          "{{topic}} Reuters AP BBC",
+          "{{topic}} site:gov OR site:edu",
+          "{{topic}} independent source",
+        ])
+        : [];
+      const tavilyQueries = hasProvider(providers, "tavily_search")
+        ? expandQueries(baseQueries, String(params.topic), 5, [
+          "{{topic}} research evidence",
+          "{{topic}} recent developments",
+          "{{topic}} primary sources",
+          "{{topic}} official data reputable news",
+          "{{topic}} analysis",
+          "{{topic}} limitations controversy",
+        ])
+        : [];
+      const wikipediaQueries = hasProvider(providers, "wikipedia_search") ? baseQueries.slice(0, 3) : [];
+      progress.step(
+        "plan",
+        "Building research plan",
+        `${{serpapiQueries.length}} SerpAPI, ${{tavilyQueries.length}} Tavily, ${{wikipediaQueries.length}} Wikipedia primary passes`,
+        "done"
       );
+
+      const searchJobs = [
+        ...serpapiQueries.map((query) => progress.track(
+          `search:serpapi_search:${{query}}`,
+          "Searching serpapi_search",
+          query,
+          searchProvider("serpapi_search", query, maxResults, signal)
+        )),
+        ...tavilyQueries.map((query) => progress.track(
+          `search:tavily_search:${{query}}`,
+          "Searching tavily_search",
+          query,
+          searchProvider("tavily_search", query, maxResults, signal)
+        )),
+        ...wikipediaQueries.map((query) => progress.track(
+          `search:wikipedia_search:${{query}}`,
+          "Searching wikipedia_search",
+          query,
+          searchProvider("wikipedia_search", query, maxResults, signal)
+        )),
+      ];
       progress.step("parallel-search", "Running parallel searches", `${{searchJobs.length}} searches in flight`);
       const settled = await Promise.allSettled(searchJobs);
       progress.step("parallel-search", "Running parallel searches", `${{searchJobs.length}} searches complete`, "done");
@@ -3097,7 +3460,46 @@ export default function (pi: ExtensionAPI) {{
           findings.push(item);
         }}
       }}
+      sortFindingsByQuality(findings);
       progress.step("merge", "Merging and deduplicating sources", `${{findings.length}} unique sources`, "done");
+
+      const verificationQueries: string[] = [];
+      pushUnique(verificationQueries, `${{params.topic}} verify key facts`);
+      pushUnique(verificationQueries, `${{params.topic}} fact check`);
+      pushUnique(verificationQueries, `${{params.topic}} source reliability`);
+      pushUnique(verificationQueries, `${{params.topic}} conflicting evidence`);
+      for (const item of findings.slice(0, 8)) {{
+        pushUnique(verificationQueries, `${{item.title}} verification`);
+      }}
+      while (verificationQueries.length < 6) {{
+        pushUnique(verificationQueries, `${{params.topic}} recheck source ${{verificationQueries.length + 1}}`);
+      }}
+      const verificationJobs = hasProvider(providers, "web_search")
+        ? verificationQueries.slice(0, 6).map((query) => progress.track(
+          `verify:web_search:${{query}}`,
+          "Verifying with web_search",
+          query,
+          searchProvider("web_search", query, maxResults, signal)
+        ))
+        : [];
+      progress.step("verify-search", "Running verification searches", `${{verificationJobs.length}} web_search rechecks`);
+      const verificationSettled = await Promise.allSettled(verificationJobs);
+      const verificationFindings: any[] = [];
+      for (const result of verificationSettled) {{
+        if (result.status === "rejected") {{
+          searchErrors.push(String(result.reason));
+          continue;
+        }}
+        for (const item of result.value) {{
+          const key = String(item.url || `${{item.provider}}:${{item.title}}`).toLowerCase();
+          if (seenUrls.has(key)) continue;
+          seenUrls.add(key);
+          verificationFindings.push(item);
+          findings.push(item);
+        }}
+      }}
+      sortFindingsByQuality(findings);
+      progress.step("verify-search", "Running verification searches", `${{verificationFindings.length}} additional verification sources`, "done");
 
       const urlsToFetch = findings
         .map((item) => item.url)
@@ -3136,11 +3538,20 @@ export default function (pi: ExtensionAPI) {{
         "Work trace:",
         progressLines.join("\\n") || "No progress events recorded.",
         "",
-        `Queries run: ${{queries.slice(0, 12).join(" | ")}}`,
+        `Primary queries planned: ${{baseQueries.join(" | ")}}`,
         `Providers attempted: ${{providers.join(", ")}}`,
+        `SerpAPI search passes: ${{serpapiQueries.length}}`,
+        `Tavily search passes: ${{tavilyQueries.length}}`,
+        `Web verification searches: ${{verificationJobs.length}}`,
         `Unique sources found: ${{findings.length}}`,
+        `Additional verification sources: ${{verificationFindings.length}}`,
         `Fetched pages: ${{fetchedPages.length}}`,
         searchErrors.length ? `Provider errors: ${{searchErrors.slice(0, 5).join(" | ")}}` : "",
+        "",
+        "Source quality policy:",
+        SOLID_SOURCE_GUIDE,
+        "",
+        `Preferred domains/examples: ${{PREFERRED_SOURCE_DOMAINS.slice(0, 36).join(", ")}}`,
         "",
         "Search findings:",
         sourceLines.join("\\n\\n") || "No search findings returned.",
@@ -3150,6 +3561,9 @@ export default function (pi: ExtensionAPI) {{
         "",
         DEEP_RESEARCH_REPORT_INSTRUCTIONS,
         "",
+        "Report template to follow:",
+        DEEP_RESEARCH_REPORT_TEMPLATE,
+        "",
         "Instruction for Pi: synthesize the answer from the evidence above, cite URLs inline, call this tool again with narrower questions if important gaps remain.",
       ].filter(Boolean).join("\\n");
 
@@ -3158,9 +3572,13 @@ export default function (pi: ExtensionAPI) {{
         details: {{
           topic: params.topic,
           progress: progress.snapshot(),
-          queries: queries.slice(0, 12),
+          queries: baseQueries,
+          serpapi_queries: serpapiQueries,
+          tavily_queries: tavilyQueries,
+          web_verification_queries: verificationQueries.slice(0, 6),
           providers,
           findings,
+          verification_findings: verificationFindings,
           fetched_pages: fetchedPages,
           errors: searchErrors,
         }},
@@ -3168,19 +3586,26 @@ export default function (pi: ExtensionAPI) {{
     }},
   }});
 
-  function startDeepResearch(args: string, ctx: any) {{
-    const topic = args.trim();
+  async function startDeepResearch(args: string, ctx: any) {{
+    let topic = args.trim();
     if (!topic) {{
-      ctx.ui.notify("Usage: /deep_research <topic or question>", "warning");
-      return;
+      const entered = await ctx.ui.input(
+        "Deep research topic",
+        "Ask the question or topic for report.md"
+      );
+      topic = String(entered ?? "").trim();
+      if (!topic) {{
+        ctx.ui.notify("Deep research cancelled: no topic entered.", "warning");
+        return;
+      }}
     }}
     const prompt = [
       `Run deep research on: ${{topic}}`,
       "",
-      "Use the deep_research tool first with depth 3 unless the topic is very small.",
-      "Search broadly, fetch useful sources, then follow these required reporting instructions:",
-      DEEP_RESEARCH_REPORT_INSTRUCTIONS,
-      "If the evidence is thin, call deep_research again with narrower follow-up questions.",
+      "Call the deep_research tool first with depth 3 unless the topic is very small.",
+      "After the tool returns, use the report policy and template included in that tool output.",
+      "If images help, call image_research after source verification and include only compact image blocks.",
+      "Create report.md or repoart.md only after the sources are verified.",
     ].join("\\n");
     if (ctx.isIdle()) {{
       pi.sendUserMessage(prompt);
@@ -3192,6 +3617,11 @@ export default function (pi: ExtensionAPI) {{
 
   pi.registerCommand("deep_research", {{
     description: "Run Pi-only deep research with parallel web/search providers",
+    handler: async (args, ctx) => startDeepResearch(args, ctx),
+  }});
+
+  pi.registerCommand("deep", {{
+    description: "Open deep research topic prompt",
     handler: async (args, ctx) => startDeepResearch(args, ctx),
   }});
 
@@ -3495,20 +3925,22 @@ def _start_windows_background(
     idle_after_file: Path | None = None,
 ) -> int:
     env = {**os.environ, "LLAMA_DEV_LOG": "1"}
-    process = subprocess.Popen(
-        _serve_command(config_path, log_path, idle_timeout_seconds, idle_after_file),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        cwd=str(config_path.parent),
-        creationflags=(
-            subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.CREATE_NO_WINDOW
-            | subprocess.DETACHED_PROCESS
-        ),
-        env=env,
-    )
+    with log_path.open("a", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            _serve_command(config_path, log_path, idle_timeout_seconds, idle_after_file),
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=handle,
+            close_fds=True,
+            cwd=str(config_path.parent),
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | subprocess.CREATE_NO_WINDOW
+                | subprocess.DETACHED_PROCESS
+                | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+            ),
+            env=env,
+        )
     return process.pid
 
 

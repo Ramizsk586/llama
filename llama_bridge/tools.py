@@ -518,10 +518,10 @@ class ToolRegistry:
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Maximum image candidates to return (1-20).",
-                            "default": 8,
+                            "description": "Maximum image candidates to return (1-3).",
+                            "default": 3,
                             "minimum": 1,
-                            "maximum": 20,
+                            "maximum": 3,
                         },
                         "include_domains": {
                             "type": "array",
@@ -742,13 +742,14 @@ class ToolRegistry:
             maximum=5,
         )
         include_images = bool(arguments.get("include_images", False))
+        image_limit = min(max_results, 3)
 
         search_tasks = []
         if self.config.tools.tavily.enabled:
             search_tasks.append(
                 self._research_tavily(
                     query,
-                    max_results,
+                    image_limit if include_images else max_results,
                     include_images=include_images,
                     include_domains=arguments.get("include_domains"),
                     exclude_domains=arguments.get("exclude_domains"),
@@ -814,43 +815,78 @@ class ToolRegistry:
             }
             for result in unique_results
         ]
+        compact_images = _dedupe_images(images)[:image_limit] if include_images else []
         return {
             "query": query,
             "guardrails": [
                 "Use only verified_sources for citation-worthy claims.",
-                "Prefer official or primary sources when multiple sources agree.",
+                "Prefer official or primary sources when multiple sources agree: government agencies, regulators, courts, election commissions, statistics offices, company filings, official datasets, and original reports.",
+                "For current events, prefer established wire/news sources when relevant: Reuters, Associated Press, AFP, BBC, Bloomberg, Financial Times, The Hindu, Indian Express, NDTV, Hindustan Times, LiveMint, Business Standard, Economic Times, Al Jazeera, DW, France24, and similar reputable outlets.",
+                "For technical, health, science, economy, or policy topics, prefer academic papers, universities, official institutions, WHO, UN, World Bank, IMF, OECD, IEA, IPCC, PubMed/NCBI, Nature, Science, Lancet, JAMA, and official datasets.",
+                "Treat SEO pages, anonymous blogs, copied press releases, social posts, YouTube commentary, forums, and content farms as weak leads, not main evidence.",
                 "If verdict is insufficient_evidence, answer with uncertainty and cite the gap.",
                 "For markdown images, cite the image source page near each image.",
+                "Use only 2-3 compact images in markdown reports.",
+                "Use clear, readable images only; skip blurry thumbnails, tiny previews, cropped maps/charts, or weakly sourced images.",
+                "Prefer full image_url values over thumbnails, and include a source_url for every embedded image when possible.",
             ],
             "verdict": verification["verdict"],
             "required_verified_sources": required_sources,
             "verified_sources": verification["verified_sources"],
             "weak_or_unreachable_sources": verification["weak_or_unreachable_sources"],
             "search_results": enriched_sources,
-            "images": _dedupe_images(images)[:max_results] if include_images else [],
+            "markdown_css": _compact_image_markdown_css() if include_images else None,
+            "images": compact_images,
+            "markdown_examples": [
+                {
+                    "title": image.get("title"),
+                    "markdown": _compact_image_markdown(image),
+                    "source_note": f"Source: {image.get('source_url')}",
+                }
+                for image in compact_images
+                if image.get("image_url") or image.get("thumbnail")
+            ],
             "search_errors": search_errors,
         }
 
     async def _image_research(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = _required_string(arguments, "query")
-        max_results = _bounded_int(arguments.get("max_results"), default=8, minimum=1, maximum=20)
-        tasks = []
+        max_results = _bounded_int(arguments.get("max_results"), default=3, minimum=1, maximum=3)
+        gathered: list[dict[str, Any] | Exception] = []
+        fallback_used = False
         if self.config.tools.tavily.enabled:
-            tasks.append(
+            tavily_result = await asyncio.gather(
                 self._research_tavily(
                     query,
                     max_results,
                     include_images=True,
                     include_domains=arguments.get("include_domains"),
                     exclude_domains=arguments.get("exclude_domains"),
-                )
+                ),
+                return_exceptions=True,
             )
+            gathered.extend(tavily_result)
+            tavily_images = _dedupe_images(
+                [
+                    image
+                    for item in tavily_result
+                    if isinstance(item, dict)
+                    for image in item.get("images", [])
+                ]
+            )
+            fallback_used = not tavily_images
+
         if self.config.tools.serpapi.enabled:
-            tasks.append(self._research_serpapi_images(query, max_results))
-        if not tasks:
+            if fallback_used or not self.config.tools.tavily.enabled:
+                serpapi_result = await asyncio.gather(
+                    self._research_serpapi_images(query, max_results),
+                    return_exceptions=True,
+                )
+                gathered.extend(serpapi_result)
+
+        if not gathered:
             raise ValueError("Configure SerpAPI or Tavily to use image_research.")
 
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
         errors = [
             {"error": str(item), "type": type(item).__name__}
             for item in gathered
@@ -871,12 +907,23 @@ class ToolRegistry:
                 "Use image_url or thumbnail exactly as returned.",
                 "Prefer candidates with source_url, and cite source_url near the image in markdown.",
                 "If no image has a source_url, say image provenance is weak.",
+                "Use only 2-3 compact images in markdown reports.",
+                "Use clear, readable images only; skip blurry thumbnails, tiny previews, cropped maps/charts, or weakly sourced images.",
+                "Prefer full image_url values over thumbnails, and include a source_url for every embedded image when possible.",
+                "Use regular search/source data for the article text, then place images near the relevant section.",
+                "Use SerpAPI image search as a fallback when the preferred image provider fails or returns no images.",
             ],
+            "provider_policy": {
+                "preferred": "tavily_images" if self.config.tools.tavily.enabled else "serpapi_images",
+                "fallback": "serpapi_images",
+                "fallback_used": fallback_used,
+            },
+            "markdown_css": _compact_image_markdown_css(),
             "images": images,
             "markdown_examples": [
                 {
                     "title": image.get("title"),
-                    "markdown": f"![{_markdown_alt(image)}]({image.get('image_url') or image.get('thumbnail')})",
+                    "markdown": _compact_image_markdown(image),
                     "source_note": f"Source: {image.get('source_url')}",
                 }
                 for image in images
@@ -1374,6 +1421,32 @@ def _dedupe_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _markdown_alt(image: dict[str, Any]) -> str:
     title = str(image.get("title") or "image").strip()
     return title.replace("[", "(").replace("]", ")")
+
+
+def _compact_image_markdown_css() -> str:
+    return (
+        "<style>\n"
+        ".image-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));"
+        "gap:14px;margin:16px 0;align-items:start;}\n"
+        ".image-card{margin:0;font-size:.9em;line-height:1.4;}\n"
+        ".image-card img{display:block;width:100%;height:auto;max-height:240px;object-fit:contain;"
+        "background:#f6f6f6;border:1px solid #ddd;border-radius:6px;padding:4px;}\n"
+        ".image-card figcaption{margin-top:6px;color:#555;}\n"
+        "</style>"
+    )
+
+
+def _compact_image_markdown(image: dict[str, Any]) -> str:
+    url = image.get("image_url") or image.get("thumbnail")
+    alt = _markdown_alt(image)
+    source_url = image.get("source_url")
+    source = f'<a href="{source_url}">source</a>' if source_url else "source unavailable"
+    return (
+        '<figure class="image-card">\n'
+        f'  <img src="{url}" alt="{alt}" loading="lazy">\n'
+        f"  <figcaption>{alt} - {source}</figcaption>\n"
+        "</figure>"
+    )
 
 
 def _html_title(html: str) -> str | None:

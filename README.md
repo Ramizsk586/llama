@@ -126,14 +126,18 @@ Pi is configured to talk to the local llama bridge, so requests appear in
 
 The `llama_bridge_deep_research` extension registers a Pi-only `deep_research`
 tool. It is not advertised through `/v1/tools` or `/api/tools`; only Pi gets it
-from the local extension. `deep_research` runs multiple search providers in parallel
-(`web_search`, `serpapi_search`, `tavily_search`, and `wikipedia_search` when
-configured), deduplicates discovered sources, fetches top pages, and returns a
-structured evidence brief that Pi can synthesize from. The `/deep_research`
-command also instructs Pi to verify important claims with separate SerpAPI and
-Tavily searches, collect image candidates with `image_research`, and create a
-`report.md` file in the current directory with citations, images, and an
-end-of-report reliability warning.
+from the local extension. `deep_research` runs at least 10 SerpAPI search passes,
+5 Tavily search passes when Tavily is enabled, then 6 `web_search`
+verification/recheck passes before it deduplicates sources, fetches top pages,
+and returns a structured evidence brief that Pi can synthesize from. The
+`/deep_research` command then instructs Pi to verify important claims with
+separate available search tools, collect 2-3 compact image candidates with
+`image_research`, and create a `report.md` file in the current directory with
+citations, images, and an end-of-report reliability warning. Generated reports
+are structured as prepared research briefs: title, executive summary, numbered
+analytical sections, evidence gaps/limitations, synthesis conclusion, and
+numbered references. Images are included only when useful and are embedded as
+compact sourced figures.
 
 ```yaml
 pi:
@@ -217,8 +221,10 @@ Built-in tools include `datetime_now`, `wikipedia_search`, `wikipedia_page`,
 `weather_current`, `serpapi_search`, `tavily_search`, `source_research`,
 `image_research`, and `verify_sources`. `source_research` combines SerpAPI and
 Tavily results, then runs parallel source-verifier workers so models can cite
-only reachable, relevant sources. `image_research` returns image URLs with source
-pages for markdown/report generation. Configure them in `env.yml`:
+only reachable, relevant sources. `image_research` returns 2-3 image URLs with
+source pages plus compact Markdown/CSS snippets for report generation. When
+Tavily image results are available, SerpAPI image search is only used as a
+fallback. Configure them in `env.yml`:
 
 ```yaml
 tools:

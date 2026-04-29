@@ -15,6 +15,10 @@ def _default_data_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
 
+    package_root = Path(__file__).resolve().parent.parent
+    if (package_root / "pyproject.toml").exists() and (package_root / "env.yml").exists():
+        return package_root
+
     if sys.argv and sys.argv[0]:
         launcher_path = Path(sys.argv[0])
         if launcher_path.name.lower() in {"llama", "llama.exe"}:
@@ -26,7 +30,7 @@ def _default_data_dir() -> Path:
             if resolved_launcher.exists():
                 return resolved_launcher.resolve().parent
 
-    return Path(__file__).resolve().parent.parent
+    return package_root
 
 
 DEFAULT_CONFIG_DIR = _default_data_dir()
