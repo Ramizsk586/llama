@@ -129,7 +129,11 @@ tool. It is not advertised through `/v1/tools` or `/api/tools`; only Pi gets it
 from the local extension. `deep_research` runs multiple search providers in parallel
 (`web_search`, `serpapi_search`, `tavily_search`, and `wikipedia_search` when
 configured), deduplicates discovered sources, fetches top pages, and returns a
-structured evidence brief that Pi can synthesize from.
+structured evidence brief that Pi can synthesize from. The `/deep_research`
+command also instructs Pi to verify important claims with separate SerpAPI and
+Tavily searches, collect image candidates with `image_research`, and create a
+`report.md` file in the current directory with citations, images, and an
+end-of-report reliability warning.
 
 ```yaml
 pi:

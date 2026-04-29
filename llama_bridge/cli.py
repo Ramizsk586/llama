@@ -2752,6 +2752,15 @@ import {{ Type }} from "typebox";
 
 const BRIDGE_URL = {json.dumps(bridge_url)};
 const API_KEY = {json.dumps(api_key)};
+const DEEP_RESEARCH_REPORT_INSTRUCTIONS = [
+  "Deep research reporting workflow:",
+  "- First run deep_research and use its fetched evidence as the base brief.",
+  "- After deep_research completes, verify the important claims and sources with separate serpapi_search and tavily_search calls; compare both providers instead of treating one provider as enough.",
+  "- Use image_research after source verification to collect relevant image URLs with source/provenance metadata.",
+  "- After all sources and images are collected, create report.md in the current working directory.",
+  "- The report.md file must be detailed, include inline source URLs/citations, embed selected images with nearby source links, and clearly separate verified findings from uncertain or conflicting evidence.",
+  "- End report.md with this exact warning: Warning: This report only uses available sources and may contain wrong or incomplete information. Do not blindly believe it; verify important claims independently.",
+].join("\\n");
 
 async function postJson(path: string, body: unknown, signal: AbortSignal) {{
   const response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
@@ -3013,7 +3022,7 @@ export default function (pi: ExtensionAPI) {{
   pi.registerTool({{
     name: "deep_research",
     label: "Deep Research",
-    description: "Pi-only research agent: run multiple parallel web searches across bridge providers, fetch top pages, and return a structured evidence brief.",
+    description: "Pi-only research agent: run multiple parallel web searches across bridge providers, fetch top pages, and return a structured evidence brief. Afterward, verify with separate SerpAPI and Tavily searches, collect images, and create report.md.",
     parameters: Type.Object({{
       topic: Type.String({{ description: "Research topic, question, or claim to investigate." }}),
       questions: Type.Optional(Type.Array(Type.String({{ description: "Optional sub-questions to investigate in parallel." }}))),
@@ -3130,6 +3139,8 @@ export default function (pi: ExtensionAPI) {{
         "Fetched evidence:",
         fetchedLines.join("\\n\\n") || "No pages fetched.",
         "",
+        DEEP_RESEARCH_REPORT_INSTRUCTIONS,
+        "",
         "Instruction for Pi: synthesize the answer from the evidence above, cite URLs inline, call this tool again with narrower questions if important gaps remain.",
       ].filter(Boolean).join("\\n");
 
@@ -3158,7 +3169,8 @@ export default function (pi: ExtensionAPI) {{
       `Run deep research on: ${{topic}}`,
       "",
       "Use the deep_research tool first with depth 3 unless the topic is very small.",
-      "Search broadly, fetch useful sources, then synthesize a concise answer with inline source URLs.",
+      "Search broadly, fetch useful sources, then follow these required reporting instructions:",
+      DEEP_RESEARCH_REPORT_INSTRUCTIONS,
       "If the evidence is thin, call deep_research again with narrower follow-up questions.",
     ].join("\\n");
     if (ctx.isIdle()) {{
