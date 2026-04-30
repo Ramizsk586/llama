@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from .config import BridgeConfig, ExternalToolProviderConfig
+from .master import MasterReviewer
 
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -106,11 +107,18 @@ class ToolRegistry:
         self._tools: dict[str, ToolDefinition] = {}
         self._unavailable_tools: dict[str, str] = {}
         self._cache = ToolCache()
+        self._master_reviewer = (
+            MasterReviewer(config.master_review)
+            if getattr(config, "master_review", None) is not None and config.master_review.enabled
+            else None
+        )
         if config.tools.enabled:
             self._register_default_tools()
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        if self._master_reviewer is not None:
+            await self._master_reviewer.aclose()
 
     def list_tools(self) -> list[dict[str, Any]]:
         return [tool.as_dict() for tool in self._tools.values()]
@@ -574,6 +582,36 @@ class ToolRegistry:
                 handler=self._verify_sources,
             )
         )
+        self._register(
+            ToolDefinition(
+                name="master_review",
+                description=(
+                    "Review a deep/source research result with specialist sub-agents and deterministic fallback checks.\n"
+                    "USE WHEN: You have a draft report or source_research/deep_research result and need quality, citation, neutrality, and evidence review.\n"
+                    "RESULT FORMAT: Structured master_review JSON with final LLM instructions, risk score, critiques, and optional revised draft."
+                ),
+                parameters={
+                    "type": "object",
+                    "required": ["research_result"],
+                    "properties": {
+                        "research_result": {
+                            "type": "object",
+                            "description": "Deep research/source research result to review.",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["fast", "balanced", "strict"],
+                            "default": "balanced",
+                        },
+                        "return_revised_draft": {
+                            "type": "boolean",
+                            "default": True,
+                        },
+                    },
+                },
+                handler=self._master_review,
+            )
+        )
 
     async def _datetime_now(self, arguments: dict[str, Any]) -> dict[str, Any]:
         country = str(arguments.get("country") or self.config.tools.country or "").strip()
@@ -816,7 +854,7 @@ class ToolRegistry:
             for result in unique_results
         ]
         compact_images = _dedupe_images(images)[:image_limit] if include_images else []
-        return {
+        result = {
             "query": query,
             "guardrails": [
                 "Use only verified_sources for citation-worthy claims.",
@@ -848,6 +886,45 @@ class ToolRegistry:
             ],
             "search_errors": search_errors,
         }
+        return await self._attach_master_review(result)
+
+    async def _attach_master_review(self, result: dict[str, Any]) -> dict[str, Any]:
+        if (
+            self._master_reviewer is None
+            or not self.config.master_review.run_after_deep_research
+        ):
+            return result
+        review = await self._master_reviewer.review_deep_research({"data": result})
+        result["master_review"] = review
+        reviewed_answer = review.get("data", {}).get("revised_draft") if review.get("ok") else None
+        if reviewed_answer:
+            result["reviewed_answer"] = reviewed_answer
+        final_instructions = review.get("data", {}).get("final_llm_instructions") if review.get("ok") else None
+        if final_instructions:
+            result["final_llm_instructions"] = final_instructions
+        return result
+
+    async def _master_review(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self._master_reviewer is None:
+            reviewer = MasterReviewer(self.config.master_review)
+            try:
+                return await reviewer.review_deep_research(
+                    arguments.get("research_result") or {},
+                    mode=arguments.get("mode"),
+                )
+            finally:
+                await reviewer.aclose()
+        config = self.config.master_review
+        original_return_revised = config.output.return_revised_draft
+        if arguments.get("return_revised_draft") is not None:
+            config.output.return_revised_draft = bool(arguments.get("return_revised_draft"))
+        try:
+            return await self._master_reviewer.review_deep_research(
+                arguments.get("research_result") or {},
+                mode=arguments.get("mode"),
+            )
+        finally:
+            config.output.return_revised_draft = original_return_revised
 
     async def _image_research(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = _required_string(arguments, "query")
@@ -1227,6 +1304,11 @@ def validate_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, A
             raise ToolValidationError("urls must contain at least one valid public HTTP URL.")
         if cleaned.get("claim") is not None and not isinstance(cleaned["claim"], str):
             cleaned["claim"] = str(cleaned["claim"])
+    if name == "master_review":
+        if not isinstance(cleaned.get("research_result"), dict):
+            raise ToolValidationError("research_result must be a JSON object.")
+        if cleaned.get("mode") is not None and cleaned["mode"] not in {"fast", "balanced", "strict"}:
+            raise ToolValidationError("mode must be one of: fast, balanced, strict.")
 
     for key, maximum in {"limit": 20, "num": 20, "max_results": 20}.items():
         if key in cleaned and cleaned[key] is not None:
@@ -1636,6 +1718,8 @@ def _validate_tool_output(name: str, result: Any) -> dict[str, Any]:
             raise ValueError(f"{name} returned no verdict")
     elif name == "image_research":
         _require_list_output(name, result, "images")
+    elif name == "master_review":
+        _require_output_keys(name, result, {"ok", "tool", "data", "metadata"})
 
     return result
 
@@ -1753,6 +1837,8 @@ def _tool_source(name: str) -> str:
         return "serpapi+tavily-images"
     if name == "verify_sources":
         return "parallel-source-verifiers"
+    if name == "master_review":
+        return "master-review"
     if name == "datetime_now":
         return "system-clock"
     return "llama-bridge"

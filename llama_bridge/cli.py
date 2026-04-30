@@ -35,6 +35,7 @@ from .config import (
     write_claude_api_settings,
     write_default_config,
 )
+from .master import MasterReviewer
 from .tools import ToolRegistry, classify_query_intent, select_relevant_tools
 
 
@@ -484,6 +485,15 @@ def main() -> None:
             return
         parser.print_help()
         return
+    if args.command == "master-review":
+        _cmd_master_review(
+            _arg_path(args.config),
+            report_path=Path(args.report_json) if args.report_json else None,
+            mode=args.mode,
+            use_stdin=args.stdin,
+            check_keys=args.check_keys,
+        )
+        return
     if args.command == "pi":
         config_path = _arg_path(args.config)
         _cmd_pi(
@@ -655,6 +665,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="show intent, selected tools, rejected tools, and provider availability",
     )
     tools_diagnose_cmd.add_argument("query")
+
+    master_cmd = subparsers.add_parser(
+        "master-review",
+        help="review a deep/source research JSON report and print final improvement instructions",
+    )
+    master_cmd.add_argument("report_json", nargs="?", help="path to deep/source research JSON")
+    master_cmd.add_argument("--config")
+    master_cmd.add_argument(
+        "--mode",
+        choices=["fast", "balanced", "strict"],
+        default=None,
+        help="review depth override",
+    )
+    master_cmd.add_argument("--stdin", action="store_true", help="read research JSON from stdin")
+    master_cmd.add_argument(
+        "--check-keys",
+        action="store_true",
+        help="show configured Groq key slots without revealing key values",
+    )
 
     subparsers.add_parser(
         "endpoints",
@@ -1431,6 +1460,87 @@ def _cmd_tools_diagnose(config_path: Path, query: str) -> None:
         print(json.dumps(report, indent=2, ensure_ascii=True))
     finally:
         asyncio.run(registry.aclose())
+
+
+def _cmd_master_review(
+    config_path: Path,
+    *,
+    report_path: Path | None,
+    mode: str | None,
+    use_stdin: bool,
+    check_keys: bool,
+) -> None:
+    config = load_config(config_path)
+    if check_keys:
+        _title("Master Review Keys")
+        keys = config.master_review.groq.api_keys
+        rows: list[tuple[str, str | int]] = [
+            ("enabled", str(config.master_review.enabled)),
+            ("groq enabled", str(config.master_review.groq.enabled)),
+            ("model", config.master_review.groq.model),
+            ("configured keys", len(keys)),
+        ]
+        _kv_rows(rows)
+        for index, key in enumerate(keys, start=1):
+            print(f"- groq_key_{index}: {_configured_label(key)}")
+        if not keys:
+            _print_state("warn", "no Groq keys configured; fallback review will be used", "33")
+        return
+
+    if use_stdin:
+        raw_text = sys.stdin.read()
+        output_dir = Path.cwd()
+    elif report_path is not None:
+        raw_text = report_path.read_text(encoding="utf-8")
+        output_dir = report_path.resolve().parent
+    else:
+        raise SystemExit("Provide report_json, use --stdin, or pass --check-keys.")
+
+    try:
+        research_result = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"research JSON is invalid: {exc}") from exc
+    if not isinstance(research_result, dict):
+        raise SystemExit("research JSON must be an object")
+
+    reviewer = MasterReviewer(config.master_review)
+    try:
+        review = asyncio.run(reviewer.review_deep_research(research_result, mode=mode))
+    finally:
+        asyncio.run(reviewer.aclose())
+
+    data = review.get("data", {}) if isinstance(review.get("data"), dict) else {}
+    final_review = data.get("final_review", {}) if isinstance(data.get("final_review"), dict) else {}
+    metadata = review.get("metadata", {}) if isinstance(review.get("metadata"), dict) else {}
+    instructions = str(data.get("final_llm_instructions") or "")
+    instructions_path = output_dir / "master_review_instructions.txt"
+    instructions_path.write_text(instructions + "\n", encoding="utf-8")
+
+    _title("Master Review")
+    _kv_rows(
+        [
+            ("Quality score", f"{data.get('quality_score', 'n/a')}/10"),
+            ("Risk level", str(data.get("risk_level", "unknown"))),
+            ("Groq keys used", ", ".join(metadata.get("groq_keys_used") or []) or "none"),
+            ("Fallback used", str(metadata.get("fallback_used", False))),
+        ]
+    )
+    _print_cli_list("Must fix", final_review.get("must_fix", []))
+    _print_cli_list("Weak sources", final_review.get("weak_sources", []))
+    _print_cli_list("Unsupported claims", final_review.get("unsupported_claims", []))
+    print()
+    print(f"Final LLM instructions written to: {instructions_path}")
+
+
+def _print_cli_list(title: str, values: Any, *, limit: int = 8) -> None:
+    items = values if isinstance(values, list) else []
+    print()
+    print(f"{title}:")
+    if not items:
+        print("- none")
+        return
+    for item in items[:limit]:
+        print(f"- {str(item)[:500]}")
 
 
 def _configured_label(value: str | None) -> str:
@@ -2453,6 +2563,22 @@ function toolErrorText(toolName: string, result: any) {{
   return `${{toolName}} failed: ${{String(error)}}\\n\\n${{pretty(result)}}`;
 }}
 
+function sendAutoFollowUp(piApi: any, text: string) {{
+  try {{
+    if (typeof piApi?.sendUserMessage !== "function") return false;
+    setTimeout(() => {{
+      try {{
+        piApi.sendUserMessage(text, {{ deliverAs: "followUp" }});
+      }} catch (error) {{
+        try {{ piApi.sendUserMessage(text); }} catch (_ignored) {{}}
+      }}
+    }}, 250);
+    return true;
+  }} catch (error) {{
+    return false;
+  }}
+}}
+
 function formatSearchResults(results: any[]) {{
   return results.map((item: any, index: number) => {{
     const title = item.title ?? item.name ?? item.heading ?? "Untitled";
@@ -2747,6 +2873,13 @@ export default function (pi: ExtensionAPI) {{
           details: result,
         }};
       }}
+      sendAutoFollowUp(
+        pi as any,
+        [
+          "Image research is complete. Continue the deep research workflow now: synthesize the report from the verified sources and selected images, then write the finished markdown file.",
+          "Use the write tool exactly like this JSON shape: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. The path field is required; do not call write with content only."
+        ].join("\\n")
+      );
       return {{
         content: [{{ type: "text", text: formatImageResults(result) || pretty(result) }}],
         details: result,
@@ -2988,7 +3121,10 @@ const DEEP_RESEARCH_REPORT_INSTRUCTIONS = [
   "- Source quality matters more than search rank. Prefer official/primary sources, international institutions, academic/research sources, reputable fact-checkers, and established news/wire outlets. Use weak sources only as leads, not as main citations.",
   SOLID_SOURCE_GUIDE,
   "- Use image_research after source verification to collect only 2-3 relevant image URLs with source/provenance metadata.",
+  "- After image_research returns, continue immediately into synthesis and file writing; do not stop and wait for the user to type continue.",
   "- After all sources and images are collected, create report.md in the current working directory.",
+  "- When using the write tool, call it with BOTH required fields: path and content. Correct shape: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. Never call write with content only.",
+  "- Use a relative path such as report.md unless the user explicitly asks for a different filename.",
   "- Write report.md as a detailed prepared research report, not a short answer or bullet-only summary.",
   "- Match this report structure: H1 title beginning with 'Research brief:' or 'Research report:', Executive summary, 5-8 numbered analytical sections, Evidence gaps/limitations/recommended sources, Conclusion (synthesis), and References.",
   "- Number analytical headings like '## 1. ...', '## 2. ...'; use paragraphs plus focused bullets inside sections when they improve readability.",
@@ -3605,7 +3741,9 @@ export default function (pi: ExtensionAPI) {{
       "Call the deep_research tool first with depth 3 unless the topic is very small.",
       "After the tool returns, use the report policy and template included in that tool output.",
       "If images help, call image_research after source verification and include only compact image blocks.",
-      "Create report.md or repoart.md only after the sources are verified.",
+      "After image_research returns, continue automatically into synthesis and file writing; do not wait for the user to say continue.",
+      "Create report.md only after the sources are verified.",
+      "When writing the file, call the write tool with both required fields: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. Never call write with content only.",
     ].join("\\n");
     if (ctx.isIdle()) {{
       pi.sendUserMessage(prompt);

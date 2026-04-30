@@ -1453,7 +1453,10 @@ def _with_tool_instructions(
         "search, and source-backed questions. Do not guess when a suitable tool is "
         "available. Summarize tool JSON clearly, including sources or timestamps "
         "when present. Ask for clarification only when the required location, "
-        "topic, or identifier is genuinely missing."
+        "topic, or identifier is genuinely missing. When using a write/file-writing "
+        "tool, include both required arguments: path and content. Example: "
+        "{\"path\":\"report.md\",\"content\":\"<full markdown report>\"}. "
+        "Never call write with content only."
         )
         instructions = f"{instructions}\n\n{pi_instructions}"
     messages = list(payload.get("messages") or [])

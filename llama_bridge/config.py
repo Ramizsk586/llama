@@ -185,6 +185,7 @@ tools:
     - source_research
     - image_research
     - verify_sources
+    - master_review
   # Tool selection and filtering (NEW)
   max_exposed: 8  # Limit tools in request (after filtering)
   relevance_filter: true  # Enable relevance-based filtering
@@ -221,6 +222,48 @@ tools:
     enabled: true
     language: en
     base_url: https://en.wikipedia.org
+
+master_review:
+  enabled: true
+  run_after_deep_research: true
+  mode: balanced
+  groq:
+    enabled: true
+    base_url: https://api.groq.com/openai/v1
+    model: llama-3.3-70b-versatile
+    api_keys:
+      - ${GROQ_API_KEY_1}
+      - ${GROQ_API_KEY_2}
+      - ${GROQ_API_KEY_3}
+    timeout_seconds: 45
+    max_retries_per_key: 2
+    cooldown_seconds_after_429: 60
+    cooldown_seconds_after_5xx: 20
+    max_parallel_agents: 1
+    requests_per_minute_per_key: 30
+    tokens_per_minute_per_key: 12000
+    requests_per_day_per_key: 1000
+    tokens_per_day_per_key: 100000
+    rate_limit_wait_seconds: 45
+  sub_agents:
+    spelling_grammar: true
+    evidence_validity: true
+    evidence_reliability: true
+    citation_coverage: true
+    neutrality_bias: true
+    logic_consistency: true
+    format_quality: true
+    final_synthesis: true
+  debate:
+    enabled: true
+    rounds: 2
+    require_disagreement: true
+    max_points_per_agent: 8
+  output:
+    return_review_trace: true
+    return_revised_draft: true
+    return_final_llm_instructions: true
+    max_instruction_tokens: 1800
 
 vs_copilot:
   models:
@@ -349,6 +392,63 @@ class ToolConfig:
 
 
 @dataclass(slots=True)
+class MasterGroqConfig:
+    enabled: bool = True
+    base_url: str = "https://api.groq.com/openai/v1"
+    model: str = "llama-3.3-70b-versatile"
+    api_keys: list[str] = field(default_factory=list)
+    timeout_seconds: float = 45.0
+    max_retries_per_key: int = 2
+    cooldown_seconds_after_429: int = 60
+    cooldown_seconds_after_5xx: int = 20
+    max_parallel_agents: int = 1
+    requests_per_minute_per_key: int = 30
+    tokens_per_minute_per_key: int = 12000
+    requests_per_day_per_key: int = 1000
+    tokens_per_day_per_key: int = 100000
+    rate_limit_wait_seconds: int = 45
+
+
+@dataclass(slots=True)
+class MasterSubAgentsConfig:
+    spelling_grammar: bool = True
+    evidence_validity: bool = True
+    evidence_reliability: bool = True
+    citation_coverage: bool = True
+    neutrality_bias: bool = True
+    logic_consistency: bool = True
+    format_quality: bool = True
+    final_synthesis: bool = True
+
+
+@dataclass(slots=True)
+class MasterDebateConfig:
+    enabled: bool = True
+    rounds: int = 2
+    require_disagreement: bool = True
+    max_points_per_agent: int = 8
+
+
+@dataclass(slots=True)
+class MasterOutputConfig:
+    return_review_trace: bool = True
+    return_revised_draft: bool = True
+    return_final_llm_instructions: bool = True
+    max_instruction_tokens: int = 1800
+
+
+@dataclass(slots=True)
+class MasterReviewConfig:
+    enabled: bool = True
+    run_after_deep_research: bool = True
+    mode: str = "balanced"
+    groq: MasterGroqConfig = field(default_factory=MasterGroqConfig)
+    sub_agents: MasterSubAgentsConfig = field(default_factory=MasterSubAgentsConfig)
+    debate: MasterDebateConfig = field(default_factory=MasterDebateConfig)
+    output: MasterOutputConfig = field(default_factory=MasterOutputConfig)
+
+
+@dataclass(slots=True)
 class BridgeConfig:
     server: ServerConfig
     providers: dict[str, ProviderConfig]
@@ -358,6 +458,7 @@ class BridgeConfig:
     copilot_cli: CopilotCliConfig
     vs_copilot_models: list[VsCopilotModel]
     tools: ToolConfig
+    master_review: MasterReviewConfig
     source_path: Path
 
 
@@ -712,6 +813,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
 
     vs_copilot_models = _load_vs_copilot_models(raw, providers, aliases, pi, codex)
     tools = _load_tool_config(raw)
+    master_review = _load_master_review_config(raw)
 
     bridge_config = BridgeConfig(
         server=server,
@@ -722,6 +824,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         copilot_cli=copilot_cli,
         vs_copilot_models=vs_copilot_models,
         tools=tools,
+        master_review=master_review,
         source_path=config_path,
     )
     write_claude_api_settings(
@@ -731,6 +834,74 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         force=True,
     )
     return bridge_config
+
+
+def _load_master_review_config(raw: dict[str, Any]) -> MasterReviewConfig:
+    review_raw = raw.get("master_review", {}) or {}
+    mode = str(review_raw.get("mode", "balanced")).lower()
+    if mode not in {"fast", "balanced", "strict"}:
+        raise ValueError("master_review.mode must be one of: fast, balanced, strict")
+
+    groq_raw = review_raw.get("groq", {}) or {}
+    api_keys = [
+        str(key).strip()
+        for key in (groq_raw.get("api_keys") or [])
+        if str(key or "").strip() and not str(key).strip().startswith("${")
+    ]
+    groq = MasterGroqConfig(
+        enabled=bool(groq_raw.get("enabled", True)),
+        base_url=str(groq_raw.get("base_url", "https://api.groq.com/openai/v1")).rstrip("/"),
+        model=str(groq_raw.get("model", "llama-3.3-70b-versatile")),
+        api_keys=api_keys,
+        timeout_seconds=float(groq_raw.get("timeout_seconds", 45.0)),
+        max_retries_per_key=max(0, int(groq_raw.get("max_retries_per_key", 2))),
+        cooldown_seconds_after_429=max(0, int(groq_raw.get("cooldown_seconds_after_429", 60))),
+        cooldown_seconds_after_5xx=max(0, int(groq_raw.get("cooldown_seconds_after_5xx", 20))),
+        max_parallel_agents=max(1, int(groq_raw.get("max_parallel_agents", 1))),
+        requests_per_minute_per_key=max(1, int(groq_raw.get("requests_per_minute_per_key", 30))),
+        tokens_per_minute_per_key=max(1, int(groq_raw.get("tokens_per_minute_per_key", 12000))),
+        requests_per_day_per_key=max(1, int(groq_raw.get("requests_per_day_per_key", 1000))),
+        tokens_per_day_per_key=max(1, int(groq_raw.get("tokens_per_day_per_key", 100000))),
+        rate_limit_wait_seconds=max(0, int(groq_raw.get("rate_limit_wait_seconds", 45))),
+    )
+
+    sub_raw = review_raw.get("sub_agents", {}) or {}
+    sub_agents = MasterSubAgentsConfig(
+        spelling_grammar=bool(sub_raw.get("spelling_grammar", True)),
+        evidence_validity=bool(sub_raw.get("evidence_validity", True)),
+        evidence_reliability=bool(sub_raw.get("evidence_reliability", True)),
+        citation_coverage=bool(sub_raw.get("citation_coverage", True)),
+        neutrality_bias=bool(sub_raw.get("neutrality_bias", True)),
+        logic_consistency=bool(sub_raw.get("logic_consistency", True)),
+        format_quality=bool(sub_raw.get("format_quality", True)),
+        final_synthesis=bool(sub_raw.get("final_synthesis", True)),
+    )
+
+    debate_raw = review_raw.get("debate", {}) or {}
+    debate = MasterDebateConfig(
+        enabled=bool(debate_raw.get("enabled", True)),
+        rounds=max(0, min(2, int(debate_raw.get("rounds", 2)))),
+        require_disagreement=bool(debate_raw.get("require_disagreement", True)),
+        max_points_per_agent=max(1, int(debate_raw.get("max_points_per_agent", 8))),
+    )
+
+    output_raw = review_raw.get("output", {}) or {}
+    output = MasterOutputConfig(
+        return_review_trace=bool(output_raw.get("return_review_trace", True)),
+        return_revised_draft=bool(output_raw.get("return_revised_draft", True)),
+        return_final_llm_instructions=bool(output_raw.get("return_final_llm_instructions", True)),
+        max_instruction_tokens=max(200, int(output_raw.get("max_instruction_tokens", 1800))),
+    )
+
+    return MasterReviewConfig(
+        enabled=bool(review_raw.get("enabled", True)),
+        run_after_deep_research=bool(review_raw.get("run_after_deep_research", True)),
+        mode=mode,
+        groq=groq,
+        sub_agents=sub_agents,
+        debate=debate,
+        output=output,
+    )
 
 
 def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
