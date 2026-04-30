@@ -36,6 +36,7 @@ from .config import (
     write_default_config,
 )
 from .master import MasterReviewer
+from .mcp_tools import main as mcp_tools_main
 from .tools import ToolRegistry, classify_query_intent, select_relevant_tools
 
 
@@ -485,6 +486,9 @@ def main() -> None:
             return
         parser.print_help()
         return
+    if args.command == "mcp-tools":
+        mcp_tools_main()
+        return
     if args.command == "master-review":
         _cmd_master_review(
             _arg_path(args.config),
@@ -492,6 +496,7 @@ def main() -> None:
             mode=args.mode,
             use_stdin=args.stdin,
             check_keys=args.check_keys,
+            write_reviewed=Path(args.write_reviewed) if args.write_reviewed else None,
         )
         return
     if args.command == "pi":
@@ -666,6 +671,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     tools_diagnose_cmd.add_argument("query")
 
+    subparsers.add_parser("mcp-tools", help="run the bridge tools MCP adapter")
+
     master_cmd = subparsers.add_parser(
         "master-review",
         help="review a deep/source research JSON report and print final improvement instructions",
@@ -683,6 +690,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--check-keys",
         action="store_true",
         help="show configured Groq key slots without revealing key values",
+    )
+    master_cmd.add_argument(
+        "--write-reviewed",
+        help="write the revised draft to this path when the review produces one",
     )
 
     subparsers.add_parser(
@@ -1469,6 +1480,7 @@ def _cmd_master_review(
     mode: str | None,
     use_stdin: bool,
     check_keys: bool,
+    write_reviewed: Path | None = None,
 ) -> None:
     config = load_config(config_path)
     if check_keys:
@@ -1503,11 +1515,7 @@ def _cmd_master_review(
     if not isinstance(research_result, dict):
         raise SystemExit("research JSON must be an object")
 
-    reviewer = MasterReviewer(config.master_review)
-    try:
-        review = asyncio.run(reviewer.review_deep_research(research_result, mode=mode))
-    finally:
-        asyncio.run(reviewer.aclose())
+    review = asyncio.run(_run_master_review_once(config.master_review, research_result, mode))
 
     data = review.get("data", {}) if isinstance(review.get("data"), dict) else {}
     final_review = data.get("final_review", {}) if isinstance(data.get("final_review"), dict) else {}
@@ -1515,21 +1523,29 @@ def _cmd_master_review(
     instructions = str(data.get("final_llm_instructions") or "")
     instructions_path = output_dir / "master_review_instructions.txt"
     instructions_path.write_text(instructions + "\n", encoding="utf-8")
+    if write_reviewed is not None and data.get("revised_draft"):
+        write_reviewed.write_text(str(data.get("revised_draft")) + "\n", encoding="utf-8")
 
     _title("Master Review")
     _kv_rows(
         [
-            ("Quality score", f"{data.get('quality_score', 'n/a')}/10"),
+            ("Quality score", f"{data.get('quality_score', 'n/a')} / 10"),
             ("Risk level", str(data.get("risk_level", "unknown"))),
+            ("Groq keys configured", len(config.master_review.groq.api_keys)),
             ("Groq keys used", ", ".join(metadata.get("groq_keys_used") or []) or "none"),
-            ("Fallback used", str(metadata.get("fallback_used", False))),
+            ("Fallback used", str(metadata.get("fallback_used", False)).lower()),
         ]
     )
     _print_cli_list("Must fix", final_review.get("must_fix", []))
     _print_cli_list("Weak sources", final_review.get("weak_sources", []))
     _print_cli_list("Unsupported claims", final_review.get("unsupported_claims", []))
     print()
+    print("Final LLM instructions:")
+    print(instructions or "none")
+    print()
     print(f"Final LLM instructions written to: {instructions_path}")
+    if write_reviewed is not None and data.get("revised_draft"):
+        print(f"Reviewed answer written to: {write_reviewed}")
 
 
 def _print_cli_list(title: str, values: Any, *, limit: int = 8) -> None:
@@ -1541,6 +1557,14 @@ def _print_cli_list(title: str, values: Any, *, limit: int = 8) -> None:
         return
     for item in items[:limit]:
         print(f"- {str(item)[:500]}")
+
+
+async def _run_master_review_once(master_config, research_result: dict[str, Any], mode: str | None) -> dict[str, Any]:
+    reviewer = MasterReviewer(master_config)
+    try:
+        return await reviewer.review_deep_research(research_result, mode=mode)
+    finally:
+        await reviewer.aclose()
 
 
 def _configured_label(value: str | None) -> str:
@@ -2009,6 +2033,302 @@ def _write_json(path: Path, data: dict) -> None:
         ) from exc
 
 
+def _ensure_claude_tool_plugin(config, config_path: Path) -> Path:
+    plugin_dir = config_path.parent / "plugins" / "llama_bridge_tools_claude"
+    _write_claude_tool_plugin(plugin_dir, config)
+    short_commands_dir = _write_claude_short_commands()
+    _print_state("ok", f"Claude Code llama bridge tools plugin: {plugin_dir}", "32")
+    _print_state("ok", f"Claude Code short slash commands: {short_commands_dir}", "32")
+    return plugin_dir
+
+
+def _ensure_codex_tool_extension(config) -> tuple[Path, Path]:
+    codex_config_path = Path(os.path.expanduser(config.codex.config_path))
+    codex_config_path.parent.mkdir(parents=True, exist_ok=True)
+    plugin_dir = codex_config_path.parent / "plugins" / "llama_bridge_tools"
+    _write_codex_tool_plugin(plugin_dir, config)
+    _write_codex_mcp_config(codex_config_path, config)
+    _print_state("ok", f"Codex llama bridge tools plugin: {plugin_dir}", "32")
+    _print_state("ok", f"Codex MCP tools config: {codex_config_path}", "32")
+    return plugin_dir, codex_config_path
+
+
+def _ensure_copilot_tool_extension(config) -> Path:
+    config_path = Path(os.path.expanduser("~/.copilot/mcp-config.json"))
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    data = _read_json_object(config_path)
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    command, args = _mcp_server_command()
+    servers["llama_bridge_tools"] = {
+        "type": "local",
+        "command": command,
+        "args": args,
+        "env": _mcp_server_env(config),
+        "tools": ["*"],
+        "timeout": 300000,
+    }
+    data["mcpServers"] = servers
+    _write_json(config_path, data)
+    _print_state("ok", f"Copilot CLI MCP tools config: {config_path}", "32")
+    return config_path
+
+
+def _write_claude_tool_plugin(plugin_dir: Path, config) -> None:
+    (plugin_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "skills" / "llama-bridge-tools").mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "commands").mkdir(parents=True, exist_ok=True)
+    _write_json(
+        plugin_dir / ".claude-plugin" / "plugin.json",
+        {
+            "name": "llama-bridge-tools",
+            "version": "0.1.0",
+            "description": "Expose local llama bridge HTTP tools to Claude Code through MCP.",
+            "author": {"name": "llama bridge"},
+            "license": "Apache-2.0",
+            "keywords": ["llama", "bridge", "mcp", "tools"],
+            "skills": "./skills/",
+            "mcpServers": "./.mcp.json",
+        },
+    )
+    _write_json(plugin_dir / ".mcp.json", _mcp_json_config(config))
+    (plugin_dir / "skills" / "llama-bridge-tools" / "SKILL.md").write_text(
+        _bridge_tools_skill("Claude Code"),
+        encoding="utf-8",
+    )
+    _write_claude_bridge_commands(plugin_dir / "commands")
+
+
+def _write_codex_tool_plugin(plugin_dir: Path, config) -> None:
+    (plugin_dir / ".codex-plugin").mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "skills" / "llama-bridge-tools").mkdir(parents=True, exist_ok=True)
+    _write_json(
+        plugin_dir / ".codex-plugin" / "plugin.json",
+        {
+            "name": "llama-bridge-tools",
+            "version": "0.1.0",
+            "description": "Expose local llama bridge HTTP tools to Codex through MCP.",
+            "author": {"name": "llama bridge"},
+            "license": "Apache-2.0",
+            "keywords": ["llama", "bridge", "mcp", "tools"],
+            "skills": "./skills/",
+            "mcpServers": "./.mcp.json",
+            "interface": {
+                "displayName": "Llama Bridge Tools",
+                "shortDescription": "Local web, research, image, weather, and citation tools",
+                "longDescription": "Connects Codex to the local llama bridge MCP adapter so enabled bridge tools can be called directly.",
+                "developerName": "llama bridge",
+                "category": "Productivity",
+                "capabilities": ["Read", "Interactive"],
+                "defaultPrompt": "Use llama bridge tools for current search, source research, images, weather, Wikipedia, or time lookups.",
+                "brandColor": "#111111",
+                "screenshots": [],
+            },
+        },
+    )
+    _write_json(plugin_dir / ".mcp.json", _mcp_json_config(config))
+    (plugin_dir / "skills" / "llama-bridge-tools" / "SKILL.md").write_text(
+        _bridge_tools_skill("Codex"),
+        encoding="utf-8",
+    )
+
+
+def _write_codex_mcp_config(codex_config_path: Path, config) -> None:
+    existing = codex_config_path.read_text(encoding="utf-8") if codex_config_path.exists() else ""
+    command, args = _mcp_server_command()
+    section = "\n".join(
+        [
+            f'command = "{_toml_escape(command)}"',
+            f"args = {_toml_string_array(args)}",
+            f"env = {_toml_inline_table(_mcp_server_env(config))}",
+            "startup_timeout_sec = 30",
+            "tool_timeout_sec = 300",
+            "enabled = true",
+        ]
+    )
+    updated = _replace_toml_section(existing, "mcp_servers.llama_bridge_tools", section)
+    if updated and not updated.endswith("\n"):
+        updated += "\n"
+    codex_config_path.write_text(updated, encoding="utf-8")
+
+
+def _mcp_json_config(config) -> dict:
+    command, args = _mcp_server_command()
+    return {
+        "mcpServers": {
+            "llama_bridge_tools": {
+                "type": "stdio",
+                "command": command,
+                "args": args,
+                "env": _mcp_server_env(config),
+            }
+        }
+    }
+
+
+def _mcp_server_env(config) -> dict[str, str]:
+    return {
+        "LLAMA_BRIDGE_BASE_URL": _server_url(config.server.host, config.server.port),
+        "LLAMA_BRIDGE_API_KEY": config.server.auth_token,
+    }
+
+
+def _bridge_tools_skill(host_name: str) -> str:
+    return f"""---
+name: llama-bridge-tools
+description: Use when {host_name} needs current web search, source research, image research, weather, Wikipedia, or date/time lookups through the local llama bridge MCP tools.
+---
+
+# Llama Bridge Tools
+
+Use the `llama_bridge_tools` MCP server when a task needs current information,
+source verification, image candidates, weather, Wikipedia, or local date/time
+lookups.
+
+Prefer the highest-level bridge tool that fits the task:
+
+- `source_research` for cited factual research and evidence gathering.
+- `image_research` for compact sourced image candidates.
+- `tavily_search` or `serpapi_search` for current web results.
+- `wikipedia_search` and `wikipedia_page` for encyclopedia context.
+- `weather_current` for live weather.
+- `datetime_now` for current time or timezone questions.
+
+The MCP server calls the local llama bridge HTTP tool endpoints, so the llama
+server must be running for tool calls to succeed.
+"""
+
+
+def _mcp_server_command() -> tuple[str, list[str]]:
+    if getattr(sys, "frozen", False):
+        return sys.executable, ["mcp-tools"]
+    return sys.executable, ["-m", "llama_bridge.mcp_tools"]
+
+
+def _write_claude_bridge_commands(commands_dir: Path) -> None:
+    for filename, (description, hint, body) in _claude_bridge_commands().items():
+        _write_claude_command_file(commands_dir / filename, description, hint, body, force=True)
+
+
+def _write_claude_short_commands() -> Path:
+    commands_dir = Path(os.path.expanduser("~/.claude/commands"))
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    for filename, (description, hint, body) in _claude_bridge_commands().items():
+        _write_claude_command_file(commands_dir / filename, description, hint, body, force=False)
+    return commands_dir
+
+
+def _claude_bridge_commands() -> dict[str, tuple[str, str, str]]:
+    deep = (
+        "Run deep sourced research through the llama bridge.",
+        "[topic]",
+        _bridge_command_body(
+            "research topic",
+            (
+                "Use `mcp__llama_bridge_tools__source_research` first for the user input, then verify important claims "
+                "with available llama bridge search tools, use `mcp__llama_bridge_tools__image_research` for 2-3 "
+                "useful sourced images, and produce a concise cited research brief."
+            ),
+        ),
+    )
+    serp = (
+        "Run a SerpAPI web search through the llama bridge.",
+        "[query]",
+        _bridge_command_body(
+            "search query",
+            "Use `mcp__llama_bridge_tools__serpapi_search` for the user input and summarize the best results with URLs.",
+        ),
+    )
+    web = (
+        "Run a web search through the llama bridge.",
+        "[query]",
+        _bridge_command_body(
+            "web search query",
+            "Use the best available llama bridge web search MCP tool for the user input and include URLs.",
+        ),
+    )
+    fetch = (
+        "Fetch a URL through the llama bridge.",
+        "[url]",
+        _bridge_command_body(
+            "URL",
+            "Use the llama bridge web fetch or source research tools to fetch and summarize the user input.",
+        ),
+    )
+    image = (
+        "Find sourced image candidates through the llama bridge.",
+        "[query]",
+        _bridge_command_body(
+            "image search topic",
+            "Use `mcp__llama_bridge_tools__image_research` to find 2-3 compact sourced image candidates for the user input.",
+        ),
+    )
+    return {
+        "deep.md": deep,
+        "deep_research.md": deep,
+        "deep-research.md": deep,
+        "serp.md": serp,
+        "serp_search.md": serp,
+        "serp-sarch.md": serp,
+        "web.md": web,
+        "web_search.md": web,
+        "fetch.md": fetch,
+        "image.md": image,
+        "image_search.md": image,
+        "image-sarch.md": image,
+    }
+
+
+def _write_claude_command_file(
+    path: Path,
+    description: str,
+    hint: str,
+    body: str,
+    *,
+    force: bool,
+) -> None:
+    content = "\n".join(
+        [
+            "<!-- Generated by llama bridge. Safe to replace. -->",
+            "---",
+            f"description: {description}",
+            f"argument-hint: {hint}",
+            "allowed-tools: mcp__llama_bridge_tools",
+            "---",
+            "",
+            body,
+            "",
+        ]
+    )
+    if not force and path.exists():
+        existing = path.read_text(encoding="utf-8", errors="replace")
+        if "Generated by llama bridge" not in existing:
+            return
+    path.write_text(content, encoding="utf-8")
+
+
+def _bridge_command_body(input_label: str, action: str) -> str:
+    return "\n".join(
+        [
+            f"User input: $ARGUMENTS",
+            "",
+            f"If the user input is empty, ask the user for the {input_label} in one short question and wait for their answer. Do not call tools yet.",
+            "",
+            f"If the user input is not empty, {action}",
+        ]
+    )
+
+
+def _toml_inline_table(values: dict[str, str]) -> str:
+    parts = [f'{key} = "{_toml_escape(value)}"' for key, value in values.items()]
+    return "{ " + ", ".join(parts) + " }"
+
+
+def _toml_string_array(values: list[str]) -> str:
+    return "[" + ", ".join(f'"{_toml_escape(value)}"' for value in values) + "]"
+
+
 def _cmd_claude(
     config_path: Path,
     pid_path: Path,
@@ -2017,7 +2337,7 @@ def _cmd_claude(
     install_claude: bool = True,
 ) -> None:
     _ensure_setup(config_path)
-    load_config(config_path)
+    config = load_config(config_path)
     api_settings_path = config_path.parent / DEFAULT_API_SETTINGS_PATH.name
     claude_executable = _ensure_claude_code(install=install_claude)
 
@@ -2045,7 +2365,16 @@ def _cmd_claude(
     if passthrough_args and passthrough_args[0] == "--":
         passthrough_args = passthrough_args[1:]
 
-    command = [claude_executable, "--settings", str(api_settings_path), *passthrough_args]
+    plugin_dir = _ensure_claude_tool_plugin(config, config_path)
+
+    command = [
+        claude_executable,
+        "--settings",
+        str(api_settings_path),
+        "--plugin-dir",
+        str(plugin_dir),
+        *passthrough_args,
+    ]
     return_code = subprocess.run(command, check=False).returncode
     if idle_after_file is not None:
         idle_after_file.write_text("closed\n", encoding="utf-8")
@@ -2099,6 +2428,7 @@ def _cmd_codex(
 
     codex_executable = _ensure_codex(install=install_codex, package=config.codex.install_package)
     codex_config_path, model_catalog_path = _write_codex_config(config, provider_name, model)
+    codex_plugin_dir, codex_mcp_config_path = _ensure_codex_tool_extension(config)
 
     _title("llama codex")
     _print_state("ok", "Codex configuration is ready", "32")
@@ -2109,6 +2439,8 @@ def _cmd_codex(
             ("profile", config.codex.profile),
             ("config", str(codex_config_path)),
             ("models", str(model_catalog_path)),
+            ("tools plugin", str(codex_plugin_dir)),
+            ("mcp tools", str(codex_mcp_config_path)),
         ]
     )
 
@@ -2176,6 +2508,7 @@ def _cmd_copilot(
         install=install_copilot,
         package=config.copilot_cli.install_package,
     )
+    copilot_mcp_config_path = _ensure_copilot_tool_extension(config)
 
     _title("llama copilot")
     _print_state("ok", "Copilot CLI environment is ready", "32")
@@ -2187,6 +2520,7 @@ def _cmd_copilot(
             ("wire api", config.copilot_cli.wire_api),
             ("prompt tokens", config.copilot_cli.max_prompt_tokens),
             ("output tokens", config.copilot_cli.max_output_tokens),
+            ("mcp tools", str(copilot_mcp_config_path)),
         ]
     )
 
@@ -3411,10 +3745,13 @@ function sortFindingsByQuality(findings: any[]) {{
 async function searchProvider(provider: string, query: string, maxResults: number, signal: AbortSignal) {{
   if (provider === "web_search") {{
     const data = await postJson("/api/web_search", {{ query, max_results: maxResults }}, signal);
+    if (data?.error || data?.ok === false) throw new Error(String(data?.error?.message ?? data?.error ?? "web_search failed"));
     return normalizeSearchResults(provider, query, data);
   }}
   if (provider === "serpapi_search") {{
     const data = await callBridgeTool("serpapi_search", {{ query, num: maxResults }}, signal);
+    const errorText = toolErrorText("serpapi_search", data);
+    if (errorText) throw new Error(errorText);
     return normalizeSearchResults(provider, query, data);
   }}
   if (provider === "tavily_search") {{
@@ -3423,6 +3760,8 @@ async function searchProvider(provider: string, query: string, maxResults: numbe
       max_results: maxResults,
       include_answer: true,
     }}, signal);
+    const errorText = toolErrorText("tavily_search", data);
+    if (errorText) throw new Error(errorText);
     const results = normalizeSearchResults(provider, query, data);
     if (data?.answer) {{
       results.unshift({{

@@ -840,7 +840,12 @@ def _load_master_review_config(raw: dict[str, Any]) -> MasterReviewConfig:
     review_raw = raw.get("master_review", {}) or {}
     mode = str(review_raw.get("mode", "balanced")).lower()
     if mode not in {"fast", "balanced", "strict"}:
-        raise ValueError("master_review.mode must be one of: fast, balanced, strict")
+        warnings.warn(
+            "master_review.mode must be one of: fast, balanced, strict; using balanced.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        mode = "balanced"
 
     groq_raw = review_raw.get("groq", {}) or {}
     api_keys = [
@@ -848,8 +853,16 @@ def _load_master_review_config(raw: dict[str, Any]) -> MasterReviewConfig:
         for key in (groq_raw.get("api_keys") or [])
         if str(key or "").strip() and not str(key).strip().startswith("${")
     ]
+    enabled = bool(review_raw.get("enabled", True))
+    groq_enabled = bool(groq_raw.get("enabled", True))
+    if enabled and groq_enabled and not api_keys:
+        warnings.warn(
+            "master_review.enabled is true but no real Groq keys are configured; local fallback review will be used.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     groq = MasterGroqConfig(
-        enabled=bool(groq_raw.get("enabled", True)),
+        enabled=groq_enabled,
         base_url=str(groq_raw.get("base_url", "https://api.groq.com/openai/v1")).rstrip("/"),
         model=str(groq_raw.get("model", "llama-3.3-70b-versatile")),
         api_keys=api_keys,
@@ -859,9 +872,9 @@ def _load_master_review_config(raw: dict[str, Any]) -> MasterReviewConfig:
         cooldown_seconds_after_5xx=max(0, int(groq_raw.get("cooldown_seconds_after_5xx", 20))),
         max_parallel_agents=max(1, int(groq_raw.get("max_parallel_agents", 1))),
         requests_per_minute_per_key=max(1, int(groq_raw.get("requests_per_minute_per_key", 30))),
-        tokens_per_minute_per_key=max(1, int(groq_raw.get("tokens_per_minute_per_key", 12000))),
+        tokens_per_minute_per_key=max(1000, int(groq_raw.get("tokens_per_minute_per_key", 12000))),
         requests_per_day_per_key=max(1, int(groq_raw.get("requests_per_day_per_key", 1000))),
-        tokens_per_day_per_key=max(1, int(groq_raw.get("tokens_per_day_per_key", 100000))),
+        tokens_per_day_per_key=max(1000, int(groq_raw.get("tokens_per_day_per_key", 100000))),
         rate_limit_wait_seconds=max(0, int(groq_raw.get("rate_limit_wait_seconds", 45))),
     )
 
@@ -894,7 +907,7 @@ def _load_master_review_config(raw: dict[str, Any]) -> MasterReviewConfig:
     )
 
     return MasterReviewConfig(
-        enabled=bool(review_raw.get("enabled", True)),
+        enabled=enabled,
         run_after_deep_research=bool(review_raw.get("run_after_deep_research", True)),
         mode=mode,
         groq=groq,

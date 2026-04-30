@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "llama_bridge_tools": {
+      "type": "stdio",
+      "command": "C:\\Users\\skabd\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+      "args": [
+        "-m",
+        "llama_bridge.mcp_tools"
+      ],
+      "env": {
+        "LLAMA_BRIDGE_BASE_URL": "http://127.0.0.1:8089",
+        "LLAMA_BRIDGE_API_KEY": "change-me"
+      }
+    }
+  }
+}

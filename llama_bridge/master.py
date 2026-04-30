@@ -17,8 +17,13 @@ LOADED_TERMS = {
     "decapitation": "removal or replacement of senior officials",
     "militarization": "heavy security deployment; described by critics as militarization",
     "manipulation": "alleged manipulation, unless independently verified",
-    "purged": "removed from electoral rolls; use 'purged' only in quoted/source-attributed context",
-    "crackdown": "security action or enforcement action, depending on context",
+    "purged": "removed from electoral rolls; use only in a quoted/attributed context",
+    "crackdown": "security enforcement action",
+    "regime": "government or administration (unless in a quoted context)",
+    "brainwashing": "alleged influence or indoctrination",
+    "genocide": "use only when legally or officially established; otherwise 'alleged atrocities'",
+    "terror": "violence or alleged terrorism (check whether officially designated)",
+    "invasion": "military incursion or offensive operation (unless officially named as invasion)",
 }
 
 REPUTABLE_NEWS = {
@@ -50,6 +55,19 @@ SOCIAL_DOMAINS = {
     "youtu.be",
     "reddit.com",
 }
+
+WIRE_SERVICES = {"reuters.com", "apnews.com"}
+ACADEMIC_JOURNALS = {
+    "jstor.org",
+    "pubmed.ncbi.nlm.nih.gov",
+    "doi.org",
+    "springer.com",
+    "nature.com",
+}
+ACADEMIC_REPOSITORIES = {"academia.edu", "researchgate.net"}
+VIDEO_PLATFORMS = {"youtube.com", "youtu.be"}
+FORUM_DOMAINS = {"reddit.com"}
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 
 BASE_JSON_INSTRUCTION = (
     "Return only valid JSON. Do not include markdown. "
@@ -93,7 +111,13 @@ FORMAT_READABILITY_SYSTEM = (
 )
 DEBATE_SYSTEM = (
     "You are a debate judge coordinating specialist reviewers. Identify disagreements, "
-    "choose the strongest criticisms, and classify fixes. Do not introduce new factual claims. "
+    "choose the strongest criticisms, and classify fixes. "
+    "You may only debate the reviewers' findings and the provided research data. "
+    "Do not add new historical, political, scientific, or factual claims. "
+    "Do not add new sources. "
+    "If evidence is insufficient, recommend softening or removing the claim - not adding imagined support. "
+    "Return JSON with exactly these list fields: agreements, disagreements, resolved_decisions, "
+    "must_fix, should_fix, do_not_change. "
     + BASE_JSON_INSTRUCTION
 )
 FINAL_SYNTHESIS_SYSTEM = (
@@ -681,19 +705,20 @@ class MasterReviewer:
         parsed = await self.client.complete_json(system=FINAL_SYNTHESIS_SYSTEM, user=user, schema_name="final_synthesis", max_tokens=3000)
         if parsed.get("ok") is False and parsed.get("error"):
             return local
-        final_review = _final_review(agent_results, debate_results)
+        final_review = _apply_deterministic_quality_floor(_final_review(agent_results, debate_results), review_input)
         final_review["must_fix"].extend(str(item) for item in parsed.get("must_fix", []))
         final_review["should_fix"].extend(str(item) for item in parsed.get("should_fix", []))
+        final_review = _dedupe_final_review(final_review)
+        risk = str(parsed.get("risk_level") or local["risk_level"])
+        instructions = str(parsed.get("final_llm_instructions") or local["final_llm_instructions"])
+        instructions = _ensure_required_instruction_sections(instructions, final_review, risk)
         return {
             "quality_score": _bounded_score(parsed.get("quality_score", local["quality_score"])),
-            "risk_level": str(parsed.get("risk_level") or local["risk_level"]),
+            "risk_level": risk,
             "sub_agent_results": [_sub_agent_to_dict(result) for result in agent_results],
             "debate_results": [_debate_to_dict(result) for result in debate_results],
-            "final_review": _dedupe_final_review(final_review),
-            "final_llm_instructions": _truncate_instructions(
-                str(parsed.get("final_llm_instructions") or local["final_llm_instructions"]),
-                int(getattr(self.config.output, "max_instruction_tokens", 1800)),
-            ),
+            "final_review": final_review,
+            "final_llm_instructions": _truncate_instructions(instructions, int(getattr(self.config.output, "max_instruction_tokens", 1800))),
             "revised_draft": str(parsed.get("revised_draft") or local["revised_draft"]),
             "confidence_assessment": _confidence_assessment(parsed.get("confidence_assessment"), local),
         }
@@ -756,26 +781,74 @@ def local_loaded_language_checks(text: str) -> list[dict[str, Any]]:
     return findings[:20]
 
 
+def classify_source(url: str, title: str = "") -> dict[str, Any]:
+    domain = _domain(url)
+    path = urlparse(url).path.lower()
+    title_lower = title.lower()
+    source_type = "unknown"
+    score = 4.0
+    recommended_use = "needs_confirmation"
+    concerns: list[str] = []
+
+    if path.endswith(IMAGE_EXTENSIONS):
+        source_type, score, recommended_use = "image_only", 2.0, "illustrative_only"
+        concerns.append("Image URL; do not use as factual evidence unless source page is verified.")
+    elif domain in {"eci.gov.in", "voters.eci.gov.in"}:
+        source_type, score, recommended_use = "official_election_body", 9.5, "primary_support"
+    elif domain == "pib.gov.in":
+        source_type, score, recommended_use = "official_government", 9.0, "primary_support"
+    elif _domain_matches(domain, WIRE_SERVICES):
+        source_type, score, recommended_use = "wire_service", 8.5, "strong_support"
+    elif _domain_matches(domain, ACADEMIC_JOURNALS):
+        source_type, score, recommended_use = "academic_journal", 8.8, "strong_support"
+    elif _domain_matches(domain, ACADEMIC_REPOSITORIES):
+        source_type, score, recommended_use = "academic_repository", 5.5, "needs_confirmation"
+        concerns.append("Academic upload repository; confirm with publisher, DOI, or institution.")
+    elif _domain_matches(domain, FORUM_DOMAINS):
+        source_type, score, recommended_use = "forum", 2.5, "avoid"
+        concerns.append("Forum content; do not use as evidence for factual claims.")
+    elif _domain_matches(domain, SOCIAL_DOMAINS - VIDEO_PLATFORMS - FORUM_DOMAINS):
+        source_type, score, recommended_use = "social_media", 3.0, "illustrative_only"
+        concerns.append("Social-media source; use only as attributed primary-post context.")
+    elif _domain_matches(domain, VIDEO_PLATFORMS):
+        source_type, score, recommended_use = "video_platform", 4.0, "avoid_as_primary"
+        concerns.append("Video platform; avoid as primary evidence unless official channel/transcript is verified.")
+    elif domain.endswith(".gov") or ".gov." in domain or domain.endswith(".gov.in") or domain.endswith(".gov.uk"):
+        source_type, score, recommended_use = "official_government", 9.0, "primary_support"
+    elif domain.endswith(".edu") or ".edu." in domain or domain.endswith(".ac.uk") or domain.endswith(".ac.in"):
+        source_type, score, recommended_use = "university", 8.0, "strong_support"
+    elif _domain_matches(domain, REPUTABLE_NEWS):
+        source_type, score, recommended_use = "reputable_news", 7.5, "support"
+    elif any(word in domain for word in ("press", "publisher", "books", "oup.com", "cambridge.org")):
+        source_type, score, recommended_use = "book_or_publisher", 7.0, "background"
+    elif any(word in domain for word in ("advocacy", "opinion", "thinktank")) or any(word in title_lower for word in ("opinion", "editorial")):
+        source_type, score, recommended_use = "advocacy_or_opinion", 5.0, "contested"
+        concerns.append("Opinion or advocacy framing; corroborate before using as evidence.")
+    elif path.endswith(".pdf"):
+        source_type, score, recommended_use = "unknown_pdf", 4.0, "needs_confirmation"
+        concerns.append("PDF from unrecognized domain; confirm author, publisher, and date.")
+
+    return {
+        "url": url,
+        "title": title,
+        "domain": domain,
+        "source_type": source_type,
+        "reliability_score": score,
+        "reliability": _reliability_label(score),
+        "recommended_use": recommended_use,
+        "concerns": concerns,
+    }
+
+
 def local_source_quality_checks(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     assessments = []
     for source in sources:
         url = str(source.get("url") or source.get("link") or source.get("source_url") or "")
         title = str(source.get("title") or source.get("name") or "")
-        domain = _domain(url)
-        score = 5
-        source_type = "unknown"
-        concerns: list[str] = []
-        if domain.endswith(".gov") or ".gov." in domain or domain.endswith(".edu") or ".edu." in domain:
-            score, source_type = 9, "official"
-        elif domain in REPUTABLE_NEWS:
-            score, source_type = 8, "reputable_news"
-        elif domain in SOCIAL_DOMAINS:
-            score, source_type = 2, "social"
-            concerns.append("Social-media source; use only as attributed primary-post evidence or background.")
-        elif any(word in domain for word in ("blog", "medium.com", "substack.com")):
-            score, source_type = 4, "analysis"
-            concerns.append("Blog or newsletter source needs confirmation.")
+        assessment = classify_source(url or str(source.get("image_url") or source.get("thumbnail") or ""), title)
+        score = float(assessment["reliability_score"])
+        concerns: list[str] = list(assessment.get("concerns") or [])
         if source.get("image_url") and not source.get("source_url") and not url:
             score = min(score, 2)
             concerns.append("Image-only evidence lacks source page.")
@@ -791,10 +864,12 @@ def local_source_quality_checks(sources: list[dict[str, Any]]) -> list[dict[str,
             {
                 "url": url,
                 "title": title,
-                "source_type": source_type,
+                "domain": assessment.get("domain", ""),
+                "source_type": assessment["source_type"],
                 "reliability_score": score,
+                "reliability": _reliability_label(score),
                 "concerns": concerns,
-                "recommended_use": "primary_support" if score >= 8 else "background_only" if score >= 5 else "needs_confirmation",
+                "recommended_use": assessment["recommended_use"],
             }
         )
     return assessments
@@ -802,22 +877,72 @@ def local_source_quality_checks(sources: list[dict[str, Any]]) -> list[dict[str,
 
 def local_claim_support_checks(claims: list[dict[str, Any]], sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_text = " ".join(json.dumps(source, ensure_ascii=True, default=str).lower() for source in sources)
+    source_assessments = local_source_quality_checks(sources)
     assessments = []
     for item in claims:
         claim = str(item.get("claim") or item.get("text") or item.get("finding") or item.get("title") or item)
         tokens = [token for token in re.findall(r"[A-Za-z0-9]{5,}", claim.lower()) if token not in {"therefore", "because"}]
         hits = sum(1 for token in tokens[:12] if token in source_text)
-        status = "weakly_supported" if hits >= 2 else "unsupported"
+        status, confidence, reason, action = classify_claim_status(claim, source_assessments, hits)
         assessments.append(
             {
                 "claim": claim,
                 "status": status,
-                "supporting_sources": [],
-                "reason": "Local keyword overlap check; confirm with source text before finalizing.",
-                "recommended_action": "keep" if status == "weakly_supported" else "add_citation",
+                "confidence": confidence,
+                "supporting_sources": _supporting_sources_for_claim(claim, source_assessments, sources),
+                "reason": reason,
+                "recommended_action": action,
             }
         )
     return assessments[:30]
+
+
+def classify_claim_status(
+    claim: str,
+    source_assessments: list[dict[str, Any]],
+    keyword_hits: int = 0,
+) -> tuple[str, str, str, str]:
+    text = claim.lower()
+    source_types = {str(item.get("source_type")) for item in source_assessments}
+    strong_types = {"official_election_body", "official_government", "court_or_legal", "academic_journal", "wire_service", "university"}
+    has_strong = bool(source_types & strong_types)
+    reputable_count = sum(1 for item in source_assessments if item.get("source_type") == "reputable_news")
+    academic_count = sum(1 for item in source_assessments if item.get("source_type") == "academic_journal")
+
+    if any(term in text for term in ("mahabharata", "ramayana", "epic", "purana", "mytholog", "scripture")) and re.search(
+        r"\b(millions?|crores?|vast armies|warriors?)\b", text
+    ):
+        return (
+            "traditional",
+            "low",
+            "Epic or traditional scale claim; present as narrative/tradition, not verified history.",
+            "label_traditional_and_soften",
+        )
+    if re.search(r"\b\d{3,4}\s*(?:bce|bc)\b", text) and academic_count == 0:
+        return (
+            "disputed",
+            "low",
+            "Exact ancient date lacks academic source support in provided evidence.",
+            "mark_disputed_or_remove_exact_date",
+        )
+    if any(term in text for term in ("alleged", "allegation", "accused", "claimed", "manipulation", "fraud", "rigged", "purged")) and not has_strong:
+        return (
+            "reported" if reputable_count else "disputed",
+            "medium" if reputable_count else "low",
+            "Political or contested allegation lacks official/legal confirmation in provided sources.",
+            "attribute_and_soften",
+        )
+    if any(term in text for term in ("scientific consensus", "clinical", "medical", "causes", "effective")):
+        if academic_count >= 2:
+            return ("verified", "high", "Scientific claim has at least two peer-reviewed/academic sources.", "keep_with_citations")
+        return ("unsupported", "low", "Scientific/medical consensus claim needs at least two peer-reviewed sources.", "add_peer_reviewed_sources_or_soften")
+    if has_strong and keyword_hits >= 1:
+        return ("verified", "high", "Supported by official, academic, university, or wire-service source evidence.", "keep_with_citations")
+    if reputable_count and keyword_hits >= 1:
+        return ("reported", "medium", "Reported by reputable news but not confirmed by primary/academic sources.", "attribute_as_reported")
+    if keyword_hits >= 2:
+        return ("reported", "medium", "Some source overlap exists, but source authority is limited.", "soften_and_cite")
+    return ("unsupported", "low", "No credible source support found in the provided evidence.", "remove_or_add_citation")
 
 
 def _fallback_spelling(review_input: MasterReviewInput) -> SubAgentResult:
@@ -838,12 +963,13 @@ def _fallback_evidence_validity(review_input: MasterReviewInput) -> SubAgentResu
     claims = review_input.key_findings or _extract_claims(review_input.draft_answer)
     assessments = local_claim_support_checks(claims, review_input.sources)
     unsupported = [item["claim"] for item in assessments if item["status"] == "unsupported"]
+    must_fix_claims = [item["claim"] for item in assessments if item["status"] in {"unsupported", "disputed", "traditional"}]
     return SubAgentResult(
         agent="evidence_validity_agent",
         ok=True,
-        score=max(0.0, 9.0 - len(unsupported)),
+        score=max(0.0, 9.0 - len(must_fix_claims)),
         findings=[{"claim_assessments": assessments}],
-        must_fix=[f"Add evidence or soften/remove: {claim[:160]}" for claim in unsupported[:8]],
+        must_fix=[f"Label, soften, cite, or remove: {claim[:160]}" for claim in must_fix_claims[:8]],
         should_fix=[],
         confidence="low",
         raw={"claim_assessments": assessments, "unsupported_claims": unsupported},
@@ -950,11 +1076,24 @@ def _local_synthesis(
     debate_results: list[DebateRoundResult],
     config: Any,
 ) -> dict[str, Any]:
-    final_review = _dedupe_final_review(_final_review(agent_results, debate_results))
-    scores = [result.score for result in agent_results if result.ok]
-    quality = round(_average(scores, default=6.5), 1)
-    risk = "high" if final_review["unsupported_claims"] or len(final_review["must_fix"]) >= 6 else "medium" if final_review["must_fix"] else "low"
-    instructions = build_final_llm_instructions(final_review, int(getattr(config.output, "max_instruction_tokens", 1800)))
+    raw_final = _apply_deterministic_quality_floor(_final_review(agent_results, debate_results), review_input)
+    final_review = _dedupe_final_review(raw_final)
+    claim_assessments = _collect_claim_assessments(agent_results)
+    source_assessments = _collect_source_assessments(agent_results)
+    citation_issues = _stringify_list(raw_final.get("citation_fixes", []))
+    bias_issues = _stringify_list(raw_final.get("bias_warnings", []))
+    quality, risk, score_explanation = calculate_quality_score(
+        agent_results,
+        claim_assessments,
+        source_assessments,
+        citation_issues,
+        bias_issues,
+    )
+    final_review["claim_assessments"] = claim_assessments
+    final_review["source_assessments"] = source_assessments
+    final_review["quality_score_explanation"] = score_explanation
+    confidence = build_confidence_assessment(claim_assessments, final_review)
+    instructions = build_final_llm_instructions(final_review, int(getattr(config.output, "max_instruction_tokens", 1800)), risk)
     revised = review_input.draft_answer if getattr(config.output, "return_revised_draft", True) else ""
     return {
         "quality_score": quality,
@@ -964,25 +1103,101 @@ def _local_synthesis(
         "final_review": final_review,
         "final_llm_instructions": instructions,
         "revised_draft": revised,
-        "confidence_assessment": {
-            "high_confidence": ["Claims directly supported by official, primary, or reputable sources."],
-            "medium_confidence": ["Claims supported by secondary sources or partial source overlap."],
-            "low_confidence": final_review["unsupported_claims"][:8] or ["Claims lacking citations or source confirmation."],
-        },
+        "confidence_assessment": confidence,
     }
 
 
-def build_final_llm_instructions(final_review: dict[str, Any], max_instruction_tokens: int = 1800) -> str:
+def calculate_quality_score(
+    agent_results: list[SubAgentResult],
+    claim_assessments: list[dict[str, Any]],
+    source_assessments: list[dict[str, Any]],
+    citation_issues: list[str],
+    bias_issues: list[str],
+) -> tuple[float, str, list[str]]:
+    base = _average([result.score for result in agent_results if result.ok], default=8.5)
+    score = float(base)
+    explanation = [f"Base agent average: {base:.1f}."]
+    p1_issue = False
+
+    weak_sources = [item for item in source_assessments if float(item.get("reliability_score") or 0) <= 4.0]
+    image_sources = [item for item in source_assessments if item.get("source_type") == "image_only"]
+    unsupported = [item for item in claim_assessments if item.get("status") == "unsupported"]
+    disputed = [item for item in claim_assessments if item.get("status") == "disputed"]
+    overconfident = [item for item in claim_assessments if item.get("status") in {"traditional", "reported"} and item.get("recommended_action") not in {"keep", "keep_with_citations"}]
+
+    if weak_sources:
+        penalty = 0.5 * len(weak_sources)
+        score -= penalty
+        explanation.append(f"Weak/social sources used as evidence: -{penalty:.1f}.")
+        p1_issue = True
+    if unsupported:
+        penalty = 0.8 * len(unsupported)
+        score -= penalty
+        explanation.append(f"Unsupported major claims: -{penalty:.1f}.")
+        p1_issue = True
+    if disputed:
+        penalty = 0.8 * len(disputed)
+        score -= penalty
+        explanation.append(f"Disputed claims stated too strongly: -{penalty:.1f}.")
+        p1_issue = True
+    if overconfident:
+        penalty = 0.3 * len(overconfident)
+        score -= penalty
+        explanation.append(f"Overconfident or unlabeled wording: -{penalty:.1f}.")
+        p1_issue = True
+    if image_sources:
+        penalty = 0.5 * len(image_sources)
+        score -= penalty
+        explanation.append(f"Image-only evidence misuse risk: -{penalty:.1f}.")
+    if citation_issues:
+        penalty = 0.4 * len(citation_issues)
+        score -= penalty
+        explanation.append(f"Invalid or missing citations: -{penalty:.1f}.")
+        p1_issue = True
+    if bias_issues:
+        penalty = 0.3 * len(bias_issues)
+        score -= penalty
+        explanation.append(f"Loaded or biased wording: -{penalty:.1f}.")
+
+    score = round(max(0.0, min(10.0, score)), 1)
+    sensitive_unsupported = any(
+        re.search(r"\b(election|fraud|medical|legal|genocide|terror|war|crime|accused|alleged)\b", str(item.get("claim", "")), re.I)
+        for item in unsupported
+    )
+    if score < 7.0 or sensitive_unsupported:
+        risk = "high"
+    elif score < 8.8 or p1_issue:
+        risk = "medium"
+    else:
+        risk = "low"
+    explanation.append(f"Final risk level: {risk}.")
+    return score, risk, explanation
+
+
+def build_confidence_assessment(claim_assessments: list[dict[str, Any]], final_review: dict[str, Any]) -> dict[str, list[str]]:
+    high = [str(item.get("claim")) for item in claim_assessments if item.get("confidence") == "high"][:8]
+    medium = [str(item.get("claim")) for item in claim_assessments if item.get("confidence") == "medium"][:8]
+    low = [str(item.get("claim")) for item in claim_assessments if item.get("confidence") == "low"][:8]
+    if not high:
+        high = ["Claims directly supported by official, academic, university, or wire-service sources."]
+    if not medium:
+        medium = ["Claims supported only by reputable reporting or partial source overlap."]
+    if not low:
+        low = final_review.get("unsupported_claims", [])[:8] or ["Claims lacking specific citations or source confirmation."]
+    return {"high_confidence": high, "medium_confidence": medium, "low_confidence": low}
+
+
+def build_final_llm_instructions(final_review: dict[str, Any], max_instruction_tokens: int = 1800, risk_level: str | None = None) -> str:
     sections = [
         "You are rewriting the deep research answer after expert review.",
         "",
         "Must follow these instructions:",
         "1. Fix spelling and grammar issues listed below.",
-        "2. Label claims as confirmed, reported, disputed, weakly supported, or unsupported where appropriate.",
+        "2. Label claims as verified, reported, disputed, traditional, or unsupported where appropriate.",
         "3. Remove or soften unsupported claims.",
         "4. Use neutral language for politically sensitive or contested claims.",
-        "5. Add a Source Quality table when source quality varies.",
-        "6. Add a Confidence Assessment section.",
+        "5. Do not use social media, forums, Reddit posts, video platforms, or image-only links as factual evidence.",
+        "6. Treat epic, religious, mythological, and traditional narratives as traditional claims unless academic historical evidence supports them.",
         "7. Do not invent new sources.",
         "8. Do not add claims not present in the research data.",
         "9. Preserve useful structure: executive summary, findings, limitations, conclusion.",
@@ -994,6 +1209,34 @@ def build_final_llm_instructions(final_review: dict[str, Any], max_instruction_t
         _bullet_section("Neutral wording replacements", final_review.get("bias_warnings", [])),
         _bullet_section("Citation fixes", final_review.get("citation_fixes", [])),
     ]
+    if risk_level in {"medium", "high"}:
+        sections.extend(
+            [
+                "",
+                "The rewritten report must include these Markdown sections exactly:",
+                "",
+                "## Source Quality Assessment",
+                "| Source | Type | Reliability | Recommended Use |",
+                "|--------|------|-------------|-----------------|",
+                "",
+                "## Claim Evidence Matrix",
+                "| Claim | Status | Supporting Source(s) | Confidence | Action |",
+                "|-------|--------|----------------------|------------|--------|",
+                "",
+                "## Confidence Assessment",
+                "**High confidence:**",
+                "- ...",
+                "",
+                "**Medium confidence:**",
+                "- ...",
+                "",
+                "**Low confidence:**",
+                "- ...",
+                "",
+                "## Evidence Gaps",
+                "- ...",
+            ]
+        )
     return _truncate_instructions("\n".join(item for item in sections if item), max_instruction_tokens)
 
 
@@ -1063,6 +1306,8 @@ def _payload_findings(raw: dict[str, Any]) -> list[dict[str, Any]]:
 def _final_review(agent_results: list[SubAgentResult], debate_results: list[DebateRoundResult]) -> dict[str, Any]:
     raw_by_agent = {result.agent: result.raw for result in agent_results}
     weak_sources = raw_by_agent.get("evidence_reliability_agent", {}).get("weak_sources", [])
+    source_assessments = raw_by_agent.get("evidence_reliability_agent", {}).get("source_assessments", [])
+    claim_assessments = raw_by_agent.get("evidence_validity_agent", {}).get("claim_assessments", [])
     unsupported = raw_by_agent.get("evidence_validity_agent", {}).get("unsupported_claims", [])
     bias = raw_by_agent.get("neutrality_bias_agent", {}).get("loaded_terms", [])
     spelling = raw_by_agent.get("spelling_grammar_agent", {}).get("findings", [])
@@ -1076,11 +1321,50 @@ def _final_review(agent_results: list[SubAgentResult], debate_results: list[Deba
         "bias_warnings": _stringify_list(bias),
         "spelling_grammar_fixes": _stringify_list(spelling),
         "citation_fixes": _stringify_list(citation),
+        "claim_assessments": claim_assessments if isinstance(claim_assessments, list) else [],
+        "source_assessments": source_assessments if isinstance(source_assessments, list) else [],
     }
 
 
+def _apply_deterministic_quality_floor(final_review: dict[str, Any], review_input: MasterReviewInput) -> dict[str, Any]:
+    output = dict(final_review)
+    local_sources = local_source_quality_checks(review_input.sources)
+    local_claims = local_claim_support_checks(review_input.key_findings or _extract_claims(review_input.draft_answer), review_input.sources)
+    if local_sources:
+        output["source_assessments"] = local_sources
+        weak = [item for item in local_sources if float(item.get("reliability_score") or 0) <= 4.0]
+        existing_weak = output.get("weak_sources", []) if isinstance(output.get("weak_sources"), list) else []
+        output["weak_sources"] = [*existing_weak, *weak]
+    if local_claims:
+        existing_claims = output.get("claim_assessments", []) if isinstance(output.get("claim_assessments"), list) else []
+        output["claim_assessments"] = [*local_claims, *existing_claims]
+        traditional_claims = [item["claim"] for item in local_claims if item.get("status") == "traditional"]
+        disputed_claims = [item["claim"] for item in local_claims if item.get("status") == "disputed"]
+        unsupported_claims = [item["claim"] for item in local_claims if item.get("status") == "unsupported"]
+        existing_unsupported = _stringify_list(output.get("unsupported_claims", []))
+        output["unsupported_claims"] = [
+            claim
+            for claim in [*existing_unsupported, *unsupported_claims]
+            if claim not in traditional_claims
+        ]
+        must = output.get("must_fix", []) if isinstance(output.get("must_fix"), list) else []
+        output["must_fix"] = [
+            *must,
+            *[f"Label as traditional narrative and avoid verified historical wording: {claim[:160]}" for claim in traditional_claims],
+            *[f"Mark disputed or remove exact unsupported dating: {claim[:160]}" for claim in disputed_claims],
+        ]
+    return output
+
+
 def _dedupe_final_review(final_review: dict[str, Any]) -> dict[str, Any]:
-    return {key: _dedupe(_stringify_list(value)) for key, value in final_review.items()}
+    structured_keys = {"claim_assessments", "source_assessments", "quality_score_explanation"}
+    output: dict[str, Any] = {}
+    for key, value in final_review.items():
+        if key in structured_keys and isinstance(value, list):
+            output[key] = value
+        else:
+            output[key] = _dedupe(_stringify_list(value))
+    return output
 
 
 def _confidence_assessment(value: Any, local: dict[str, Any]) -> dict[str, list[str]]:
@@ -1091,6 +1375,41 @@ def _confidence_assessment(value: Any, local: dict[str, Any]) -> dict[str, list[
             "low_confidence": _stringify_list(value.get("low_confidence", [])),
         }
     return local["confidence_assessment"]
+
+
+def _collect_claim_assessments(agent_results: list[SubAgentResult]) -> list[dict[str, Any]]:
+    for result in agent_results:
+        if result.agent != "evidence_validity_agent":
+            continue
+        values = result.raw.get("claim_assessments")
+        if isinstance(values, list):
+            return [item for item in values if isinstance(item, dict)]
+    return []
+
+
+def _collect_source_assessments(agent_results: list[SubAgentResult]) -> list[dict[str, Any]]:
+    for result in agent_results:
+        if result.agent != "evidence_reliability_agent":
+            continue
+        values = result.raw.get("source_assessments")
+        if isinstance(values, list):
+            return [item for item in values if isinstance(item, dict)]
+    return []
+
+
+def _ensure_required_instruction_sections(instructions: str, final_review: dict[str, Any], risk_level: str) -> str:
+    if risk_level not in {"medium", "high"}:
+        return instructions
+    required = [
+        "## Source Quality Assessment",
+        "## Claim Evidence Matrix",
+        "## Confidence Assessment",
+        "## Evidence Gaps",
+    ]
+    if all(section in instructions for section in required):
+        return instructions
+    generated = build_final_llm_instructions(final_review, 1800, risk_level)
+    return instructions.rstrip() + "\n\n" + generated
 
 
 def _sub_agent_to_dict(result: SubAgentResult) -> dict[str, Any]:
@@ -1153,6 +1472,35 @@ def _domain(url: str) -> str:
     parsed = urlparse(url)
     host = (parsed.netloc or parsed.path).lower().split("@")[-1].split(":")[0]
     return host[4:] if host.startswith("www.") else host
+
+
+def _domain_matches(domain: str, patterns: set[str]) -> bool:
+    return any(domain == pattern or domain.endswith(f".{pattern}") for pattern in patterns)
+
+
+def _reliability_label(score: float) -> str:
+    if score >= 8.5:
+        return "high"
+    if score >= 6.5:
+        return "medium"
+    if score >= 4.5:
+        return "low"
+    return "weak"
+
+
+def _supporting_sources_for_claim(
+    claim: str,
+    source_assessments: list[dict[str, Any]],
+    raw_sources: list[dict[str, Any]],
+) -> list[str]:
+    tokens = {token for token in re.findall(r"[A-Za-z0-9]{5,}", claim.lower()) if token not in {"therefore", "because"}}
+    matches: list[str] = []
+    for index, (assessment, source) in enumerate(zip(source_assessments, raw_sources, strict=False), start=1):
+        source_text = json.dumps(source, ensure_ascii=True, default=str).lower()
+        if tokens and not any(token in source_text for token in list(tokens)[:12]):
+            continue
+        matches.append(str(source.get("id") or source.get("index") or source.get("url") or assessment.get("url") or index))
+    return matches[:5]
 
 
 def _average(values: list[float], *, default: float) -> float:

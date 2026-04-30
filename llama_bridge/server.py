@@ -214,21 +214,21 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         payload = _completion_request_to_chat_completion(body, resolved.upstream_model)
+        payload = _with_bridge_tools(payload, app.state.tools, config)
         provider = _provider_for(app, resolved)
         if bool(body.get("stream")):
+            _log_streaming_tool_policy(config, "openai_completion", payload)
             return StreamingResponse(
                 _safe_stream(_stream_completion_response(provider, payload, body, config)),
                 media_type="text/event-stream",
             )
 
         try:
-            response = await provider.create_chat_completion(payload, stream=False)
-            response.raise_for_status()
+            data = await _chat_completion_with_bridge_tools(app, provider, payload, config)
         except httpx.HTTPStatusError as exc:
             return _upstream_error(exc.response)
         except httpx.RequestError as exc:
             return _request_error(exc)
-        data = response.json()
         return JSONResponse(_chat_completion_to_completion_response(data, body))
 
     @app.post("/v1/embeddings")

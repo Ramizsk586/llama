@@ -1,0 +1,17 @@
+{
+  "name": "llama-bridge-tools",
+  "version": "0.1.0",
+  "description": "Expose local llama bridge HTTP tools to Claude Code through MCP.",
+  "author": {
+    "name": "llama bridge"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "llama",
+    "bridge",
+    "mcp",
+    "tools"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

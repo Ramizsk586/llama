@@ -157,6 +157,15 @@ llama pi --model qwen3.5:cloud
 To use NVIDIA NIM instead, set `provider: nvidia_nim` and choose a model from
 that provider.
 
+`llama claude` launches Claude Code with `Api.json` and also writes a local
+Claude Code plugin under `plugins/llama_bridge_tools_claude` next to your
+`env.yml`. The plugin is loaded with `--plugin-dir` and exposes the same bridge
+tools through an MCP server named `llama_bridge_tools`. It also adds Claude
+user slash commands such as `/serp`, `/web`, `/fetch`, `/image`, `/image_search`,
+`/image-sarch`, `/deep`, `/deep_research`, and `/deep-research` that prompt
+Claude to use the corresponding bridge MCP tools without the long plugin
+namespace.
+
 `llama codex` configures and launches OpenAI Codex CLI with the local llama
 bridge. If Codex is missing, llama installs Node.js/npm through the available OS
 package manager and then installs Codex with `npm install -g @openai/codex`.
@@ -175,7 +184,18 @@ model = "qwen3.5:cloud"
 model_provider = "llama_bridge"
 model_context_window = 65536
 model_catalog_json = "C:\\Users\\you\\.codex\\llama_bridge_models.json"
+
+[mcp_servers.llama_bridge_tools]
+command = "llama"
+args = ["mcp-tools"]
+env = { LLAMA_BRIDGE_BASE_URL = "http://127.0.0.1:8089", LLAMA_BRIDGE_API_KEY = "change-me" }
+startup_timeout_sec = 30
+tool_timeout_sec = 300
+enabled = true
 ```
+
+It also writes a Codex plugin bundle under `~/.codex/plugins/llama_bridge_tools`
+with a companion skill and MCP manifest for Codex plugin-aware surfaces.
 
 Pass Codex arguments after `--`:
 
@@ -186,7 +206,9 @@ llama codex -- --help
 `llama copilot` configures and launches GitHub Copilot CLI with the local llama
 bridge. If Copilot CLI is missing, llama installs Node.js/npm through the
 available OS package manager and then installs Copilot CLI with
-`npm install -g @github/copilot`. Configure the provider and model in `env.yml`:
+`npm install -g @github/copilot`. It also writes
+`~/.copilot/mcp-config.json` so Copilot CLI sees the bridge tools as the
+`llama_bridge_tools` MCP server. Configure the provider and model in `env.yml`:
 
 ```yaml
 copilot_cli:
@@ -261,6 +283,11 @@ Cohere (`/v1/chat`), and Gemini (`:generateContent`) calls execute bridge-owned
 tool calls on the server and send the result back to the model before returning
 the final answer. External apps can also call tools directly through the HTTP
 tool endpoints above.
+
+Claude Code, Codex, and Copilot CLI get those tools through the `llama mcp-tools`
+stdio MCP adapter when launched by `llama claude`, `llama codex`, or
+`llama copilot`. The adapter lists the enabled bridge tools from `/api/tools`
+and calls `/api/tools/{name}` with the configured local bridge API key.
 
 ## GitHub Copilot
 

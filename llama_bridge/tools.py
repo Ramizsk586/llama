@@ -1874,7 +1874,7 @@ TOOL_KEYWORDS = {
     "source_research": {
         "keywords": [
             "verify", "source", "sources", "citation", "cite", "accurate", "solid",
-            "research", "latest", "current", "evidence", "fact check", "markdown",
+            "research", "deep research", "latest", "current", "evidence", "fact check", "markdown",
         ],
         "weight": 3.5,
     },
@@ -1885,6 +1885,15 @@ TOOL_KEYWORDS = {
     "verify_sources": {
         "keywords": ["verify", "check source", "validate", "link", "links", "url", "citation", "fact check"],
         "weight": 3.0,
+    },
+    "master_review": {
+        "keywords": [
+            "review report", "rate report", "audit report",
+            "check evidence", "citation audit", "source quality",
+            "improve research", "make it 9.5", "final reviewer",
+            "quality check", "master review", "fact check report",
+        ],
+        "weight": 4.0,
     },
 }
 
@@ -1918,6 +1927,10 @@ def classify_query_intent(query: str) -> dict[str, float]:
             text,
             ("verify", "is this true", "fact check", "sources", "citation", "citations", "reliable", "evidence", "check citations"),
         ),
+        "review": _phrase_score(
+            text,
+            ("review report", "rate report", "audit report", "citation audit", "source quality", "improve research", "make it 9.5", "final reviewer", "quality check", "master review", "fact check report"),
+        ),
         "image": _phrase_score(
             text,
             ("image", "images", "photo", "picture", "visual", "screenshot", "illustration"),
@@ -1929,7 +1942,7 @@ def classify_query_intent(query: str) -> dict[str, float]:
     if intents["web_search"]:
         intents["encyclopedia"] *= 0.5
     if no_tool:
-        for key in ("weather", "time", "web_search", "encyclopedia", "verify", "image"):
+        for key in ("weather", "time", "web_search", "encyclopedia", "verify", "review", "image"):
             intents[key] *= 0.25
     return {key: round(value, 3) for key, value in intents.items() if value > 0}
 
@@ -1975,6 +1988,7 @@ def score_tool_for_query(
         "serpapi_search": {"web_search": 4.7, "verify": 1.5},
         "source_research": {"verify": 5.5, "web_search": 3.0},
         "verify_sources": {"verify": 6.0},
+        "master_review": {"review": 7.0, "verify": 2.5},
         "image_research": {"image": 7.0},
     }
     for intent, weight in intent_weights.get(tool_name, {}).items():
@@ -2051,7 +2065,7 @@ def _forced_tool_bonus(tool_name: str, query_lower: str) -> float:
         return 3.0
     if tool_name == "source_research" and any(
         word in query_lower
-        for word in ("verify", "source", "sources", "citation", "accurate", "research", "current", "latest")
+        for word in ("verify", "source", "sources", "citation", "accurate", "research", "deep research", "current", "latest")
     ):
         return 4.0
     if tool_name == "image_research" and any(
@@ -2062,6 +2076,24 @@ def _forced_tool_bonus(tool_name: str, query_lower: str) -> float:
         word in query_lower for word in ("verify", "validate", "link", "links", "url", "citation")
     ):
         return 4.0
+    if tool_name == "master_review" and any(
+        phrase in query_lower
+        for phrase in (
+            "review report",
+            "rate report",
+            "audit report",
+            "check evidence",
+            "citation audit",
+            "source quality",
+            "improve research",
+            "make it 9.5",
+            "final reviewer",
+            "quality check",
+            "master review",
+            "fact check report",
+        )
+    ):
+        return 4.5
     if tool_name == "wikipedia_search" and any(
         phrase in query_lower for phrase in ("who is", "what is", "history", "definition")
     ):
@@ -2138,6 +2170,7 @@ def _tool_sort_key(tool: dict[str, Any], scores: dict[str, float], default_searc
         "weather_current": 90,
         "datetime_now": 85,
         "verify_sources": 80,
+        "master_review": 78,
         "source_research": 75,
         f"{default_search_provider}_search": 70,
         "tavily_search": 65,
@@ -2167,6 +2200,8 @@ def _forced_tool_names(query: str, default_search_provider: str = "tavily") -> s
     if any(word in query_lower for word in ("latest", "news", "current", "recent", "price", "web")):
         preferred = f"{default_search_provider}_search"
         return {preferred, "source_research"}
+    if any(phrase in query_lower for phrase in ("deep research", "source research", "research report", "source verification")):
+        return {"source_research", "verify_sources"}
     if any(
         phrase in query_lower
         for phrase in ("current time", "what time", "time in", "today's date", "date today", "current date", "timezone")
@@ -2174,6 +2209,24 @@ def _forced_tool_names(query: str, default_search_provider: str = "tavily") -> s
         return {"datetime_now"}
     if any(word in query_lower for word in ("image", "images", "photo", "picture", "visual")):
         return {"image_research"}
+    if any(
+        phrase in query_lower
+        for phrase in (
+            "review report",
+            "rate report",
+            "audit report",
+            "check evidence",
+            "citation audit",
+            "source quality",
+            "improve research",
+            "make it 9.5",
+            "final reviewer",
+            "quality check",
+            "master review",
+            "fact check report",
+        )
+    ):
+        return {"master_review"}
     if any(phrase in query_lower for phrase in ("verify", "is this true", "fact check", "citation", "sources")):
         return {"verify_sources", "source_research"}
     if any(phrase in query_lower for phrase in ("who is", "who was", "what is", "history", "definition")):
