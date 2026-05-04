@@ -1118,13 +1118,25 @@ def create_app(
     @app.get("/v1/tools")
     @app.get("/api/tools")
     async def list_bridge_tools(
+        request: Request,
         x_api_key: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
         _check_tools_auth(config, x_api_key, authorization)
         if not config.tools.expose_http:
             raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
-        return _bridge_tools_response(app.state.tools)
+        # Detect CLI type from user agent or headers
+        user_agent = request.headers.get("user-agent", "").lower()
+        cli_type = "generic"
+        if "copilot" in user_agent:
+            cli_type = "copilot"
+        elif "claude" in user_agent:
+            cli_type = "claude"
+        elif "pi" in user_agent or "mariozechner" in user_agent:
+            cli_type = "pi"
+        elif "codex" in user_agent:
+            cli_type = "codex"
+        return _bridge_tools_response(app.state.tools, cli_type)
 
     @app.post("/v1/tools/call")
     @app.post("/api/tools/call")
@@ -1317,7 +1329,7 @@ def _with_bridge_tools(
 ) -> dict[str, Any]:
     """
     Merge bridge tools into request, optionally filtering by relevance.
-    
+
     Args:
         payload: Request payload
         registry: Tool registry
@@ -1325,7 +1337,9 @@ def _with_bridge_tools(
         enable_filtering: Enable tool relevance filtering
         max_exposed_tools: Maximum tools to include (after filtering)
     """
-    bridge_tools = registry.openai_tools()
+    # Detect CLI type for enhanced tool descriptions
+    cli_type = _detect_cli_type(payload, config) if config else "generic"
+    bridge_tools = registry.openai_tools(cli_type)
     if not bridge_tools:
         return payload
 
@@ -1336,7 +1350,7 @@ def _with_bridge_tools(
     # Apply relevance filtering if enabled
     if enable_filtering:
         query = _latest_user_text(payload.get("messages", []))[:500]
-        
+
         if query:
             filtered_tools, scores = select_relevant_tools(
                 bridge_tools,
@@ -1366,6 +1380,7 @@ def _with_bridge_tools(
                         "confidence_threshold": config.tools.confidence_threshold if config else 0.5,
                         "default_search_provider": config.tools.default_search_provider if config else "tavily",
                     },
+                    "cli_type": cli_type,
                 },
             ) if config else None
             bridge_tools = filtered_tools
@@ -1427,6 +1442,115 @@ def _latest_user_text(messages: Any) -> str:
     return ""
 
 
+def _detect_cli_type(payload: dict[str, Any], config: BridgeConfig) -> str:
+    """Detect which CLI type is being used based on request patterns."""
+    model = payload.get("model", "")
+
+    # Check for known CLI models
+    try:
+        pi_model = resolve_pi_model(config)
+        if model == pi_model:
+            return "pi"
+    except Exception:
+        pass
+
+    try:
+        codex_model = resolve_codex_model(config)
+        if model == codex_model:
+            return "codex"
+    except Exception:
+        pass
+
+    try:
+        copilot_model = resolve_copilot_cli_model(config)
+        if model == copilot_model:
+            return "copilot"
+    except Exception:
+        pass
+
+    # Check for Claude Code patterns
+    messages = payload.get("messages", [])
+    if any("anthropic" in str(msg).lower() for msg in messages):
+        return "claude"
+
+    # Check for specific tool usage patterns
+    if any("copilot" in str(payload).lower()):
+        return "copilot"
+
+    return "generic"
+
+
+def _get_cli_specific_instructions(cli_type: str, config: BridgeConfig) -> str:
+    """Get CLI-specific tool instructions and animations."""
+    base_instructions = (
+        "Tool-use rules:\n"
+        "- Use tools for current facts, weather, time/date, timezone info, and web research.\n"
+        "- Do not guess when a relevant tool is available.\n"
+        "- When a tool result is returned, treat it as the source of truth unless it contains an error.\n"
+        "- If a tool result has ok=false, explain the failure and answer only if enough information remains.\n"
+        "- Do not invent citations, URLs, prices, dates, or weather data.\n"
+        "- If sources are returned, mention them accurately."
+    )
+
+    cli_customizations = {
+        "pi": (
+            "🎯 Pi CLI Mode - Enhanced Tool Experience:\n"
+            "• Use available tools for factual, current, time, weather, search, and source-backed questions.\n"
+            "• Display progress with animated indicators: 🔍 for search, 🌤️ for weather, 🕐 for time.\n"
+            "• Summarize tool JSON clearly, including sources or timestamps when present.\n"
+            "• Show confidence levels and source verification status.\n"
+            "• Ask for clarification only when the required location, topic, or identifier is genuinely missing.\n"
+            "• When using file-writing tools, include both required arguments: path and content.\n"
+            "• Example: {\"path\":\"report.md\",\"content\":\"<full markdown report>\"}.\n"
+            "• Never call write with content only."
+        ),
+        "copilot": (
+            "🚀 GitHub Copilot CLI Mode - Streamlined Tool Integration:\n"
+            "• Focus on code-related searches, documentation, and current technical information.\n"
+            "• Use animated progress indicators: 💻 for code search, 📚 for docs, 🔧 for tools.\n"
+            "• Provide concise summaries with direct links and code examples.\n"
+            "• Prioritize developer-focused tools and current API documentation.\n"
+            "• Format results for easy code integration and reference.\n"
+            "• Highlight breaking changes and version compatibility."
+        ),
+        "codex": (
+            "🔮 OpenAI Codex Mode - Research & Analysis Tools:\n"
+            "• Emphasize deep research, source verification, and comprehensive analysis.\n"
+            "• Use progress animations: 📊 for research, ✅ for verification, 📈 for analysis.\n"
+            "• Provide detailed source citations and evidence chains.\n"
+            "• Support complex multi-step research workflows.\n"
+            "• Include confidence scores and alternative viewpoints.\n"
+            "• Format results for academic and professional standards."
+        ),
+        "claude": (
+            "🧠 Claude Code Mode - Intelligent Tool Usage:\n"
+            "• Leverage Claude's reasoning capabilities with tool integration.\n"
+            "• Use contextual animations: 🤔 for thinking, 🔍 for investigation, 💡 for insights.\n"
+            "• Provide nuanced analysis with multiple perspectives.\n"
+            "• Support creative and analytical workflows.\n"
+            "• Include reasoning traces and alternative approaches.\n"
+            "• Format results for comprehensive understanding."
+        ),
+    }
+
+    cli_instruction = cli_customizations.get(cli_type, "")
+    custom_instruction = ""
+
+    if cli_type == "pi" and config.tools.pi_system_instructions:
+        custom_instruction = config.tools.pi_system_instructions
+    elif config.tools.tool_system_instructions:
+        custom_instruction = config.tools.tool_system_instructions
+
+    if cli_instruction and custom_instruction:
+        return f"{base_instructions}\n\n{cli_instruction}\n\n{custom_instruction}"
+    elif cli_instruction:
+        return f"{base_instructions}\n\n{cli_instruction}"
+    elif custom_instruction:
+        return f"{base_instructions}\n\n{custom_instruction}"
+    else:
+        return base_instructions
+
+
 def _with_tool_instructions(
     payload: dict[str, Any],
     config: BridgeConfig,
@@ -1434,31 +1558,10 @@ def _with_tool_instructions(
 ) -> dict[str, Any]:
     if not selected_tools:
         return payload
-    instructions = config.tools.tool_system_instructions or (
-        "Tool-use rules:\n"
-        "- Use tools for current facts, weather, time/date, source verification, and web research.\n"
-        "- Do not guess when a relevant tool is available.\n"
-        "- When a tool result is returned, treat it as the source of truth unless it contains an error.\n"
-        "- If a tool result has ok=false, explain the failure and answer only if enough information remains.\n"
-        "- Do not invent citations, URLs, prices, dates, or weather data.\n"
-        "- If sources are returned, mention them accurately."
-    )
-    try:
-        pi_model = resolve_pi_model(config)
-    except Exception:
-        pi_model = None
-    if payload.get("model") == pi_model:
-        pi_instructions = config.tools.pi_system_instructions or (
-        "Pi tool policy: Use available tools for factual, current, time, weather, "
-        "search, and source-backed questions. Do not guess when a suitable tool is "
-        "available. Summarize tool JSON clearly, including sources or timestamps "
-        "when present. Ask for clarification only when the required location, "
-        "topic, or identifier is genuinely missing. When using a write/file-writing "
-        "tool, include both required arguments: path and content. Example: "
-        "{\"path\":\"report.md\",\"content\":\"<full markdown report>\"}. "
-        "Never call write with content only."
-        )
-        instructions = f"{instructions}\n\n{pi_instructions}"
+
+    cli_type = _detect_cli_type(payload, config)
+    instructions = _get_cli_specific_instructions(cli_type, config)
+
     messages = list(payload.get("messages") or [])
     if messages and messages[0].get("role") == "system":
         messages[0] = {
@@ -1470,9 +1573,9 @@ def _with_tool_instructions(
     return {**payload, "messages": messages}
 
 
-def _bridge_tools_response(registry: ToolRegistry) -> dict[str, Any]:
-    tools = registry.list_tools()
-    openai_tools = registry.openai_tools()
+def _bridge_tools_response(registry: ToolRegistry, cli_type: str = "generic") -> dict[str, Any]:
+    tools = registry.list_tools(cli_type)
+    openai_tools = registry.openai_tools(cli_type)
     unavailable_tools = registry.unavailable_tools()
     return {
         "object": "list",
@@ -1489,6 +1592,7 @@ def _bridge_tools_response(registry: ToolRegistry) -> dict[str, Any]:
             }
             for tool in tools
         ],
+        "cli_type": cli_type,
     }
 
 
@@ -1526,9 +1630,34 @@ async def _chat_completion_with_bridge_tools(
     bridge_tool_names = set(app.state.tools._tools)
 
     for _round in range(max_rounds):
-        response = await provider.create_chat_completion(request_payload, stream=False)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = await provider.create_chat_completion(request_payload, stream=False)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            _write_dev_log(
+                config,
+                "tool_round_http_error",
+                {"round": _round, "status_code": exc.response.status_code},
+            )
+            raise
+        except httpx.RequestError as exc:
+            _write_dev_log(
+                config,
+                "tool_round_request_error",
+                {"round": _round, "error": str(exc)},
+            )
+            raise
+        
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            _write_dev_log(
+                config,
+                "tool_round_parse_error",
+                {"round": _round, "error": str(exc), "response_text": response.text[:500]},
+            )
+            raise HTTPException(status_code=502, detail="Invalid response from upstream provider") from exc
+        
         message = ((data.get("choices") or [{}])[0].get("message") or {})
         tool_calls = message.get("tool_calls") or []
         bridge_calls = [
@@ -1564,7 +1693,12 @@ async def _chat_completion_with_bridge_tools(
             name = function.get("name") or ""
             try:
                 arguments = json.loads(function.get("arguments") or "{}")
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                _write_dev_log(
+                    config,
+                    "tool_argument_parse_error",
+                    {"tool": name, "call_id": tool_call.get("id"), "error": str(e)},
+                )
                 arguments = {}
             
             _write_dev_log(
@@ -1577,8 +1711,10 @@ async def _chat_completion_with_bridge_tools(
                 },
             )
             
+            # Detect CLI type for formatting
+            cli_type = _detect_cli_type(request_payload, config)
             try:
-                tool_result = await app.state.tools.call_structured(name, arguments)
+                tool_result = await app.state.tools.call_structured(name, arguments, cli_type)
                 _write_dev_log(
                     config,
                     "tool_call_success" if tool_result.get("ok") else "tool_call_error",
@@ -1588,6 +1724,7 @@ async def _chat_completion_with_bridge_tools(
                         "ok": tool_result.get("ok"),
                         "arguments": arguments,
                         "result": tool_result,
+                        "cli_type": cli_type,
                     },
                 )
             except Exception as exc:
@@ -2711,7 +2848,8 @@ async def _stream_responses_response(
                 break
             try:
                 chunk = json.loads(raw)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                _write_dev_log(config, "responses_parse_error", {"raw": raw, "error": str(e)})
                 continue
             if chunk.get("error"):
                 yield _responses_sse("error", {"type": "error", "error": chunk["error"]})
@@ -2768,10 +2906,13 @@ async def _stream_responses_response(
                     current["arguments"] += function["arguments"]
     except httpx.HTTPStatusError as exc:
         message = await _response_error_message(exc.response)
-        yield _responses_sse("error", {"type": "error", "error": {"message": message}})
+        _write_dev_log(config, "responses_stream_error", {"status_code": exc.response.status_code, "message": message})
+        yield _responses_sse("error", {"type": "error", "error": {"message": message, "status_code": exc.response.status_code}})
         return
     except httpx.RequestError as exc:
-        yield _responses_sse("error", {"type": "error", "error": {"message": str(exc)}})
+        error_msg = f"Stream connection error: {str(exc)}"
+        _write_dev_log(config, "responses_stream_error", {"message": error_msg, "type": exc.__class__.__name__})
+        yield _responses_sse("error", {"type": "error", "error": {"message": error_msg, "type": exc.__class__.__name__}})
         return
 
     output = []
@@ -2992,14 +3133,17 @@ async def _stream_openai_response(
         message = await _response_error_message(exc.response)
         _write_dev_log(
             config,
-            "pi_response_error",
+            "openai_stream_error",
             {"status_code": exc.response.status_code, "message": message},
         )
-        yield f"data: {json.dumps({'error': {'message': message}}, ensure_ascii=True)}\n\n"
+        yield f"data: {json.dumps({'error': {'message': message, 'status_code': exc.response.status_code}}, ensure_ascii=True)}\n\n"
+        yield f"data: [DONE]\n\n"
         return
     except httpx.RequestError as exc:
-        _write_dev_log(config, "pi_response_error", {"message": str(exc)})
-        yield f"data: {json.dumps({'error': {'message': str(exc)}}, ensure_ascii=True)}\n\n"
+        error_msg = f"Stream connection error: {str(exc)}"
+        _write_dev_log(config, "openai_stream_error", {"message": error_msg})
+        yield f"data: {json.dumps({'error': {'message': error_msg, 'type': exc.__class__.__name__}}, ensure_ascii=True)}\n\n"
+        yield f"data: [DONE]\n\n"
         return
 
 
@@ -3044,6 +3188,7 @@ async def _stream_completion_response(
     config: BridgeConfig,
 ) -> AsyncIterator[str]:
     try:
+        has_error = False
         async for line in provider.stream_chat_completion(payload):
             if not line or not line.startswith("data:"):
                 continue
@@ -3053,7 +3198,8 @@ async def _stream_completion_response(
                 return
             try:
                 chunk = json.loads(raw)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                _write_dev_log(config, "completion_parse_error", {"raw": raw, "error": str(e)})
                 continue
             choice = (chunk.get("choices") or [{}])[0]
             delta = choice.get("delta") or {}
@@ -3072,18 +3218,22 @@ async def _stream_completion_response(
                 ],
             }
             yield f"data: {json.dumps(completion_chunk, ensure_ascii=True)}\n\n"
-        yield "data: [DONE]\n\n"
+        if not has_error:
+            yield "data: [DONE]\n\n"
     except httpx.HTTPStatusError as exc:
         message = await _response_error_message(exc.response)
         _write_dev_log(
             config,
-            "completion_response_error",
+            "completion_stream_error",
             {"status_code": exc.response.status_code, "message": message},
         )
-        yield f"data: {json.dumps({'error': {'message': message}}, ensure_ascii=True)}\n\n"
+        yield f"data: {json.dumps({'error': {'message': message, 'status_code': exc.response.status_code}}, ensure_ascii=True)}\n\n"
+        yield f"data: [DONE]\n\n"
     except httpx.RequestError as exc:
-        _write_dev_log(config, "completion_response_error", {"message": str(exc)})
-        yield f"data: {json.dumps({'error': {'message': str(exc)}}, ensure_ascii=True)}\n\n"
+        error_msg = f"Stream connection error: {str(exc)}"
+        _write_dev_log(config, "completion_stream_error", {"message": error_msg, "type": exc.__class__.__name__})
+        yield f"data: {json.dumps({'error': {'message': error_msg, 'type': exc.__class__.__name__}}, ensure_ascii=True)}\n\n"
+        yield f"data: [DONE]\n\n"
 
 
 async def _stream_cohere_chat_response(
@@ -3102,7 +3252,8 @@ async def _stream_cohere_chat_response(
                 return
             try:
                 chunk = json.loads(raw)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                _write_dev_log(config, "cohere_parse_error", {"raw": raw, "error": str(e)})
                 continue
             choice = (chunk.get("choices") or [{}])[0]
             delta = choice.get("delta") or {}
@@ -3113,11 +3264,14 @@ async def _stream_cohere_chat_response(
         yield "event: stream-end\ndata: {}\n\n"
     except httpx.HTTPStatusError as exc:
         message = await _response_error_message(exc.response)
-        _write_dev_log(config, "cohere_chat_error", {"message": message})
-        yield f"event: error\ndata: {json.dumps({'message': message}, ensure_ascii=True)}\n\n"
+        _write_dev_log(config, "cohere_stream_error", {"status_code": exc.response.status_code, "message": message})
+        yield f"event: error\ndata: {json.dumps({'message': message, 'status_code': exc.response.status_code}, ensure_ascii=True)}\n\n"
+        yield "event: stream-end\ndata: {}\n\n"
     except httpx.RequestError as exc:
-        _write_dev_log(config, "cohere_chat_error", {"message": str(exc)})
-        yield f"event: error\ndata: {json.dumps({'message': str(exc)}, ensure_ascii=True)}\n\n"
+        error_msg = f"Stream connection error: {str(exc)}"
+        _write_dev_log(config, "cohere_stream_error", {"message": error_msg, "type": exc.__class__.__name__})
+        yield f"event: error\ndata: {json.dumps({'message': error_msg, 'type': exc.__class__.__name__}, ensure_ascii=True)}\n\n"
+        yield "event: stream-end\ndata: {}\n\n"
 
 
 async def _gemini_generate_content(
@@ -3170,7 +3324,8 @@ async def _stream_gemini_generate_content(
                 return
             try:
                 chunk = json.loads(raw)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                _write_dev_log(config, "gemini_parse_error", {"raw": raw, "error": str(e)})
                 continue
             choice = (chunk.get("choices") or [{}])[0]
             delta = choice.get("delta") or {}
@@ -3190,11 +3345,12 @@ async def _stream_gemini_generate_content(
                 yield f"data: {json.dumps(event, ensure_ascii=True)}\n\n"
     except httpx.HTTPStatusError as exc:
         message = await _response_error_message(exc.response)
-        _write_dev_log(config, "gemini_generate_error", {"message": message})
-        yield f"data: {json.dumps({'error': {'message': message}}, ensure_ascii=True)}\n\n"
+        _write_dev_log(config, "gemini_stream_error", {"status_code": exc.response.status_code, "message": message})
+        yield f"data: {json.dumps({'error': {'message': message, 'status_code': exc.response.status_code}}, ensure_ascii=True)}\n\n"
     except httpx.RequestError as exc:
-        _write_dev_log(config, "gemini_generate_error", {"message": str(exc)})
-        yield f"data: {json.dumps({'error': {'message': str(exc)}}, ensure_ascii=True)}\n\n"
+        error_msg = f"Stream connection error: {str(exc)}"
+        _write_dev_log(config, "gemini_stream_error", {"message": error_msg, "type": exc.__class__.__name__})
+        yield f"data: {json.dumps({'error': {'message': error_msg, 'type': exc.__class__.__name__}}, ensure_ascii=True)}\n\n"
 
 
 async def _stream_ollama_chat_response(
@@ -3406,17 +3562,57 @@ async def _call_bridge_tool(
 
 
 def _upstream_error(response: httpx.Response) -> JSONResponse:
+    """Format upstream provider errors consistently."""
     try:
-        detail = response.json()
-    except Exception:
-        detail = {"message": response.text}
-    return JSONResponse(status_code=response.status_code, content={"error": detail})
+        # Try to parse as JSON first
+        try:
+            detail = response.json()
+        except Exception:
+            detail = {"message": response.text or "Unknown error"}
+        
+        # Ensure we have a proper error structure
+        if isinstance(detail, dict):
+            if "error" not in detail and "message" not in detail:
+                detail = {"message": str(detail)}
+        else:
+            detail = {"message": str(detail)}
+        
+        content = {
+            "error": detail if isinstance(detail, dict) else {"message": str(detail)},
+            "status_code": response.status_code,
+        }
+        return JSONResponse(status_code=response.status_code, content=content)
+    except Exception as exc:
+        # Fallback for any parsing errors
+        return JSONResponse(
+            status_code=response.status_code or 500,
+            content={"error": {"message": f"Error processing upstream response: {str(exc)}"}},
+        )
 
 
 def _request_error(exc: httpx.RequestError) -> JSONResponse:
+    """Format request errors consistently."""
+    error_msg = str(exc)
+    
+    # Provide more context for specific error types
+    if isinstance(exc, httpx.ConnectError):
+        status_code = 503
+        error_msg = f"Cannot connect to upstream provider: {error_msg}"
+    elif isinstance(exc, httpx.TimeoutException):
+        status_code = 504
+        error_msg = f"Request to upstream provider timed out: {error_msg}"
+    else:
+        status_code = 502
+        error_msg = f"Error communicating with upstream provider: {error_msg}"
+    
     return JSONResponse(
-        status_code=502,
-        content={"error": {"message": str(exc)}},
+        status_code=status_code,
+        content={
+            "error": {
+                "message": error_msg,
+                "type": exc.__class__.__name__,
+            },
+        },
     )
 
 

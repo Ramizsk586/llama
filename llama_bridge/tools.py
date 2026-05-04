@@ -52,22 +52,60 @@ class ToolDefinition:
     parameters: dict[str, Any]
     handler: ToolHandler
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self, cli_type: str = "generic") -> dict[str, Any]:
+        description = self._enhance_description_for_cli(self.description, cli_type)
         return {
             "name": self.name,
-            "description": self.description,
+            "description": description,
             "parameters": self.parameters,
         }
 
-    def as_openai_tool(self) -> dict[str, Any]:
+    def as_openai_tool(self, cli_type: str = "generic") -> dict[str, Any]:
+        description = self._enhance_description_for_cli(self.description, cli_type)
         return {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": description,
                 "parameters": self.parameters,
             },
         }
+
+    def _enhance_description_for_cli(self, base_description: str, cli_type: str) -> str:
+        """Enhance tool descriptions with CLI-specific guidance."""
+        enhancements = {
+            "pi": {
+                "datetime_now": " 🎯 Perfect for scheduling and time-based decisions",
+                "weather_current": " 🌤️ Great for travel planning and outdoor activities",
+                "tavily_search": " 🔍 Excellent for finding current information and latest updates",
+                "source_research": " 📊 Best for deep analysis and verified information",
+                "image_research": " 🖼️ Ideal for visual content and presentations",
+            },
+            "copilot": {
+                "datetime_now": " ⏰ Useful for code timestamps and version tracking",
+                "tavily_search": " 💻 Perfect for finding API documentation and code examples",
+                "source_research": " 📈 Great for technical research and implementation details",
+                "verify_sources": " 🛡️ Essential for code security and dependency verification",
+                "wikipedia_search": " 📖 Helpful for understanding technical concepts",
+            },
+            "codex": {
+                "source_research": " 🔬 Advanced research with source verification",
+                "verify_sources": " 🔒 Academic-grade source validation",
+                "master_review": " 🎓 Comprehensive analysis and quality assurance",
+                "tavily_search": " 🔍 Scholarly search with current information",
+            },
+            "claude": {
+                "source_research": " 🧠 Intelligent multi-source analysis",
+                "master_review": " 🎯 Comprehensive evaluation with reasoning",
+                "tavily_search": " 🤔 Contextual search with deep understanding",
+                "verify_sources": " ✅ Rigorous source verification",
+            },
+        }
+
+        cli_enhancement = enhancements.get(cli_type, {}).get(self.name, "")
+        if cli_enhancement:
+            return f"{base_description}{cli_enhancement}"
+        return base_description
 
 
 class ToolValidationError(ValueError):
@@ -120,11 +158,11 @@ class ToolRegistry:
         if self._master_reviewer is not None:
             await self._master_reviewer.aclose()
 
-    def list_tools(self) -> list[dict[str, Any]]:
-        return [tool.as_dict() for tool in self._tools.values()]
+    def list_tools(self, cli_type: str = "generic") -> list[dict[str, Any]]:
+        return [tool.as_dict(cli_type) for tool in self._tools.values()]
 
-    def openai_tools(self) -> list[dict[str, Any]]:
-        return [tool.as_openai_tool() for tool in self._tools.values()]
+    def openai_tools(self, cli_type: str = "generic") -> list[dict[str, Any]]:
+        return [tool.as_openai_tool(cli_type) for tool in self._tools.values()]
 
     def unavailable_tools(self) -> dict[str, str]:
         return dict(self._unavailable_tools)
@@ -139,6 +177,7 @@ class ToolRegistry:
         self,
         name: str,
         arguments: dict[str, Any] | None = None,
+        cli_type: str = "generic",
     ) -> dict[str, Any]:
         """Call a tool and always return model-readable structured JSON."""
         started_at = datetime.now(UTC)
@@ -155,15 +194,20 @@ class ToolRegistry:
                     metadata["cache_hit"] = True
                     cached_result["metadata"] = metadata
                     cached_result["timestamp"] = metadata.get("finished_at")
+                    # Add CLI-specific formatting to cached results
+                    cached_result = _add_cli_formatting(cached_result, cli_type)
                     return cached_result
             result = await self.call(name, validated_args)
             result = _validate_tool_output(name, result)
             structured = _structured_tool_success(name, result, started_at)
+            structured = _add_cli_formatting(structured, cli_type)
             if cache_key and structured.get("ok"):
                 self._cache.set(cache_key, structured, int(self.config.tools.cache_ttl_seconds))
             return structured
         except Exception as exc:
-            return _structured_tool_error(name, exc, started_at)
+            error_result = _structured_tool_error(name, exc, started_at)
+            error_result = _add_cli_formatting(error_result, cli_type)
+            return error_result
 
     def _cache_key(self, name: str, arguments: dict[str, Any]) -> str | None:
         if not self.config.tools.cache_enabled:
@@ -1737,6 +1781,105 @@ def _require_list_output(name: str, result: dict[str, Any], key: str) -> None:
         raise ValueError(f"{name} output key '{key}' must be a list")
 
 
+def _add_cli_formatting(result: dict[str, Any], cli_type: str) -> dict[str, Any]:
+    """Add CLI-specific formatting, animations, and progress indicators."""
+    if not result.get("ok"):
+        # Add error formatting
+        error_indicators = {
+            "pi": "❌",
+            "copilot": "🔴",
+            "codex": "⚠️",
+            "claude": "🚫",
+            "generic": "✗",
+        }
+        indicator = error_indicators.get(cli_type, "✗")
+        if "error" in result:
+            result["error"] = f"{indicator} {result['error']}"
+        return result
+
+    # Success formatting with CLI-specific animations
+    tool_name = result.get("tool", "")
+    animations = {
+        "pi": {
+            "datetime_now": "🕐",
+            "weather_current": "🌤️",
+            "tavily_search": "🔍",
+            "serpapi_search": "🔎",
+            "source_research": "📊",
+            "image_research": "🖼️",
+            "verify_sources": "✅",
+            "master_review": "🎯",
+            "wikipedia_search": "📚",
+        },
+        "copilot": {
+            "datetime_now": "⏰",
+            "weather_current": "🌦️",
+            "tavily_search": "💻",
+            "serpapi_search": "🔧",
+            "source_research": "📈",
+            "image_research": "🖥️",
+            "verify_sources": "🛡️",
+            "master_review": "🚀",
+            "wikipedia_search": "📖",
+        },
+        "codex": {
+            "datetime_now": "⏳",
+            "weather_current": "🌍",
+            "tavily_search": "🔬",
+            "serpapi_search": "🔍",
+            "source_research": "📊",
+            "image_research": "🎨",
+            "verify_sources": "🔒",
+            "master_review": "🎓",
+            "wikipedia_search": "📚",
+        },
+        "claude": {
+            "datetime_now": "🕰️",
+            "weather_current": "🌤️",
+            "tavily_search": "🤔",
+            "serpapi_search": "💭",
+            "source_research": "🧠",
+            "image_research": "🎭",
+            "verify_sources": "✅",
+            "master_review": "🎯",
+            "wikipedia_search": "📖",
+        },
+        "generic": {
+            "datetime_now": "🕐",
+            "weather_current": "🌤️",
+            "tavily_search": "🔍",
+            "serpapi_search": "🔎",
+            "source_research": "📊",
+            "image_research": "🖼️",
+            "verify_sources": "✅",
+            "master_review": "🎯",
+            "wikipedia_search": "📚",
+        },
+    }
+
+    indicator = animations.get(cli_type, animations["generic"]).get(tool_name, "✅")
+
+    # Add progress messages for different CLI types
+    progress_messages = {
+        "pi": f"{indicator} Tool completed successfully",
+        "copilot": f"{indicator} Operation completed",
+        "codex": f"{indicator} Research completed",
+        "claude": f"{indicator} Analysis complete",
+        "generic": f"{indicator} Success",
+    }
+
+    if "data" in result and isinstance(result["data"], dict):
+        result["data"]["_progress_indicator"] = progress_messages.get(cli_type, "✅ Success")
+
+    # Add CLI-specific metadata
+    metadata = result.get("metadata", {})
+    metadata["cli_type"] = cli_type
+    metadata["formatted"] = True
+    result["metadata"] = metadata
+
+    return result
+
+
 def _structured_tool_success(
     name: str,
     result: dict[str, Any],
@@ -2173,8 +2316,6 @@ def _tool_sort_key(tool: dict[str, Any], scores: dict[str, float], default_searc
         "master_review": 78,
         "source_research": 75,
         f"{default_search_provider}_search": 70,
-        "tavily_search": 65,
-        "serpapi_search": 60,
         "image_research": 58,
         "wikipedia_search": 55,
         "wikipedia_page": 45,
@@ -2184,6 +2325,16 @@ def _tool_sort_key(tool: dict[str, Any], scores: dict[str, float], default_searc
 
 def _forced_tool_names(query: str, default_search_provider: str = "tavily") -> set[str]:
     query_lower = query.lower()
+
+    # Check for explicit tool names first
+    explicit_tools = []
+    for tool_name in ["tavily_search", "serpapi_search", "source_research", "weather_current", "datetime_now", "wikipedia_search", "image_research", "verify_sources", "master_review"]:
+        if tool_name in query_lower or f"use {tool_name}" in query_lower or f"try {tool_name}" in query_lower:
+            explicit_tools.append(tool_name)
+
+    if explicit_tools:
+        return set(explicit_tools)
+
     creative_or_code = (
         "write a poem",
         "story",

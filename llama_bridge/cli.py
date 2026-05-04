@@ -483,7 +483,10 @@ def main() -> None:
             return
         if args.tools_command == "diagnose":
             _cmd_tools_diagnose(config_path, args.query)
-            return
+        if args.tools_command == "test-cli":
+            _cmd_tools_test_cli(config_path, args.cli_type, args.tool_name)
+        parser.print_help()
+        return
         parser.print_help()
         return
     if args.command == "mcp-tools":
@@ -543,6 +546,18 @@ def main() -> None:
             model_override=args.model,
             copilot_args=args.copilot_args,
             install_copilot=not args.no_install_copilot,
+        )
+        return
+    if args.command == "opencode":
+        config_path = _arg_path(args.config)
+        _cmd_opencode(
+            config_path,
+            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+            provider_override=args.provider,
+            model_override=args.model,
+            opencode_args=args.opencode_args,
+            install_opencode=not args.no_install_opencode,
         )
         return
 
@@ -670,6 +685,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="show intent, selected tools, rejected tools, and provider availability",
     )
     tools_diagnose_cmd.add_argument("query")
+    tools_test_cli_cmd = tools_subparsers.add_parser(
+        "test-cli",
+        help="test CLI-specific tool formatting and animations",
+    )
+    tools_test_cli_cmd.add_argument("cli_type", choices=["pi", "copilot", "codex", "claude", "generic"])
+    tools_test_cli_cmd.add_argument("tool_name")
 
     subparsers.add_parser("mcp-tools", help="run the bridge tools MCP adapter")
 
@@ -777,6 +798,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "copilot_args",
         nargs=argparse.REMAINDER,
         help="extra arguments passed to copilot",
+    )
+
+    opencode_cmd = subparsers.add_parser(
+        "opencode",
+        help="configure and launch OpenCode with the bridge",
+    )
+    opencode_cmd.add_argument("--config")
+    opencode_cmd.add_argument("--pid-file")
+    opencode_cmd.add_argument("--log-file")
+    opencode_cmd.add_argument("--provider", help="provider name from env.yml to use for OpenCode")
+    opencode_cmd.add_argument("--model", help="model name to use for OpenCode")
+    opencode_cmd.add_argument(
+        "--no-install-opencode",
+        action="store_true",
+        help="do not install OpenCode automatically if it is missing",
+    )
+    opencode_cmd.add_argument(
+        "opencode_args",
+        nargs=argparse.REMAINDER,
+        help="extra arguments passed to opencode",
     )
 
     return parser
@@ -1360,7 +1401,8 @@ def _cmd_tools_list(config_path: Path) -> None:
     config = load_config(config_path)
     registry = ToolRegistry(config)
     try:
-        tools = registry.openai_tools()
+        # Show tools for generic CLI by default, but could be enhanced per CLI type
+        tools = registry.openai_tools("generic")
         _title("llama tools")
         _kv_rows(
             [
@@ -1397,7 +1439,7 @@ def _cmd_tools_score(config_path: Path, query: str) -> None:
     config = load_config(config_path)
     registry = ToolRegistry(config)
     try:
-        tools = registry.openai_tools()
+        tools = registry.openai_tools("generic")
         selected, scores = select_relevant_tools(
             tools,
             query,
@@ -1433,11 +1475,51 @@ def _cmd_tools_test(config_path: Path, name: str, arguments: str) -> None:
     print(json.dumps(result, indent=2, ensure_ascii=True))
 
 
+def _cmd_tools_test_cli(config_path: Path, cli_type: str, tool_name: str) -> None:
+    """Test CLI-specific tool formatting and descriptions."""
+    config = load_config(config_path)
+    registry = ToolRegistry(config)
+    try:
+        # Test tool description enhancement
+        tools = registry.openai_tools(cli_type)
+        tool = next((t for t in tools if t["function"]["name"] == tool_name), None)
+        if not tool:
+            print(f"Tool '{tool_name}' not found")
+            return
+
+        _title(f"CLI Test: {cli_type} - {tool_name}")
+        print("Enhanced Description:")
+        print(f"  {tool['function']['description']}")
+        print()
+
+        # Test tool call with CLI formatting
+        print("Testing tool call with CLI formatting...")
+        test_args = {}
+        if tool_name == "datetime_now":
+            test_args = {"timezone": "UTC"}
+        elif tool_name in ["tavily_search", "serpapi_search"]:
+            test_args = {"query": "test query"}
+        elif tool_name == "weather_current":
+            test_args = {"location": "London"}
+
+        try:
+            result = asyncio.run(registry.call_structured(tool_name, test_args, cli_type))
+            print("Result with CLI formatting:")
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            print()
+            print("Progress Indicator:", result.get("data", {}).get("_progress_indicator", "N/A"))
+        except Exception as exc:
+            print(f"Tool call failed: {exc}")
+
+    finally:
+        asyncio.run(registry.aclose())
+
+
 def _cmd_tools_diagnose(config_path: Path, query: str) -> None:
     config = load_config(config_path)
     registry = ToolRegistry(config)
     try:
-        tools = registry.openai_tools()
+        tools = registry.openai_tools("generic")
         selected, scores = select_relevant_tools(
             tools,
             query,
@@ -2658,18 +2740,15 @@ def _ensure_claude_code(install: bool = True) -> str:
     if not install:
         raise SystemExit("Claude Code CLI was not found. Install Claude Code and try again.")
 
-    print("Claude Code CLI was not found, installing it now...")
-    _ensure_node_and_npm()
-    npm_executable = _find_npm_executable()
-    if not npm_executable:
-        raise SystemExit("npm was not found after setup. Install Node.js 18+ and try again.")
+    _print_state("install", "Claude Code CLI was not found, installing it now", "36")
+    _ensure_git()  # Ensure git is available
 
     process = subprocess.run(
-        [npm_executable, "install", "-g", "@anthropic-ai/claude-code"],
+        ["powershell", "-Command", "irm https://claude.ai/install.ps1 | iex"],
         check=False,
     )
     if process.returncode != 0:
-        raise SystemExit("Claude Code install failed. Try `npm install -g @anthropic-ai/claude-code`.")
+        raise SystemExit("Claude Code install failed. Try `irm https://claude.ai/install.ps1 | iex`.")
 
     claude_executable = _find_claude_executable()
     if not claude_executable:
@@ -2685,17 +2764,15 @@ def _ensure_pi(install: bool = True, package: str = "@mariozechner/pi-coding-age
         raise SystemExit("Pi CLI was not found. Install Pi and try again.")
 
     _print_state("install", "Pi CLI was not found, installing it now", "36")
-    _ensure_node_and_npm()
-    npm_executable = _find_npm_executable()
-    if not npm_executable:
-        raise SystemExit("npm was not found after setup. Install Node.js 18+ and try again.")
+    _ensure_git()  # Ensure git is available for shell
 
     process = subprocess.run(
-        [npm_executable, "install", "-g", package],
+        ["curl", "-fsSL", "https://pi.dev/install.sh", "|", "sh"],
+        shell=True,
         check=False,
     )
     if process.returncode != 0:
-        raise SystemExit(f"Pi install failed. Try `npm install -g {package}`.")
+        raise SystemExit("Pi install failed. Try `curl -fsSL https://pi.dev/install.sh | sh`.")
 
     pi_executable = _find_pi_executable()
     if not pi_executable:
@@ -2758,12 +2835,18 @@ def _ensure_codex(install: bool = True, package: str = "@openai/codex") -> str:
     if not npm_executable:
         raise SystemExit("npm was not found after setup. Install Node.js 18+ and try again.")
 
-    process = subprocess.run(
-        [npm_executable, "install", "-g", package],
+    _ensure_git()  # Ensure git is available
+
+    process1 = subprocess.run(
+        [npm_executable, "i", "-g", "@openai/codex"],
         check=False,
     )
-    if process.returncode != 0:
-        raise SystemExit(f"Codex install failed. Try `npm install -g {package}`.")
+    process2 = subprocess.run(
+        [npm_executable, "i", "-g", "@openai/codex@latest"],
+        check=False,
+    )
+    if process1.returncode != 0 or process2.returncode != 0:
+        raise SystemExit("Codex install failed. Try `npm i -g @openai/codex` and `npm i -g @openai/codex@latest`.")
 
     codex_executable = _find_codex_executable()
     if not codex_executable:
@@ -2779,17 +2862,15 @@ def _ensure_copilot_cli(install: bool = True, package: str = "@github/copilot") 
         raise SystemExit("GitHub Copilot CLI was not found. Install Copilot CLI and try again.")
 
     _print_state("install", "GitHub Copilot CLI was not found, installing it now", "36")
-    _ensure_node_and_npm()
-    npm_executable = _find_npm_executable()
-    if not npm_executable:
-        raise SystemExit("npm was not found after setup. Install Node.js 18+ and try again.")
+    _ensure_git()  # Ensure git is available for bash
 
     process = subprocess.run(
-        [npm_executable, "install", "-g", package],
+        ["curl", "-fsSL", "https://opencode.ai/install", "|", "bash"],
+        shell=True,
         check=False,
     )
     if process.returncode != 0:
-        raise SystemExit(f"Copilot CLI install failed. Try `npm install -g {package}`.")
+        raise SystemExit("Copilot CLI install failed. Try `curl -fsSL https://opencode.ai/install | bash`.")
 
     copilot_executable = _find_copilot_executable()
     if not copilot_executable:
@@ -4172,6 +4253,22 @@ def _find_claude_executable() -> str | None:
             ]
         )
     return _first_existing(candidates)
+
+
+def _ensure_git() -> str:
+    git = shutil.which("git")
+    if git:
+        return git
+    # Try to install git using winget
+    if shutil.which("winget"):
+        subprocess.run(
+            ["winget", "install", "--id", "Git.Git", "--exact", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements"],
+            check=False,
+        )
+    git = shutil.which("git")
+    if not git:
+        raise SystemExit("Git is required but not found. Install Git for Windows and try again.")
+    return git
 
 
 def _find_pi_executable() -> str | None:

@@ -35,6 +35,7 @@ def main() -> int:
     temp_root: Path | None = None
     try:
         git = _ensure_git()
+        _ensure_github_cli()
         python = _ensure_python()
         install_dir = args.install_dir.expanduser().resolve()
         _validate_install_dir(install_dir)
@@ -81,7 +82,7 @@ def main() -> int:
         return 1
     finally:
         if temp_root and temp_root.exists() and not args.keep_temp:
-            shutil.rmtree(temp_root, ignore_errors=True)
+            _cleanup_temp_dir(temp_root)
         if _launched_by_double_click():
             print()
             input("Press Enter to close...")
@@ -101,9 +102,6 @@ def _default_install_dir() -> Path:
 
 
 def _ensure_git() -> str:
-    git = shutil.which("git")
-    if git:
-        return git
     _install_with_winget("Git.Git", "Git")
     git = shutil.which("git") or _first_existing(
         [
@@ -112,8 +110,12 @@ def _ensure_git() -> str:
         ]
     )
     if not git:
-        raise RuntimeError("Git was not found. Install Git for Windows, then run setup again.")
+        raise RuntimeError("Git was not found after installation. Install Git for Windows manually, then run setup again.")
     return git
+
+
+def _ensure_github_cli() -> None:
+    _install_with_winget("GitHub.cli", "GitHub CLI")
 
 
 def _ensure_python() -> str:
@@ -345,6 +347,27 @@ def _run(command: list[str], label: str, cwd: Path | None = None) -> None:
         raise RuntimeError(f"Command not found: {command[0]}") from exc
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"{label} failed with exit code {exc.returncode}") from exc
+
+
+def _cleanup_temp_dir(temp_dir: Path) -> None:
+    """Aggressively clean up temporary directory, especially on Windows."""
+    if os.name == "nt":
+        # On Windows, use rmdir /s /q which is more forceful
+        try:
+            subprocess.run(
+                ["cmd", "/c", "rmdir", "/s", "/q", str(temp_dir)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass  # Ignore all errors in cleanup
+    else:
+        # On Unix-like systems, shutil.rmtree is usually sufficient
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _launched_by_double_click() -> bool:

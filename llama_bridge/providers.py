@@ -19,12 +19,16 @@ class ResolvedModel:
 
 class OpenAICompatibleProvider:
     _TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+    _MAX_RETRIES = 5  # Increased from 3
+    _INITIAL_RETRY_DELAY = 0.5  # seconds
+    _MAX_RETRY_DELAY = 30  # seconds
 
     def __init__(self, config: ProviderConfig):
         self.config = config
+        # Increased timeout and connection limits for better reliability
         self._client = httpx.AsyncClient(
-            timeout=config.timeout,
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            timeout=max(config.timeout, 60),  # Ensure minimum 60s timeout
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
         )
 
     async def aclose(self) -> None:
@@ -54,14 +58,16 @@ class OpenAICompatibleProvider:
         return f"{self.config.base_url}/embeddings"
 
     def _retry_delay(self, attempt: int) -> float:
-        return 0.25 * (2 ** attempt)
+        """Exponential backoff with jitter and cap"""
+        delay = min(self._INITIAL_RETRY_DELAY * (2 ** attempt), self._MAX_RETRY_DELAY)
+        return delay
 
     def _should_retry_status(self, exc: httpx.HTTPStatusError) -> bool:
         return exc.response.status_code in self._TRANSIENT_STATUS_CODES
 
     async def _post(self, url: str, payload: dict[str, Any]) -> httpx.Response:
         last_exc: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(self._MAX_RETRIES):
             try:
                 response = await self._client.post(
                     url,
@@ -72,19 +78,21 @@ class OpenAICompatibleProvider:
                 return response
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
-                if not self._should_retry_status(exc) or attempt == 2:
+                if not self._should_retry_status(exc) or attempt >= self._MAX_RETRIES - 1:
                     raise
+                await asyncio.sleep(self._retry_delay(attempt))
             except httpx.RequestError as exc:
                 last_exc = exc
-                if attempt == 2:
+                if attempt >= self._MAX_RETRIES - 1:
                     raise
+                await asyncio.sleep(self._retry_delay(attempt))
             await asyncio.sleep(self._retry_delay(attempt))
         assert last_exc is not None
         raise last_exc
 
     async def _stream(self, url: str, payload: dict[str, Any]) -> AsyncIterator[str]:
         last_exc: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(self._MAX_RETRIES):
             yielded = False
             try:
                 async with self._client.stream(
@@ -100,13 +108,17 @@ class OpenAICompatibleProvider:
                     return
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
-                if not self._should_retry_status(exc) or attempt == 2:
+                if not self._should_retry_status(exc) or attempt >= self._MAX_RETRIES - 1:
+                    raise
+                if not yielded:
+                    await asyncio.sleep(self._retry_delay(attempt))
+                else:
                     raise
             except httpx.RequestError as exc:
                 last_exc = exc
-                if yielded or attempt == 2:
+                if yielded or attempt >= self._MAX_RETRIES - 1:
                     raise
-            await asyncio.sleep(self._retry_delay(attempt))
+                await asyncio.sleep(self._retry_delay(attempt))
         assert last_exc is not None
         raise last_exc
 

@@ -98,10 +98,17 @@ class BridgeMcpServer:
         ]
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        data = self._request("POST", f"/api/tools/{name}", arguments)
-        is_error = bool(data.get("ok") is False)
-        text = json.dumps(data, indent=2, ensure_ascii=False, default=str)
-        return {"content": [{"type": "text", "text": text}], "isError": is_error}
+        try:
+            data = self._request("POST", f"/api/tools/{name}", arguments)
+            is_error = bool(data.get("ok") is False)
+            # Ensure clean JSON response without extra whitespace
+            text = json.dumps(data, separators=(',', ':'), ensure_ascii=False, default=str)
+            return {"content": [{"type": "text", "text": text}], "isError": is_error}
+        except Exception as exc:
+            # Return structured error response
+            error_data = {"ok": False, "error": str(exc), "tool": name}
+            text = json.dumps(error_data, separators=(',', ':'), ensure_ascii=False)
+            return {"content": [{"type": "text", "text": text}], "isError": True}
 
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         headers = {"Accept": "application/json"}
