@@ -196,8 +196,8 @@ openclaw:
 poolside:
   provider: ollama_cloud
   model: gemma4:31b
-  api_url: http://127.0.0.1:8089/v1
-  api_key: ${ change-me }
+  api_url: http://127.0.0.1:8089
+  api_key: null
   token: ${POOLSIDE_TOKEN}
   config_path: ~/.config/poolside/settings.yaml
   install_command: "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
@@ -220,6 +220,7 @@ tools:
   require_auth: true
   country: India
   include:
+    - shell.execute
     - datetime_now
     - wikipedia_search
     - wikipedia_page

@@ -11,3 +11,4 @@ build
 llama.spec
 llama_bridge.egg-info
 llama.telegram.json
+llama.poolside.closed

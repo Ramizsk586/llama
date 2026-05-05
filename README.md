@@ -343,9 +343,11 @@ llama openclaw stop
 Poolside's official installer: `curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh`
 on macOS/Linux, and on Windows it tries that installer through Git Bash when Git
 is installed. If the shell installer is unavailable or rejects the Windows
-environment, it falls back to `irm https://downloads.poolside.ai/pool/install.ps1 | iex`. It now follows the same provider/model pattern as the other llama
-CLI launchers, writes Poolside `settings.yaml` when possible, passes configured
-Poolside auth through environment variables, and wires in the bridge MCP tools.
+environment, it falls back to `irm https://downloads.poolside.ai/pool/install.ps1 | iex`.
+It follows the same provider/model pattern as the other llama CLI launchers. When
+configured for the local llama bridge, it starts the bridge if needed, uses
+`server.auth_token` as the Poolside API key, writes Poolside `settings.yaml`,
+keeps the Poolside shell tool enabled, and wires in the bridge MCP tools.
 You can configure it in
 `env.yml`:
 
@@ -353,19 +355,20 @@ You can configure it in
 poolside:
   provider: ollama_cloud
   model: qwen3.5:cloud
-  api_url: null  # Optional Poolside deployment URL; leave null for saved/default Poolside setup.
-  api_key: ${POOLSIDE_API_KEY}
+  api_url: http://127.0.0.1:8089
+  api_key: null  # Optional for non-llama Poolside deployments.
   token: ${POOLSIDE_TOKEN}
   config_path: ~/.config/poolside/settings.yaml
   install_command: "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
   windows_install_command: "irm https://downloads.poolside.ai/pool/install.ps1 | iex"
 ```
 
-When `poolside.api_key` or `poolside.token` is configured, `llama poolside`
-exports it as `POOLSIDE_API_KEY` or `POOLSIDE_TOKEN` so Poolside can authenticate
-without prompting. When `poolside.api_url` is configured, it also exports
+For the local llama bridge URL, `llama poolside` exports `server.auth_token` as
+`POOLSIDE_API_KEY`, so you do not need to duplicate `api_key: llama` under
+`poolside`. For another Poolside deployment, configure `poolside.api_key` or
+`poolside.token`; the launcher exports those as `POOLSIDE_API_KEY` or
+`POOLSIDE_TOKEN`. When `poolside.api_url` is configured, it also exports
 `POOLSIDE_STANDALONE_BASE_URL` in addition to `POOLSIDE_API_URL`.
-Leave these unset to use credentials saved by `pool setup` or `pool login`.
 
 Use `llama poolside --provider <name> --model <model>` to override the saved
 provider or model for one launch.

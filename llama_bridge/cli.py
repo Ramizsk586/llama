@@ -623,6 +623,8 @@ def main() -> None:
             config_path = _arg_path(args.config)
             _cmd_poolside(
                 config_path,
+                _arg_path(None, DEFAULT_PID_PATH, config_path),
+                _arg_path(None, DEFAULT_LOG_PATH, config_path),
                 args.poolside_args,
                 provider_override=args.provider,
                 model_override=args.model,
@@ -2621,8 +2623,9 @@ def _cmd_logs(
 
     server_running, _running_url = _server_is_running(config_path, pid_path)
     if not server_running:
-        _print_state("stop", "llama server is not running", "33")
-        return
+        if follow:
+            _print_state("stop", "llama server is not running; showing saved log and exiting", "33")
+            follow = False
 
     if dev:
         log_path = config_path.parent / "llama.dev.log"
@@ -2637,12 +2640,25 @@ def _cmd_logs(
                 "Run `llama stop` first, then `llama logs --clear`."
             ) from exc
 
-    if not log_path.exists():
-        _print_state("warn", f"no llama log found at {log_path}", "33")
-        return
+    requested_dev_log = dev
+    if not log_path.exists() or (not dev and log_path.stat().st_size == 0):
+        fallback_log_path = config_path.parent / "llama.dev.log"
+        if not dev and fallback_log_path.exists() and fallback_log_path.stat().st_size > 0:
+            log_path = fallback_log_path
+            dev = True
+            _print_state("info", f"llama.log is empty; showing dev log at {log_path}", "36")
+        elif not log_path.exists():
+            _print_state("warn", f"no llama log found at {log_path}", "33")
+            return
+        else:
+            _print_state(
+                "info",
+                f"{log_path} is empty; new server output will appear here",
+                "36",
+            )
 
     if follow:
-        _title("llama dev logs" if dev else "llama logs")
+        _title("llama dev logs" if dev and requested_dev_log else "llama logs")
     with log_path.open("r", encoding="utf-8", errors="replace") as handle:
         if tail > 0:
             lines = handle.readlines()
@@ -3652,6 +3668,8 @@ def _cmd_openclaw(
 
 def _cmd_poolside(
     config_path: Path,
+    pid_path: Path,
+    log_path: Path,
     poolside_args: list[str],
     provider_override: str | None = None,
     model_override: str | None = None,
@@ -3675,14 +3693,41 @@ def _cmd_poolside(
             "or pass `llama poolside --model ...`."
         )
 
+    poolside_api_url = _poolside_api_url(config)
+    uses_llama_bridge = bool(
+        poolside_api_url and _is_llama_bridge_poolside_url(config, poolside_api_url)
+    )
+    standalone_base_url = _poolside_standalone_base_url(config, poolside_api_url)
+    poolside_api_key = _poolside_auth_token(config, poolside_api_url)
+    if uses_llama_bridge:
+        server_running, _running_url = _server_is_running(config_path, pid_path)
+        if not server_running:
+            idle_after_file = pid_path.parent / "llama.poolside.closed"
+            idle_after_file.unlink(missing_ok=True)
+            _print_state("start", "llama server is not running, starting it for Poolside", "36")
+            _cmd_start(
+                config_path,
+                pid_path,
+                log_path,
+                idle_timeout_seconds=180,
+                idle_after_file=idle_after_file,
+            )
+            server_running, _running_url = _server_is_running(config_path, pid_path)
+            if not server_running:
+                raise SystemExit(f"llama server failed to start, see log: {log_path}")
+            _print_note("llama server will stop 3 minutes after Poolside closes with no requests")
+        else:
+            idle_after_file = None
+            _print_state("run", "using existing llama server", "32")
+    else:
+        idle_after_file = None
+
     poolside_executable = _ensure_poolside(
         install=install_poolside,
         install_command=config.poolside.install_command,
         windows_install_command=config.poolside.windows_install_command,
     )
     poolside_settings_path = _write_poolside_config(config)
-    poolside_api_url = _poolside_api_url(config)
-    poolside_api_key = _configured_poolside_api_key(config)
 
     _title("llama poolside")
     _print_state("ok", "Poolside environment is ready", "32")
@@ -3690,7 +3735,7 @@ def _cmd_poolside(
         [
             ("provider", provider_name),
             ("model", model),
-            ("api url", poolside_api_url or "poolside default"),
+            ("api url", poolside_api_url or standalone_base_url or "poolside default"),
             ("auth", "configured" if poolside_api_key else "stored login or interactive setup"),
             ("config", str(poolside_settings_path)),
             ("command", poolside_executable),
@@ -3709,20 +3754,25 @@ def _cmd_poolside(
     env = os.environ.copy()
     if poolside_api_url:
         env["POOLSIDE_API_URL"] = poolside_api_url
-        env["POOLSIDE_STANDALONE_BASE_URL"] = poolside_api_url
-    if config.poolside.api_key and not str(config.poolside.api_key).startswith("${"):
-        env["POOLSIDE_API_KEY"] = str(config.poolside.api_key)
+    if uses_llama_bridge and standalone_base_url:
+        env["POOLSIDE_STANDALONE_BASE_URL"] = standalone_base_url
+    if poolside_api_key:
+        env["POOLSIDE_API_KEY"] = poolside_api_key
     if config.poolside.token and not str(config.poolside.token).startswith("${"):
         env["POOLSIDE_TOKEN"] = str(config.poolside.token)
     env["LLAMA_BRIDGE_API_KEY"] = config.server.auth_token
+    if uses_llama_bridge and standalone_base_url:
+        env["OPENAI_API_KEY"] = "ollama"
+        env["OPENAI_BASE_URL"] = standalone_base_url
 
-    raise SystemExit(
-        subprocess.run(
-            command,
-            check=False,
-            env=env,
-        ).returncode
-    )
+    return_code = subprocess.run(
+        command,
+        check=False,
+        env=env,
+    ).returncode
+    if idle_after_file is not None:
+        idle_after_file.write_text("closed\n", encoding="utf-8")
+    raise SystemExit(return_code)
 
 
 def _write_poolside_config(config) -> Path:
@@ -3735,12 +3785,15 @@ def _write_poolside_config(config) -> Path:
         existing = {}
 
     poolside_api_url = _poolside_api_url(config)
-    if poolside_api_url:
-        pool_section = dict(existing.get("pool") or {})
+    pool_section_value = existing.get("pool")
+    pool_section = dict(pool_section_value) if isinstance(pool_section_value, dict) else {}
+    # Poolside validates settings.yaml strictly; auth must come from env, not pool.api_key.
+    pool_section.pop("api_key", None)
+    pool_section.pop("token", None)
+    if poolside_api_url and not _is_llama_bridge_poolside_url(config, poolside_api_url):
         pool_section["api_url"] = poolside_api_url
         existing["pool"] = pool_section
     else:
-        pool_section = dict(existing.get("pool") or {})
         if _is_llama_bridge_poolside_url(config, pool_section.get("api_url")):
             pool_section.pop("api_url", None)
             if pool_section:
@@ -3758,6 +3811,16 @@ def _write_poolside_config(config) -> Path:
         "env": _mcp_server_env(config),
     }
     existing["mcp_servers"] = mcp_servers
+
+    tools_value = existing.get("tools")
+    tools = dict(tools_value) if isinstance(tools_value, dict) else {}
+    shell_value = tools.get("shell")
+    shell_tool = dict(shell_value) if isinstance(shell_value, dict) else {}
+    shell_tool["disabled"] = False
+    tools["shell"] = shell_tool
+    for legacy_key in ("enabled", "allow_shell", "allow_bash"):
+        tools.pop(legacy_key, None)
+    existing["tools"] = tools
 
     try:
         settings_path.write_text(
@@ -3777,7 +3840,15 @@ def _poolside_api_url(config) -> str | None:
     api_url = str(config.poolside.api_url or "").strip()
     if not api_url or api_url.startswith("${"):
         return None
-    return api_url.rstrip("/")
+    api_url = api_url.rstrip("/")
+    bridge_v1_urls = {
+        f"{_server_url(config.server.host, config.server.port).rstrip('/')}/v1",
+        f"http://127.0.0.1:{config.server.port}/v1",
+        f"http://localhost:{config.server.port}/v1",
+    }
+    if api_url in bridge_v1_urls:
+        return api_url.removesuffix("/v1")
+    return api_url
 
 
 def _configured_poolside_api_key(config) -> str | None:
@@ -3788,13 +3859,81 @@ def _configured_poolside_api_key(config) -> str | None:
     return None
 
 
+def _poolside_auth_token(config, api_url: str | None) -> str | None:
+    if api_url and _is_llama_bridge_poolside_url(config, api_url):
+        return "ollama"
+    return _configured_poolside_api_key(config)
+
+
+def _poolside_standalone_base_url(config, api_url: str | None) -> str | None:
+    if not api_url:
+        return None
+    return api_url.rstrip("/")
+
+
+def _configure_poolside_standalone_auth(
+    poolside_executable: str,
+    standalone_base_url: str,
+    api_key: str,
+) -> None:
+    if _poolside_credentials_match(standalone_base_url, api_key):
+        return
+    env = os.environ.copy()
+    env["POOLSIDE_STANDALONE_BASE_URL"] = standalone_base_url
+    process = subprocess.run(
+        [poolside_executable, "setup", "--api-key", api_key],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "unknown error"
+        raise SystemExit(f"Poolside standalone setup failed: {detail}")
+
+
+def _resolved_poolside_credentials_path() -> Path:
+    return Path(os.path.expanduser("~/.config/poolside/credentials.json"))
+
+
+def _poolside_credentials_match(standalone_base_url: str, api_key: str) -> bool:
+    credentials_path = _resolved_poolside_credentials_path()
+    if not credentials_path.exists():
+        return False
+    try:
+        raw = json.loads(credentials_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    entries = raw if isinstance(raw, list) else [raw]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("serviceMode") or "").lower() != "standalone":
+            continue
+        if str(entry.get("apiUrl") or "").rstrip("/") != standalone_base_url.rstrip("/"):
+            continue
+        if str(entry.get("token") or "") != api_key:
+            continue
+        return True
+    return False
+
+
 def _is_llama_bridge_poolside_url(config, value: Any) -> bool:
     api_url = str(value or "").strip().rstrip("/")
     if not api_url:
         return False
     bridge_base = f"{_server_url(config.server.host, config.server.port)}/v1".rstrip("/")
+    bridge_root = _server_url(config.server.host, config.server.port).rstrip("/")
     localhost_base = f"http://127.0.0.1:{config.server.port}/v1"
-    return api_url in {bridge_base, localhost_base, f"http://localhost:{config.server.port}/v1"}
+    localhost_root = f"http://127.0.0.1:{config.server.port}"
+    return api_url in {
+        bridge_base,
+        bridge_root,
+        localhost_base,
+        localhost_root,
+        f"http://localhost:{config.server.port}/v1",
+        f"http://localhost:{config.server.port}",
+    }
 
 
 def _resolved_poolside_settings_path(config) -> Path:
@@ -6009,22 +6148,21 @@ def _start_windows_background(
     idle_after_file: Path | None = None,
 ) -> int:
     env = {**os.environ, "LLAMA_DEV_LOG": "1"}
-    with log_path.open("a", encoding="utf-8") as handle:
-        process = subprocess.Popen(
-            _serve_command(config_path, log_path, idle_timeout_seconds, idle_after_file),
-            stdin=subprocess.DEVNULL,
-            stdout=handle,
-            stderr=handle,
-            close_fds=True,
-            cwd=str(config_path.parent),
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP
-                | subprocess.CREATE_NO_WINDOW
-                | subprocess.DETACHED_PROCESS
-                | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-            ),
-            env=env,
-        )
+    process = subprocess.Popen(
+        _serve_command(config_path, log_path, idle_timeout_seconds, idle_after_file),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        cwd=str(config_path.parent),
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW
+            | subprocess.DETACHED_PROCESS
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        ),
+        env=env,
+    )
     return process.pid
 
 

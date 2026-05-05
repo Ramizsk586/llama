@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import socket
+import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -349,6 +351,39 @@ class ToolRegistry:
         self._unavailable_tools.pop(tool.name, None)
 
     def _register_default_tools(self) -> None:
+        self._register(
+            ToolDefinition(
+                name="shell.execute",
+                description=(
+                    "Run a local shell command and return stdout, stderr, exit code, and timeout status.\n"
+                    "USE WHEN: User asks to create files, inspect folders, run tests, or execute local commands in the workspace.\n"
+                    "DO NOT USE: For web search or external factual lookup when a bridge research tool fits better.\n"
+                    "RESULT FORMAT: Command, working directory, exit code, stdout, stderr, and timed_out."
+                ),
+                parameters={
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to run.",
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Optional working directory.",
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "description": "Command timeout in seconds.",
+                            "default": 60,
+                            "minimum": 1,
+                            "maximum": 600,
+                        },
+                    },
+                },
+                handler=self._shell_execute,
+            )
+        )
         self._register(
             ToolDefinition(
                 name="datetime_now",
@@ -740,6 +775,53 @@ class ToolRegistry:
                 handler=self._master_review,
             )
         )
+
+    async def _shell_execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        command = _required_string(arguments, "command")
+        cwd_value = str(arguments.get("cwd") or "").strip()
+        cwd = cwd_value or None
+        if cwd and not os.path.isdir(cwd):
+            raise ValueError(f"Working directory does not exist: {cwd}")
+        timeout_seconds = _bounded_int(
+            arguments.get("timeout_seconds"),
+            default=60,
+            minimum=1,
+            maximum=600,
+        )
+        process_args = (
+            ["powershell", "-NoProfile", "-Command", command]
+            if os.name == "nt"
+            else ["sh", "-lc", command]
+        )
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                process_args,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                cwd=cwd,
+                check=False,
+            )
+            return {
+                "command": command,
+                "cwd": cwd or os.getcwd(),
+                "exit_code": completed.returncode,
+                "stdout": _truncate_tool_output(completed.stdout),
+                "stderr": _truncate_tool_output(completed.stderr),
+                "timed_out": False,
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "command": command,
+                "cwd": cwd or os.getcwd(),
+                "exit_code": None,
+                "stdout": _truncate_tool_output(exc.stdout or ""),
+                "stderr": _truncate_tool_output(exc.stderr or ""),
+                "timed_out": True,
+            }
 
     async def _datetime_now(self, arguments: dict[str, Any]) -> dict[str, Any]:
         country = str(arguments.get("country") or self.config.tools.country or "").strip()
@@ -1797,6 +1879,14 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
     except (TypeError, ValueError):
         number = default
     return max(minimum, min(maximum, number))
+
+
+def _truncate_tool_output(value: Any, limit: int = 12000) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n... <truncated {omitted} chars>"
 
 
 def _api_key(provider: ExternalToolProviderConfig, label: str) -> str:

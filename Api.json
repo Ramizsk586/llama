@@ -1,7 +1,7 @@
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8089",
-    "ANTHROPIC_AUTH_TOKEN": "change-me",
+    "ANTHROPIC_AUTH_TOKEN": "llama",
     "API_TIMEOUT_MS": "3000000",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "ANTHROPIC_SMALL_FAST_MODEL": "small_fast",

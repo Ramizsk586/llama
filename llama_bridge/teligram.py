@@ -1496,15 +1496,7 @@ class TeligramBot:
         me = await self.get_me()
         self.apply_telegram_profile(me)
         await self.set_my_commands()
-        LOGGER.info(
-            "Teligram polling started: name=%s bot=@%s provider=%s model=%s workspace=%s commands=%s",
-            self.agent_name,
-            me.get("username", "unknown"),
-            self.provider_name,
-            self.model,
-            self.workspace,
-            ", ".join(command for command, _ in COMMANDS),
-        )
+        LOGGER.info("Teligram polling started")
         while True:
             try:
                 updates = await self.get_updates(offset)

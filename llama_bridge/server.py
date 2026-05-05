@@ -1178,16 +1178,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
         tool_manager = app.state.tool_manager
         full_schema = request.query_params.get("full_schema") == "true"
+        management_tools = tool_manager.management_openai_tools() if tool_manager else []
+        bridge_tools = app.state.tools.openai_tools()
         if full_schema:
-            tools = tool_manager.compact_manifest("test", "openai")
-            # Replace summaries with full schemas
-            full_tools = []
-            for summary in tools:
-                tool = app.state.tools._tools.get(summary["name"])
-                if tool:
-                    full_tools.append(tool.as_openai_tool())
-            return _bridge_tools_response_from_list(full_tools)
-        return _bridge_tools_response(app.state.tools)
+            return _bridge_tools_response_from_list([*bridge_tools, *management_tools])
+        return _bridge_tools_response_from_list([*bridge_tools, *management_tools])
 
     @app.post("/v1/tools/call")
     @app.post("/api/tools/call")
@@ -1457,6 +1452,9 @@ def _with_bridge_tools(
     query = _latest_user_text(payload.get("messages", []))[:500]
     request_profile = _request_tool_profile(config, provider_config, payload.get("model"), query)
 
+    if bool(payload.get("stream")) and payload.get("tools"):
+        return _with_streaming_client_tool_instructions(payload)
+
     if tool_manager and config and config.tools.management_enabled:
         return _with_managed_tools(payload, registry, config, tool_manager, request_profile)
 
@@ -1518,6 +1516,64 @@ def _with_bridge_tools(
     merged["tools"] = tools
     merged.setdefault("tool_choice", "auto")
     return merged
+
+
+def _with_streaming_client_tool_instructions(payload: dict[str, Any]) -> dict[str, Any]:
+    tool_names = _tool_names(payload.get("tools"))
+    if not tool_names:
+        return payload
+
+    lines = [
+        "Streaming tool-use rules:",
+        "- Call only tool names exactly present in the supplied tool list.",
+    ]
+    if "shell" in tool_names:
+        lines.append(
+            "- For local shell commands, call `shell` with `cmd`; never call "
+            "`shell_exec`, `shell_execute`, `Shell`, `Run cmd`, or pass `command`."
+        )
+    prefixed_bridge_tools = sorted(name for name in tool_names if name.startswith("llama_bridge_tools__"))
+    if prefixed_bridge_tools:
+        lines.append(
+            "- For llama bridge MCP tools, use the fully prefixed "
+            "`llama_bridge_tools__...` names shown in the tool list; never call "
+            "unprefixed `tool_catalog_search` or `tool_schema_get`."
+        )
+
+    return _append_system_instruction(payload, "\n".join(lines))
+
+
+def _append_system_instruction(payload: dict[str, Any], instruction: str) -> dict[str, Any]:
+    messages = list(payload.get("messages") or [])
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        messages[0] = {**messages[0], "content": _append_content_text(messages[0].get("content"), instruction)}
+    else:
+        messages.insert(0, {"role": "system", "content": instruction})
+    return {**payload, "messages": messages}
+
+
+def _append_content_text(content: Any, text: str) -> Any:
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": text}]
+    if isinstance(content, str):
+        return f"{content}\n\n{text}".strip()
+    if content is None:
+        return text
+    return f"{_string_content(content)}\n\n{text}".strip()
+
+
+def _tool_names(tools: Any) -> set[str]:
+    names: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = function.get("name") or tool.get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
 
 
 def _with_managed_tools(
@@ -1784,6 +1840,44 @@ def _bridge_tools_response(registry: ToolRegistry) -> dict[str, Any]:
         "tools": tools,
         "data": tools,
         "unavailable_tools": unavailable_tools,
+        "openai_tools": openai_tools,
+        "ollama_tools": openai_tools,
+        "anthropic_tools": [
+            {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "input_schema": tool.get("parameters") or {"type": "object"},
+            }
+            for tool in tools
+        ],
+    }
+
+
+def _bridge_tools_response_from_list(openai_tools: list[dict[str, Any]]) -> dict[str, Any]:
+    tools = []
+    for tool in openai_tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = function.get("name") or tool.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        description = function.get("description") if isinstance(function.get("description"), str) else ""
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {"type": "object"}
+        tools.append(
+            {
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            }
+        )
+    return {
+        "object": "list",
+        "tools": tools,
+        "data": tools,
+        "unavailable_tools": {},
         "openai_tools": openai_tools,
         "ollama_tools": openai_tools,
         "anthropic_tools": [
@@ -3364,10 +3458,13 @@ async def _stream_openai_response(
     payload: dict[str, Any],
     config: BridgeConfig,
 ) -> AsyncIterator[str]:
+    available_tool_names = _tool_names(payload.get("tools"))
+    tool_name_by_index: dict[int, str] = {}
     try:
         async for line in provider.stream_chat_completion(payload):
             if not line:
                 continue
+            line = _normalize_streaming_tool_delta(line, available_tool_names, tool_name_by_index)
             yield f"{line}\n\n"
     except httpx.HTTPStatusError as exc:
         message = await _response_error_message(exc.response)
@@ -3382,6 +3479,98 @@ async def _stream_openai_response(
         _write_dev_log(config, "pi_response_error", {"message": str(exc)})
         yield f"data: {json.dumps({'error': {'message': str(exc)}}, ensure_ascii=True)}\n\n"
         return
+
+
+def _normalize_streaming_tool_delta(
+    line: str,
+    available_tool_names: set[str],
+    tool_name_by_index: dict[int, str],
+) -> str:
+    if not available_tool_names or not line.startswith("data:"):
+        return line
+    raw = line.removeprefix("data:").strip()
+    if raw == "[DONE]":
+        return line
+    try:
+        chunk = json.loads(raw)
+    except json.JSONDecodeError:
+        return line
+
+    changed = False
+    for choice in chunk.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        for tool_delta in delta.get("tool_calls") or []:
+            if not isinstance(tool_delta, dict):
+                continue
+            try:
+                index = int(tool_delta.get("index", 0))
+            except (TypeError, ValueError):
+                index = 0
+            function = tool_delta.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if isinstance(name, str) and name:
+                corrected = _streaming_tool_alias(name, available_tool_names)
+                if corrected != name:
+                    function["name"] = corrected
+                    changed = True
+                tool_name_by_index[index] = corrected
+
+            target_name = tool_name_by_index.get(index) or function.get("name")
+            arguments = function.get("arguments")
+            if isinstance(arguments, str) and target_name:
+                rewritten = _rewrite_streaming_tool_arguments(target_name, arguments)
+                if rewritten != arguments:
+                    function["arguments"] = rewritten
+                    changed = True
+
+    if not changed:
+        return line
+    return f"data: {json.dumps(chunk, ensure_ascii=True)}"
+
+
+def _streaming_tool_alias(name: str, available_tool_names: set[str]) -> str:
+    if name in available_tool_names:
+        return name
+
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+    shell_aliases = {
+        "shell_exec",
+        "shell_execute",
+        "shell",
+        "run_cmd",
+        "run_command",
+        "cmd",
+        "command",
+        "run_cmd",
+    }
+    if normalized in shell_aliases:
+        if "shell" in available_tool_names:
+            return "shell"
+        if "llama_bridge_tools__shell.execute" in available_tool_names:
+            return "llama_bridge_tools__shell.execute"
+
+    bridge_aliases = {
+        "tool_catalog_search": "llama_bridge_tools__tool_catalog_search",
+        "tool_schema_get": "llama_bridge_tools__tool_schema_get",
+    }
+    target = bridge_aliases.get(normalized)
+    if target in available_tool_names:
+        return target
+    return name
+
+
+def _rewrite_streaming_tool_arguments(tool_name: str, arguments: str) -> str:
+    if tool_name == "shell":
+        return re.sub(r'(["\'])command\1\s*:', r'\1cmd\1:', arguments)
+    if tool_name == "llama_bridge_tools__shell.execute":
+        return re.sub(r'(["\'])cmd\1\s*:', r'\1command\1:', arguments)
+    return arguments
 
 
 async def _stream_anthropic_complete_response(
@@ -3703,8 +3892,12 @@ def _check_auth(
     token = x_api_key
     if not token and authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:]
-    if config.server.auth_token and not hmac.compare_digest(
-        token or "", config.server.auth_token
+    accepted_tokens = [str(config.server.auth_token or "")]
+    if config.server.host in {"127.0.0.1", "localhost", "::1"}:
+        accepted_tokens.append("ollama")
+    if config.server.auth_token and not any(
+        candidate and hmac.compare_digest(token or "", candidate)
+        for candidate in accepted_tokens
     ):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -4124,11 +4317,7 @@ async def _run_embedded_telegram_bot(app: FastAPI) -> None:
         LOGGER.exception("Telegram bot skipped: Teligram initialization failed")
         return
 
-    LOGGER.info(
-        "Telegram bot worker started with Teligram runtime for provider=%s model=%s",
-        bot.provider_name,
-        bot.model,
-    )
+    LOGGER.info("Telegram bot worker started with Teligram runtime")
     try:
         await bot.poll_forever()
     except asyncio.CancelledError:
