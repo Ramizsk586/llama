@@ -120,6 +120,59 @@ llama telegram status
 llama stop
 ```
 
+## Telegram Agent
+
+Teligram is the standalone Telegram AI agent runtime. It reads `env.yml` through
+the same bridge config loader, uses the configured provider/model, and composes
+its system prompt from workspace Markdown files in `llama_bridge/bot_docs`, such as
+`SOUL.md`, `AGENTS.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `MEMORY.md`, and
+`HEARTBEAT.md`.
+
+Setup checklist:
+
+```powershell
+llama bot setup
+```
+
+1. Create a bot with BotFather.
+2. Copy the token into `TELEGRAM_BOT_TOKEN` or `telegram.bot_token`.
+3. Set `telegram.enabled: true` in `env.yml`.
+4. Choose `telegram.provider` and `telegram.model`.
+5. Set `telegram.allowed_chat_ids` if you want to restrict access.
+6. Customize the workspace Markdown files in `llama_bridge/bot_docs`.
+7. Run the bot:
+
+```powershell
+llama bot run
+```
+
+Useful checks:
+
+```powershell
+llama telegram status
+python -m llama_bridge.teligram --config .\env.yml --workspace .\llama_bridge\bot_docs
+```
+
+Example `env.yml` section:
+
+```yaml
+telegram:
+  enabled: true
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  allowed_chat_ids: []
+  provider: ollama_cloud
+  model: qwen3.5:cloud
+  system_prompt: "You are Teligram, a safe Telegram AI agent powered by Llama Bridge."
+  max_input_chars: 4000
+  max_output_tokens: 700
+  poll_interval_seconds: 2.0
+  response_timeout_seconds: 180.0
+```
+
+After launch, send `/status` in Telegram, then send a normal test message. The
+runtime does not print bot tokens, API keys, private prompts, or message content
+in normal logs.
+
 `llama api status` checks only the model aliases saved under `anthropic_models`
 in `env.yml` and reports whether each provider/model API responds.
 

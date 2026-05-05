@@ -49,7 +49,7 @@ from .tool_management import ToolManager
 
 
 DEV_LOG_ENABLED = os.environ.get("LLAMA_DEV_LOG") == "1"
-LOGGER = logging.getLogger(__name__)
+LOGGER = logging.getLogger("uvicorn.error.llama_bridge.server")
 
 
 def create_app(
@@ -4079,65 +4079,36 @@ def _stream_error_event(message: str) -> str:
 
 async def _run_embedded_telegram_bot(app: FastAPI) -> None:
     config = app.state.bridge_config
-    telegram = config.telegram
-    model = telegram.model or config.providers[telegram.provider].default_model
-    if not model:
-        LOGGER.warning("Telegram bot skipped: no model configured for provider %s", telegram.provider)
+    try:
+        from .teligram import TeligramBot
+    except Exception:
+        LOGGER.exception("Telegram bot skipped: could not load Teligram runtime")
         return
 
-    telegram_poll_timeout_seconds = 30.0
-    telegram_timeout = httpx.Timeout(
-        connect=10.0,
-        read=telegram_poll_timeout_seconds + 15.0,
-        write=30.0,
-        pool=30.0,
-    )
-    bridge_timeout = httpx.Timeout(
-        connect=10.0,
-        read=max(10.0, float(telegram.response_timeout_seconds)),
-        write=30.0,
-        pool=30.0,
-    )
-    offset = 0
-    server_base_url = f"{_local_server_url(config.server.host, config.server.port)}/v1"
-    headers = {"x-api-key": config.server.auth_token} if config.server.auth_token else {}
-
-    LOGGER.info("Telegram bot worker started for provider=%s model=%s", telegram.provider, model)
     try:
-        async with httpx.AsyncClient(timeout=telegram_timeout) as client:
-            await _telegram_set_my_commands(client, telegram.bot_token or "")
-            while True:
-                try:
-                    response = await client.get(
-                        f"https://api.telegram.org/bot{telegram.bot_token}/getUpdates",
-                        params={"timeout": int(telegram_poll_timeout_seconds), "offset": offset + 1},
-                    )
-                    response.raise_for_status()
-                    payload = response.json()
-                except httpx.ReadTimeout:
-                    payload = {"result": []}
-                except httpx.HTTPError:
-                    LOGGER.exception("Telegram bot poll failed")
-                    await asyncio.sleep(max(1.0, float(telegram.poll_interval_seconds)))
-                    continue
-                for update in payload.get("result", []):
-                    offset = max(offset, int(update.get("update_id", 0)))
-                    await _handle_embedded_telegram_update(
-                        app,
-                        client,
-                        telegram,
-                        server_base_url,
-                        headers,
-                        model,
-                        bridge_timeout,
-                        update,
-                    )
-                await asyncio.sleep(max(0.5, float(telegram.poll_interval_seconds)))
+        bot = TeligramBot(
+            config,
+            provider=app.state.providers.get(config.telegram.provider),
+            tools=app.state.tools,
+        )
+    except Exception:
+        LOGGER.exception("Telegram bot skipped: Teligram initialization failed")
+        return
+
+    LOGGER.info(
+        "Telegram bot worker started with Teligram runtime for provider=%s model=%s",
+        bot.provider_name,
+        bot.model,
+    )
+    try:
+        await bot.poll_forever()
     except asyncio.CancelledError:
         LOGGER.info("Telegram bot worker stopped")
         raise
     except Exception:
         LOGGER.exception("Telegram bot worker crashed")
+    finally:
+        await bot.aclose()
 
 
 async def _handle_embedded_telegram_update(
@@ -4606,23 +4577,7 @@ def _telegram_pending_command(config: BridgeConfig, chat_id: str) -> str | None:
 
 
 def _telegram_progress_steps(mode: Any) -> list[str]:
-    if mode == "deepresearch":
-        return [
-            "Step 1/4: Understanding your research goal",
-            "Step 2/4: Building the research plan",
-            "Step 3/4: Collecting and checking information",
-            "Step 4/4: Writing the final answer",
-        ]
-    if mode == "web":
-        return [
-            "Step 1/3: Understanding your search request",
-            "Step 2/3: Looking for current information",
-            "Step 3/3: Preparing the final answer",
-        ]
-    if mode in {"summarize", "explain"}:
-        return [
-            "Working on it now",
-        ]
+    # Keep Telegram chats quiet: typing indicators are enough while work runs.
     return []
 
 

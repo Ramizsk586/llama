@@ -20,3 +20,6 @@ llama = "llama_bridge.cli:main"
 
 [tool.setuptools]
 packages = ["llama_bridge"]
+
+[tool.setuptools.package-data]
+llama_bridge = ["bot_docs/*.md"]

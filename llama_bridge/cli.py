@@ -620,9 +620,14 @@ def main() -> None:
             parser.print_help()
             return
         if args.command == "bot":
-            config_path = _arg_path(args.config)
+            config_path = _arg_path(getattr(args, "bot_run_config", None) or args.config)
             if args.bot_command in {None, "setup"}:
                 _cmd_bot_setup(config_path)
+                return
+            if args.bot_command == "run":
+                from .teligram import run_teligram
+
+                run_teligram(str(config_path), args.workspace)
                 return
             if args.bot_command == "status":
                 _cmd_telegram_status(config_path)
@@ -977,6 +982,9 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_cmd.add_argument("--config")
     bot_subparsers = bot_cmd.add_subparsers(dest="bot_command")
     bot_subparsers.add_parser("setup", help="run the Telegram bot setup workflow")
+    bot_run_cmd = bot_subparsers.add_parser("run", help="run the Teligram polling bot")
+    bot_run_cmd.add_argument("--config", dest="bot_run_config", help="path to env.yml")
+    bot_run_cmd.add_argument("--workspace", help="workspace directory for Teligram Markdown files")
     bot_subparsers.add_parser("status", help="show Telegram bot configuration status")
     bot_send_cmd = bot_subparsers.add_parser("send", help="send a Telegram message from the bot")
     bot_send_cmd.add_argument("--chat-id", help="explicit Telegram chat ID to send to")
@@ -1230,15 +1238,28 @@ def _cmd_bot_setup(config_path: Path) -> None:
         yaml.safe_dump(raw, sort_keys=False, allow_unicode=False),
         encoding="utf-8",
     )
+    workspace_path = Path(__file__).resolve().parent / "bot_docs"
+    _ensure_teligram_workspace_files(workspace_path)
     _print_state("ok", "Telegram bot configuration updated", "32")
     _kv_rows(
         [
             ("config", str(config_path)),
+            ("workspace", str(workspace_path)),
             ("provider", telegram["provider"]),
             ("model", telegram["model"]),
             ("allowed chats", ", ".join(telegram["allowed_chat_ids"]) or "all"),
+            ("run", f"llama bot run --config {config_path}"),
         ]
     )
+
+
+def _ensure_teligram_workspace_files(workspace: Path) -> None:
+    try:
+        from .teligram import ensure_required_workspace_files
+    except Exception as exc:  # noqa: BLE001 - setup should continue even if templates fail.
+        _print_state("warn", f"could not load Teligram templates: {exc}", "33")
+        return
+    ensure_required_workspace_files(workspace)
 
 
 def _cmd_endpoints() -> None:

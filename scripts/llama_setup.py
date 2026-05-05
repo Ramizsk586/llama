@@ -240,6 +240,20 @@ def _missing_python_modules(python: str, modules: tuple[str, ...]) -> list[str]:
 
 
 def _build_llama_exe(build_python: str, source_dir: Path) -> None:
+    add_data_args: list[str] = []
+    for filename in (
+        "IDENTITY.md",
+        "SOUL.md",
+        "USER.md",
+        "AGENTS.md",
+        "TOOLS.md",
+        "MEMORY.md",
+        "HEARTBEAT.md",
+    ):
+        source_file = source_dir / "llama_bridge" / "bot_docs" / filename
+        if source_file.exists():
+            add_data_args.extend(["--add-data", f"{source_file}{os.pathsep}llama_bridge{os.sep}bot_docs"])
+
     command = [
         build_python,
         "-m",
@@ -258,6 +272,8 @@ def _build_llama_exe(build_python: str, source_dir: Path) -> None:
         "--hidden-import",
         "yaml",
         "--hidden-import",
+        "llama_bridge.teligram",
+        "--hidden-import",
         "uvicorn.logging",
         "--hidden-import",
         "uvicorn.loops.auto",
@@ -265,6 +281,7 @@ def _build_llama_exe(build_python: str, source_dir: Path) -> None:
         "uvicorn.protocols.http.auto",
         "--hidden-import",
         "uvicorn.protocols.websockets.auto",
+        *add_data_args,
         str(source_dir / "llama_bridge" / "__main__.py"),
     ]
     _run(command, "Building llama.exe", cwd=source_dir)
