@@ -113,21 +113,23 @@ def anthropic_messages_to_openai(messages: list[dict[str, Any]]) -> list[dict[st
         text_parts: list[str] = []
         pending_tool_calls: list[dict[str, Any]] = []
         tool_results: list[dict[str, Any]] = []
+        tool_call_map: dict[str, dict] = {}  # Map tool_use_id to tool_call
+        
         for block in content:
             block_type = block.get("type")
             if block_type == "text":
                 text_parts.append(block.get("text", ""))
             elif block_type == "tool_use":
-                pending_tool_calls.append(
-                    {
-                        "id": block["id"],
-                        "type": "function",
-                        "function": {
-                            "name": block["name"],
-                            "arguments": json.dumps(block.get("input", {})),
-                        },
-                    }
-                )
+                tool_call = {
+                    "id": block["id"],
+                    "type": "function",
+                    "function": {
+                        "name": block["name"],
+                        "arguments": json.dumps(block.get("input", {})),
+                    },
+                }
+                pending_tool_calls.append(tool_call)
+                tool_call_map[block["id"]] = tool_call
             elif block_type == "tool_result":
                 # Preserve structured JSON in tool results
                 result_content = block.get("content", "")
@@ -135,23 +137,41 @@ def anthropic_messages_to_openai(messages: list[dict[str, Any]]) -> list[dict[st
                     result_text = _preserve_tool_result_json(result_content)
                 else:
                     result_text = _text_from_content(result_content)
-                
-                tool_results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": block["tool_use_id"],
-                        "content": result_text,
-                    }
-                )
 
-        if pending_tool_calls:
-            converted.append(
-                {
-                    "role": "assistant",
-                    "content": "\n".join(part for part in text_parts if part),
-                    "tool_calls": pending_tool_calls,
+                tool_result = {
+                    "role": "tool",
+                    "tool_call_id": block["tool_use_id"],
+                    "content": result_text,
                 }
-            )
+                
+                # If no matching tool_call exists, we need to create a synthetic one
+                if block["tool_use_id"] not in tool_call_map:
+                    # Will handle this after the loop
+                    pass
+                
+                tool_results.append(tool_result)
+
+        # Handle case where we have tool_results but no matching tool_calls
+        if tool_results and not pending_tool_calls:
+            # Create synthetic tool_calls for orphaned tool_results
+            synthetic_calls = []
+            for tr in tool_results:
+                synthetic_calls.append({
+                    "id": tr["tool_call_id"],
+                    "type": "function",
+                    "function": {"name": "unknown_tool", "arguments": "{}"},
+                })
+            converted.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": synthetic_calls,
+            })
+        elif pending_tool_calls:
+            converted.append({
+                "role": "assistant",
+                "content": "\n".join(part for part in text_parts if part),
+                "tool_calls": pending_tool_calls,
+            })
         elif text_parts:
             converted.append({"role": role, "content": "\n".join(text_parts)})
 

@@ -28,9 +28,13 @@ from .config import (
     load_config,
     codex_model_error,
     copilot_cli_model_error,
+    openai_model_error,
+    opencode_model_error,
     pi_model_error,
     resolve_codex_model,
     resolve_copilot_cli_model,
+    resolve_openai_model,
+    resolve_opencode_model,
     resolve_pi_model,
     write_claude_api_settings,
     write_default_config,
@@ -545,6 +549,19 @@ def main() -> None:
             install_copilot=not args.no_install_copilot,
         )
         return
+    if args.command == "opencode":
+        config_path = _arg_path(args.config)
+        _cmd_opencode(
+            config_path,
+            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+            provider_override=args.provider,
+            model_override=args.model,
+            opencode_args=args.opencode_args,
+            install_opencode=not args.no_install_opencode,
+            project_config=args.project_config,
+        )
+        return
 
     parser.print_help()
 
@@ -777,6 +794,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "copilot_args",
         nargs=argparse.REMAINDER,
         help="extra arguments passed to copilot",
+    )
+
+    opencode_cmd = subparsers.add_parser(
+        "opencode",
+        help="configure and launch OpenCode with llama bridge models",
+    )
+    opencode_cmd.add_argument("--config")
+    opencode_cmd.add_argument("--pid-file")
+    opencode_cmd.add_argument("--log-file")
+    opencode_cmd.add_argument("--provider", help="provider name from env.yml to use for OpenCode")
+    opencode_cmd.add_argument("--model", help="model name to use for OpenCode")
+    opencode_cmd.add_argument(
+        "--no-install-opencode",
+        action="store_true",
+        help="do not install OpenCode automatically if it is missing",
+    )
+    opencode_cmd.add_argument(
+        "--project-config",
+        action="store_true",
+        help="write project-local .opencode/opencode.json instead of global config",
+    )
+    opencode_cmd.add_argument(
+        "opencode_args",
+        nargs=argparse.REMAINDER,
+        help="extra arguments passed to opencode",
     )
 
     return parser
@@ -2072,6 +2114,10 @@ def _ensure_copilot_tool_extension(config) -> Path:
     data["mcpServers"] = servers
     _write_json(config_path, data)
     _print_state("ok", f"Copilot CLI MCP tools config: {config_path}", "32")
+    
+    # Verify MCP server is reachable
+    _verify_mcp_server_tools(config)
+    
     return config_path
 
 
@@ -2172,6 +2218,81 @@ def _mcp_server_env(config) -> dict[str, str]:
         "LLAMA_BRIDGE_BASE_URL": _server_url(config.server.host, config.server.port),
         "LLAMA_BRIDGE_API_KEY": config.server.auth_token,
     }
+
+
+def _verify_mcp_server_tools(config) -> None:
+    """Verify MCP server is reachable and return discovered tool names."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    command, args = _mcp_server_command()
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [command] + args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Send initialize request
+        init_msg = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "copilot-cli-verify", "version": "1.0"},
+            },
+        }) + "\n"
+        proc.stdin.write(init_msg)
+        proc.stdin.flush()
+
+        # Read initialize response (and possibly notification)
+        init_response = proc.stdout.readline()
+        # Try to read notification if present
+        import select
+        try:
+            if select.select([proc.stdout], [], [], 1.0)[0]:
+                notification = proc.stdout.readline()
+        except Exception:
+            pass
+
+        # Send tools/list request
+        list_msg = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+        }) + "\n"
+        proc.stdin.write(list_msg)
+        proc.stdin.flush()
+
+        # Read tools/list response
+        response_line = proc.stdout.readline()
+        if response_line:
+            data = json.loads(response_line)
+            tools = (data.get("result") or {}).get("tools") or []
+            tool_names = [t.get("name") for t in tools if t.get("name")]
+            if tool_names:
+                _print_state("ok", f"MCP tools discovered: {', '.join(tool_names)}", "32")
+            else:
+                _print_state("warn", "MCP server returned no tools", "33")
+        else:
+            _print_state("warn", "MCP server did not respond to tools/list", "33")
+
+    except Exception as exc:
+        _print_state("warn", f"Could not verify MCP server: {exc}", "33")
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
 
 
 def _bridge_tools_skill(host_name: str) -> str:
@@ -2537,6 +2658,98 @@ def _cmd_copilot(
     env["COPILOT_MODEL"] = model
     return_code = subprocess.run(
         [copilot_executable, *passthrough_args],
+        check=False,
+        env=env,
+    ).returncode
+    if idle_after_file is not None:
+        idle_after_file.write_text("closed\n", encoding="utf-8")
+    raise SystemExit(return_code)
+
+
+def _cmd_opencode(
+    config_path: Path,
+    pid_path: Path,
+    log_path: Path,
+    provider_override: str | None,
+    model_override: str | None,
+    opencode_args: list[str],
+    install_opencode: bool = True,
+    project_config: bool = False,
+) -> None:
+    _ensure_setup(config_path)
+    config = load_config(config_path)
+
+    server_running, _running_url = _server_is_running(config_path, pid_path)
+    if not server_running:
+        idle_after_file = pid_path.parent / "llama.opencode.closed"
+        idle_after_file.unlink(missing_ok=True)
+        _print_state("start", "llama server is not running, starting it for OpenCode", "36")
+        _cmd_start(
+            config_path,
+            pid_path,
+            log_path,
+            idle_timeout_seconds=180,
+            idle_after_file=idle_after_file,
+        )
+        server_running, _running_url = _server_is_running(config_path, pid_path)
+        if not server_running:
+            raise SystemExit(f"llama server failed to start, see log: {log_path}")
+        _print_note("llama server will stop 3 minutes after OpenCode closes with no requests")
+    else:
+        idle_after_file = None
+        _print_state("run", "using existing llama server", "32")
+
+    provider_name = provider_override or config.opencode.provider
+    if provider_name not in config.providers:
+        available = ", ".join(sorted(config.providers))
+        raise SystemExit(
+            f"Unknown OpenCode provider '{provider_name}'. Available providers: {available}"
+        )
+
+    model = resolve_opencode_model(
+        config,
+        provider_name=provider_name,
+        model_override=model_override,
+    )
+    if not model:
+        raise SystemExit(opencode_model_error(config, provider_name))
+
+    opencode_executable = _ensure_opencode(
+        install=install_opencode,
+        package=config.opencode.install_package,
+    )
+
+    _title("llama opencode")
+    _print_state("ok", "OpenCode environment is ready", "32")
+    _kv_rows(
+        [
+            ("provider", provider_name),
+            ("model", model),
+            ("base url", f"{_server_url(config.server.host, config.server.port)}/v1"),
+        ]
+    )
+
+    passthrough_args = opencode_args
+    if passthrough_args and passthrough_args[0] == "--":
+        passthrough_args = passthrough_args[1:]
+
+    env = os.environ.copy()
+    env["OPENAI_API_KEY"] = config.server.auth_token
+    env["OPENAI_BASE_URL"] = f"{_server_url(config.server.host, config.server.port)}/v1"
+
+    opencode_config = {
+        "model": f"llama-bridge/{model}",
+        "providers": {
+            "llama-bridge": {
+                "apiKey": config.server.auth_token,
+                "baseURL": f"{_server_url(config.server.host, config.server.port)}/v1",
+            }
+        },
+    }
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_config)
+
+    return_code = subprocess.run(
+        [opencode_executable] + passthrough_args,
         check=False,
         env=env,
     ).returncode
@@ -4223,6 +4436,56 @@ def _find_copilot_executable() -> str | None:
             ]
         )
     return _first_existing(candidates)
+
+
+def _find_opencode_executable() -> str | None:
+    opencode_executable = shutil.which("opencode")
+    if opencode_executable:
+        return opencode_executable
+    candidates = []
+    app_data = os.environ.get("APPDATA")
+    if app_data:
+        candidates.extend(
+            [
+                Path(app_data) / "npm" / "opencode.cmd",
+                Path(app_data) / "npm" / "opencode.exe",
+            ]
+        )
+    return _first_existing(candidates)
+
+
+def _ensure_opencode(install: bool = True, package: str | None = None) -> str:
+    opencode_executable = _find_opencode_executable()
+    if opencode_executable:
+        return opencode_executable
+    if not install:
+        raise SystemExit("OpenCode was not found. Install OpenCode and try again.")
+
+    _print_state("install", "OpenCode was not found, installing it now", "36")
+    _ensure_node_and_npm()
+    npm_executable = _find_npm_executable()
+    if not npm_executable:
+        raise SystemExit("npm was not found after setup. Install Node.js 18+ and try again.")
+
+    if package is None:
+        package = "opencode-ai"
+
+    process = subprocess.run(
+        [npm_executable, "install", "-g", package],
+        check=False,
+    )
+    if process.returncode != 0:
+        raise SystemExit(f"OpenCode install failed. Try `npm install -g {package}`.")
+
+    opencode_executable = _find_opencode_executable()
+    if not opencode_executable:
+        raise SystemExit(
+            "OpenCode installed, but `opencode` is not on PATH. Restart your terminal and try again."
+        )
+    return opencode_executable
+
+
+    return opencode_config_path
 
 
 def _first_existing(paths: list[Path]) -> str | None:

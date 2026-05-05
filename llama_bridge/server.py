@@ -39,6 +39,7 @@ from .providers import (
     resolve_model,
 )
 from .tools import ToolRegistry, select_relevant_tools
+from .tool_management import ToolManager
 
 
 DEV_LOG_ENABLED = os.environ.get("LLAMA_DEV_LOG") == "1"
@@ -59,6 +60,7 @@ def create_app(
         for name, provider_config in config.providers.items()
     }
     app.state.tools = ToolRegistry(config)
+    app.state.tool_manager = ToolManager(app.state.tools, config)
     app.state.anthropic_batches = {}
     app.state.anthropic_files = {}
     app.state.anthropic_skills = {}
@@ -162,7 +164,7 @@ def create_app(
             )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        payload = _with_bridge_tools({**body, "model": resolved.upstream_model}, app.state.tools, config)
+        payload = _with_bridge_tools({**body, "model": resolved.upstream_model}, app.state.tools, config, tool_manager=app.state.tool_manager)
         provider = _provider_for(app, resolved)
         _write_dev_log(
             config,
@@ -214,7 +216,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         payload = _completion_request_to_chat_completion(body, resolved.upstream_model)
-        payload = _with_bridge_tools(payload, app.state.tools, config)
+        payload = _with_bridge_tools(payload, app.state.tools, config, tool_manager=app.state.tool_manager)
         provider = _provider_for(app, resolved)
         if bool(body.get("stream")):
             _log_streaming_tool_policy(config, "openai_completion", payload)
@@ -547,6 +549,7 @@ def create_app(
             _cohere_chat_request_to_chat_completion(body, resolved.upstream_model),
             app.state.tools,
             config,
+            tool_manager=app.state.tool_manager,
         )
         provider = _provider_for(app, resolved)
         if bool(body.get("stream")):
@@ -633,6 +636,7 @@ def create_app(
             _responses_request_to_chat_completion(body, resolved.upstream_model),
             app.state.tools,
             config,
+            tool_manager=app.state.tool_manager,
         )
         provider = _provider_for(app, resolved)
         _write_dev_log(
@@ -1018,6 +1022,7 @@ def create_app(
             _ollama_chat_request_to_chat_completion(body, resolved.upstream_model),
             app.state.tools,
             config,
+            tool_manager=app.state.tool_manager,
         )
         provider = _provider_for(app, resolved)
         if bool(body.get("stream", True)):
@@ -1118,12 +1123,24 @@ def create_app(
     @app.get("/v1/tools")
     @app.get("/api/tools")
     async def list_bridge_tools(
+        request: Request,
         x_api_key: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
     ):
         _check_tools_auth(config, x_api_key, authorization)
         if not config.tools.expose_http:
             raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+        tool_manager = app.state.tool_manager
+        full_schema = request.query_params.get("full_schema") == "true"
+        if full_schema:
+            tools = tool_manager.compact_manifest("test", "openai")
+            # Replace summaries with full schemas
+            full_tools = []
+            for summary in tools:
+                tool = app.state.tools._tools.get(summary["name"])
+                if tool:
+                    full_tools.append(tool.as_openai_tool())
+            return _bridge_tools_response_from_list(full_tools)
         return _bridge_tools_response(app.state.tools)
 
     @app.post("/v1/tools/call")
@@ -1162,6 +1179,74 @@ def create_app(
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="tool arguments must be an object")
         return await _call_bridge_tool(app, tool_name, _bridge_tool_arguments(body))
+
+    @app.get("/v1/tools/compact")
+    @app.get("/api/tools/compact")
+    async def compact_tool_catalog(
+        request: Request,
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+        query: str = "",
+        limit: int = 20,
+    ):
+        _check_tools_auth(config, x_api_key, authorization)
+        if not config.tools.expose_http:
+            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+        tool_manager = app.state.tool_manager
+        compact = tool_manager.compact_manifest(query or "test", "openai")
+        return {"ok": True, "data": compact[:limit], "total": len(compact)}
+
+    @app.get("/v1/tools/{tool_name}/schema")
+    @app.get("/api/tools/{tool_name}/schema")
+    async def get_tool_schema(
+        tool_name: str,
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+        fmt: str = "openai",
+    ):
+        _check_tools_auth(config, x_api_key, authorization)
+        if not config.tools.expose_http:
+            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+        tool_manager = app.state.tool_manager
+        result = await tool_manager.call_management_tool(
+            "tool_schema_get", {"name": tool_name, "format": fmt}, "openai", None
+        )
+        return result
+
+    @app.get("/v1/tools/{tool_name}/help")
+    @app.get("/api/tools/{tool_name}/help")
+    async def get_tool_help(
+        tool_name: str,
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        _check_tools_auth(config, x_api_key, authorization)
+        if not config.tools.expose_http:
+            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+        tool_manager = app.state.tool_manager
+        result = await tool_manager.call_management_tool(
+            "tool_usage_help", {"name": tool_name}, "openai", None
+        )
+        return result
+
+    @app.post("/v1/tools/search")
+    @app.post("/api/tools/search")
+    async def search_tools(
+        request: Request,
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        _check_tools_auth(config, x_api_key, authorization)
+        if not config.tools.expose_http:
+            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Request body must be an object")
+        tool_manager = app.state.tool_manager
+        result = await tool_manager.call_management_tool(
+            "tool_catalog_search", body, "openai", None
+        )
+        return result
 
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(
@@ -1226,6 +1311,7 @@ def create_app(
             anthropic_request_to_openai(body, resolved.upstream_model),
             app.state.tools,
             config,
+            tool_manager=app.state.tool_manager,
         )
 
         if stream:
@@ -1314,17 +1400,15 @@ def _with_bridge_tools(
     config: BridgeConfig | None = None,
     enable_filtering: bool = True,
     max_exposed_tools: int = 5,
+    tool_manager: ToolManager | None = None,
 ) -> dict[str, Any]:
     """
     Merge bridge tools into request, optionally filtering by relevance.
-    
-    Args:
-        payload: Request payload
-        registry: Tool registry
-        config: Bridge config (for logging)
-        enable_filtering: Enable tool relevance filtering
-        max_exposed_tools: Maximum tools to include (after filtering)
+    Uses ToolManager for compact-first tool management when enabled.
     """
+    if tool_manager and config and config.tools.management_enabled:
+        return _with_managed_tools(payload, registry, config, tool_manager)
+
     bridge_tools = registry.openai_tools()
     if not bridge_tools:
         return payload
@@ -1333,10 +1417,9 @@ def _with_bridge_tools(
         enable_filtering = config.tools.relevance_filter
         max_exposed_tools = max(1, int(config.tools.max_exposed or max_exposed_tools))
 
-    # Apply relevance filtering if enabled
     if enable_filtering:
         query = _latest_user_text(payload.get("messages", []))[:500]
-        
+
         if query:
             filtered_tools, scores = select_relevant_tools(
                 bridge_tools,
@@ -1385,6 +1468,69 @@ def _with_bridge_tools(
             tools.append(tool)
     merged["tools"] = tools
     merged.setdefault("tool_choice", "auto")
+    return merged
+
+
+def _with_managed_tools(
+    payload: dict[str, Any],
+    registry: ToolRegistry,
+    config: BridgeConfig,
+    tool_manager: ToolManager,
+) -> dict[str, Any]:
+    """Handle tool integration with compact-first management system."""
+    query = _latest_user_text(payload.get("messages", []))[:500]
+
+    # Get tools based on policy
+    tools = tool_manager.schemas_for_request(query, "openai", None)
+
+    # Add compact manifest as system instruction
+    compact_manifest = tool_manager.compact_manifest(query, "openai")
+    compact_text = tool_manager.compact_instruction_text()
+
+    if compact_manifest:
+        manifest_lines = []
+        for tool in compact_manifest:
+            line = f"- {tool['name']}: {tool['summary']}"
+            if tool.get('use_when'):
+                line += f" (use when: {', '.join(tool['use_when'][:3])})"
+            if tool.get('args_hint'):
+                line += f" [args: {tool['args_hint']}]"
+            manifest_lines.append(line)
+
+        if manifest_lines:
+            compact_text += "\n\nAvailable bridge tools, compact view:\n" + "\n".join(manifest_lines)
+            compact_text += "\n\nNeed exact parameters? Call tool_schema_get with the tool name.\n"
+            compact_text += "Unsure which tool? Call tool_catalog_search with your query."
+
+    merged = {**payload}
+
+    # Add compact instructions to system message
+    messages = list(merged.get("messages") or [])
+    if messages and messages[0].get("role") == "system":
+        messages[0] = {
+            **messages[0],
+            "content": f"{messages[0].get('content') or ''}\n\n{compact_text}".strip(),
+        }
+    else:
+        messages.insert(0, {"role": "system", "content": compact_text})
+
+    merged["messages"] = messages
+    merged["tools"] = tools
+    merged.setdefault("tool_choice", "auto")
+
+    # Log the decision
+    _write_dev_log(
+        config,
+        "managed_tool_selection",
+        {
+            "query_preview": query[:100],
+            "policy": config.tools.expose_full_schema_policy,
+            "compact_tools_count": len(compact_manifest),
+            "full_schemas_count": len([t for t in tools if t.get("type") == "function"]),
+            "management_tools_count": len(tool_manager.management_openai_tools()),
+        },
+    )
+
     return merged
 
 
@@ -1521,9 +1667,14 @@ async def _chat_completion_with_bridge_tools(
     """
     Execute chat completion with automatic tool handling.
     Logs tool selection, arguments, results, and errors.
+    Handles management tools internally when tool management is enabled.
     """
     request_payload = {**payload, "messages": list(payload.get("messages") or [])}
+    tool_manager = getattr(app.state, "tool_manager", None)
     bridge_tool_names = set(app.state.tools._tools)
+    management_tool_names = (
+        set(tool_manager._management_tools.keys()) if tool_manager else set()
+    )
 
     for _round in range(max_rounds):
         response = await provider.create_chat_completion(request_payload, stream=False)
@@ -1531,24 +1682,77 @@ async def _chat_completion_with_bridge_tools(
         data = response.json()
         message = ((data.get("choices") or [{}])[0].get("message") or {})
         tool_calls = message.get("tool_calls") or []
-        bridge_calls = [
-            call
-            for call in tool_calls
-            if ((call.get("function") or {}).get("name") in bridge_tool_names)
-        ]
-        
-        if not bridge_calls or len(bridge_calls) != len(tool_calls):
+
+        if not tool_calls:
             _write_dev_log(
                 config,
                 "tool_execution_complete",
-                {
-                    "round": _round,
-                    "total_tool_calls": len(tool_calls),
-                    "bridge_tool_calls": len(bridge_calls),
-                    "has_non_bridge_tools": len(bridge_calls) < len(tool_calls),
-                    "final_message": _message_summary(message),
-                },
+                {"round": _round, "reason": "no tool calls"},
             )
+            return data
+
+        # Separate management tools from bridge tools
+        management_calls = []
+        bridge_calls = []
+        other_calls = []
+
+        for call in tool_calls:
+            func_name = (call.get("function") or {}).get("name") or ""
+            if func_name in management_tool_names:
+                management_calls.append(call)
+            elif func_name in bridge_tool_names:
+                bridge_calls.append(call)
+            else:
+                other_calls.append(call)
+
+        # Handle management tools internally
+        if management_calls:
+            request_payload["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                    "tool_calls": management_calls + bridge_calls + other_calls,
+                }
+            )
+
+            for tool_call in management_calls:
+                function = tool_call.get("function") or {}
+                name = function.get("name") or ""
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+
+                _write_dev_log(
+                    config,
+                    "management_tool_call",
+                    {"tool": name, "call_id": tool_call.get("id"), "arguments": arguments},
+                )
+
+                # Call management tool via ToolManager
+                if tool_manager:
+                    result = await tool_manager.call_management_tool(
+                        name, arguments, "openai", None
+                    )
+                else:
+                    result = {"ok": False, "error": "ToolManager not available"}
+
+                request_payload["messages"].append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id"),
+                        "content": json.dumps(result, ensure_ascii=True),
+                    }
+                )
+
+            # If only management tools were called, continue the loop
+            if not bridge_calls and not other_calls:
+                continue
+
+            # Remove management calls from tool_calls for further processing
+            tool_calls = [c for c in tool_calls if c not in management_calls]
+
+        if not tool_calls or (len(tool_calls) == len(management_calls) and not bridge_calls):
             return data
 
         request_payload["messages"].append(
@@ -1558,15 +1762,15 @@ async def _chat_completion_with_bridge_tools(
                 "tool_calls": tool_calls,
             }
         )
-        
-        for tool_call in bridge_calls:
+
+        for tool_call in tool_calls:
             function = tool_call.get("function") or {}
             name = function.get("name") or ""
             try:
                 arguments = json.loads(function.get("arguments") or "{}")
             except json.JSONDecodeError:
                 arguments = {}
-            
+
             _write_dev_log(
                 config,
                 "tool_call_start",
@@ -1576,7 +1780,7 @@ async def _chat_completion_with_bridge_tools(
                     "arguments": arguments,
                 },
             )
-            
+
             try:
                 tool_result = await app.state.tools.call_structured(name, arguments)
                 _write_dev_log(
@@ -1602,7 +1806,6 @@ async def _chat_completion_with_bridge_tools(
                         "error_type": type(exc).__name__,
                     },
                 )
-                # Structured error response
                 tool_result = {
                     "ok": False,
                     "tool": name,
@@ -1610,7 +1813,7 @@ async def _chat_completion_with_bridge_tools(
                     "retryable": not isinstance(exc, (KeyError, ValueError)),
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
-            
+
             request_payload["messages"].append(
                 {
                     "role": "tool",
@@ -3139,6 +3342,7 @@ async def _gemini_generate_content(
         _gemini_request_to_chat_completion(body, resolved.upstream_model),
         app.state.tools,
         config,
+        tool_manager=app.state.tool_manager,
     )
     provider = _provider_for(app, resolved)
     if stream:
@@ -3300,8 +3504,18 @@ async def _shutdown_after_idle(
         await asyncio.sleep(min(30, idle_timeout_seconds))
         idle_for = time.monotonic() - app.state.last_request_at
         if idle_for >= idle_timeout_seconds:
-            os.kill(os.getpid(), signal.SIGTERM)
-            return
+            # Signal uvicorn to shut down via app state
+            app.state.shutdown_requested = True
+            # Give current requests time to finish
+            await asyncio.sleep(1)
+            # Use uvicorn's shutdown mechanism
+            import signal as signal_module
+            if hasattr(signal_module, 'SIGTERM'):
+                os.kill(os.getpid(), signal_module.SIGTERM)
+            else:
+                # Windows fallback - exit more gracefully
+                print(f"\nIdle timeout reached ({idle_timeout_seconds}s). Shutting down...", flush=True)
+                os._exit(0)  # Use hard exit on Windows if needed
 
 
 def _check_auth(

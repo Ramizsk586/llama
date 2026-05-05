@@ -170,6 +170,11 @@ copilot_cli:
   max_output_tokens: 2048
   install_package: "@github/copilot"
 
+opencode:
+  provider: ollama_cloud
+  model: qwen3.5:cloud
+  install_package: "opencode-ai"
+
 tools:
   enabled: true
   expose_http: true
@@ -348,6 +353,20 @@ class CopilotCliConfig:
 
 
 @dataclass(slots=True)
+class OpenCodeConfig:
+    provider: str = "ollama_cloud"
+    model: str | None = None
+    config_path: str = "~/.config/opencode/opencode.json"
+    provider_id: str = "llama-bridge"
+    provider_name: str = "Llama Bridge"
+    install_package: str = "opencode-ai"
+    context_size: int = 65536
+    output_tokens: int = 8192
+    small_model: str | None = None
+    write_project_config: bool = False
+
+
+@dataclass(slots=True)
 class VsCopilotModel:
     name: str
     provider: str
@@ -389,6 +408,18 @@ class ToolConfig:
     tool_system_instructions: str | None = None
     # Pi CLI specific instructions
     pi_system_instructions: str | None = None  # Custom system instructions for Pi CLI
+    # Tool management system options
+    management_enabled: bool = True
+    compact_manifest_enabled: bool = True
+    compact_manifest_max_tools: int = 20
+    always_expose_management_tools: bool = True
+    expose_full_schema_policy: str = "relevant"  # one of: always, relevant, on_demand, never
+    schema_memory_enabled: bool = True
+    schema_memory_ttl_seconds: int = 86400
+    schema_fetch_max_tools: int = 3
+    compact_summary_max_chars: int = 160
+    full_schema_token_budget: int = 5000
+    fallback_to_full_schemas_for_unsupported_clients: bool = True
 
 
 @dataclass(slots=True)
@@ -456,6 +487,7 @@ class BridgeConfig:
     pi: PiConfig
     codex: CodexConfig
     copilot_cli: CopilotCliConfig
+    opencode: OpenCodeConfig
     vs_copilot_models: list[VsCopilotModel]
     tools: ToolConfig
     master_review: MasterReviewConfig
@@ -572,6 +604,80 @@ def copilot_cli_model_error(
         f"Config: {config.source_path}. Provider: {selected_provider}. "
         "Set copilot_cli.model, set that provider's default_model, configure a model "
         "alias for that provider, or pass `llama copilot --model ...`."
+    )
+
+
+def resolve_opencode_model(
+    config: BridgeConfig,
+    provider_name: str | None = None,
+    model_override: str | None = None,
+) -> str | None:
+    selected_provider = provider_name or config.opencode.provider
+    provider = config.providers[selected_provider]
+    if model_override:
+        return model_override
+    if config.opencode.model:
+        return config.opencode.model
+    if provider.default_model:
+        return provider.default_model
+
+    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    for alias_name in preferred_aliases:
+        alias = config.anthropic_models.get(alias_name)
+        if alias and alias.provider == selected_provider and alias.model:
+            return alias.model
+
+    for alias in config.anthropic_models.values():
+        if alias.provider == selected_provider and alias.model:
+            return alias.model
+
+    return None
+
+
+def opencode_model_error(config: BridgeConfig, provider_name: str | None = None) -> str:
+    selected_provider = provider_name or config.opencode.provider
+    return (
+        "OpenCode model is not configured. "
+        f"Config: {config.source_path}. Provider: {selected_provider}. "
+        "Set opencode.model, set that provider's default_model, configure a model "
+        "alias for that provider, or pass `llama opencode --model ...`."
+    )
+
+
+def resolve_openai_model(
+    config: BridgeConfig,
+    provider_name: str | None = None,
+    model_override: str | None = None,
+) -> str | None:
+    selected_provider = provider_name or config.openai.provider
+    provider = config.providers[selected_provider]
+    if model_override:
+        return model_override
+    if config.openai.model:
+        return config.openai.model
+    if provider.default_model:
+        return provider.default_model
+
+    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    for alias_name in preferred_aliases:
+        alias = config.anthropic_models.get(alias_name)
+        if alias and alias.provider == selected_provider and alias.model:
+            return alias.model
+
+    for alias in config.anthropic_models.values():
+        if alias.provider == selected_provider and alias.model:
+            return alias.model
+
+    return None
+
+
+def openai_model_error(config: BridgeConfig, provider_name: str | None = None) -> str:
+    selected_provider = provider_name or config.openai.provider
+    return (
+        "OpenCode model is not configured. "
+        f"Config: {config.source_path}. Provider: {selected_provider}. "
+        "Set openai.model, set that provider's default_model, configure a model "
+        "alias for that provider, or pass `llama openai --model ...`."
     )
 
 
@@ -811,6 +917,24 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             f"Unknown provider referenced by copilot_cli.provider: {copilot_cli.provider}"
         )
 
+    opencode_raw = raw.get("opencode", {}) or {}
+    opencode = OpenCodeConfig(
+        provider=opencode_raw.get("provider", codex.provider),
+        model=opencode_raw.get("model"),
+        config_path=opencode_raw.get("config_path", "~/.config/opencode/opencode.json"),
+        provider_id=opencode_raw.get("provider_id", "llama-bridge"),
+        provider_name=opencode_raw.get("provider_name", "Llama Bridge"),
+        install_package=opencode_raw.get("install_package", "opencode-ai"),
+        context_size=int(opencode_raw.get("context_size", 65536)),
+        output_tokens=int(opencode_raw.get("output_tokens", 8192)),
+        small_model=opencode_raw.get("small_model"),
+        write_project_config=bool(opencode_raw.get("write_project_config", False)),
+    )
+    if opencode.provider not in providers:
+        raise ValueError(
+            f"Unknown provider referenced by opencode.provider: {opencode.provider}"
+        )
+
     vs_copilot_models = _load_vs_copilot_models(raw, providers, aliases, pi, codex)
     tools = _load_tool_config(raw)
     master_review = _load_master_review_config(raw)
@@ -822,6 +946,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         pi=pi,
         codex=codex,
         copilot_cli=copilot_cli,
+        opencode=opencode,
         vs_copilot_models=vs_copilot_models,
         tools=tools,
         master_review=master_review,
@@ -965,6 +1090,20 @@ def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
         cache_ttl_seconds=cache_ttl_seconds,
         tool_system_instructions=tools_raw.get("tool_system_instructions"),
         pi_system_instructions=tools_raw.get("pi_system_instructions"),
+        # Tool management fields
+        management_enabled=bool(tools_raw.get("management_enabled", True)),
+        compact_manifest_enabled=bool(tools_raw.get("compact_manifest_enabled", True)),
+        compact_manifest_max_tools=int(tools_raw.get("compact_manifest_max_tools", 20)),
+        always_expose_management_tools=bool(tools_raw.get("always_expose_management_tools", True)),
+        expose_full_schema_policy=str(tools_raw.get("expose_full_schema_policy", "relevant")),
+        schema_memory_enabled=bool(tools_raw.get("schema_memory_enabled", True)),
+        schema_memory_ttl_seconds=int(tools_raw.get("schema_memory_ttl_seconds", 86400)),
+        schema_fetch_max_tools=int(tools_raw.get("schema_fetch_max_tools", 3)),
+        compact_summary_max_chars=int(tools_raw.get("compact_summary_max_chars", 160)),
+        full_schema_token_budget=int(tools_raw.get("full_schema_token_budget", 5000)),
+        fallback_to_full_schemas_for_unsupported_clients=bool(
+            tools_raw.get("fallback_to_full_schemas_for_unsupported_clients", True)
+        ),
     )
 
 

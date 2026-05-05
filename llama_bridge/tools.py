@@ -69,6 +69,134 @@ class ToolDefinition:
             },
         }
 
+    def as_summary(self, max_chars: int = 160) -> dict[str, Any]:
+        """Create a compact summary of the tool for compact manifest."""
+        summary = _extract_first_sentence(self.description)
+        if len(summary) > max_chars:
+            summary = summary[:max_chars - 3] + "..."
+
+        use_when = _extract_use_when(self.description)
+        if not use_when:
+            use_when = _infer_use_when_from_name(self.name)
+
+        args_hint = _build_args_hint(self.parameters)
+        category = _infer_category(self.name, self.description)
+
+        return {
+            "name": self.name,
+            "summary": summary,
+            "use_when": use_when[:5],
+            "args_hint": args_hint,
+            "category": category,
+            "schema_id": self.schema_id(),
+            "requires_full_schema": False,
+        }
+
+    def schema_id(self) -> str:
+        """Generate a stable hash of the full tool schema."""
+        schema = self.as_openai_tool()
+        schema_str = json.dumps(schema, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha256(schema_str.encode("utf-8")).hexdigest()[:16]
+
+
+def _extract_first_sentence(text: str) -> str:
+    """Extract the first sentence from a tool description."""
+    import re
+    # Look for "USE WHEN:" section and extract text before it
+    use_when_match = re.search(r"USE WHEN:", text, re.IGNORECASE)
+    if use_when_match:
+        text = text[:use_when_match.start()].strip()
+
+    # Extract first sentence (ending with ., !, ?)
+    match = re.match(r"^(.*?[.!?])\s", text)
+    if match:
+        return match.group(1).strip()
+
+    # If no sentence ending found, take first line or up to 160 chars
+    first_line = text.split("\n")[0].strip()
+    return first_line
+
+
+def _extract_use_when(description: str) -> list[str]:
+    """Extract USE WHEN keywords from tool description."""
+    import re
+    match = re.search(r"USE WHEN:\s*(.+?)(?:\n|$)", description, re.IGNORECASE)
+    if not match:
+        return []
+    use_when_text = match.group(1).strip()
+    # Extract keywords - words that are meaningful
+    keywords = re.findall(r"\b\w{3,}\b", use_when_text.lower())
+    # Filter out common words
+    stop_words = {"the", "and", "for", "with", "this", "that", "when", "user", "asks", "about"}
+    return [kw for kw in keywords if kw not in stop_words][:10]
+
+
+def _infer_use_when_from_name(tool_name: str) -> list[str]:
+    """Infer use_when keywords from tool name."""
+    name_lower = tool_name.lower()
+    keywords = []
+
+    # Common patterns
+    if "weather" in name_lower:
+        keywords = ["weather", "temperature", "rain", "wind"]
+    elif "wiki" in name_lower:
+        keywords = ["wikipedia", "information", "topic", "article"]
+    elif "search" in name_lower:
+        keywords = ["search", "find", "lookup", "research"]
+    elif "time" in name_lower or "date" in name_lower or "datetime" in name_lower:
+        keywords = ["time", "date", "timezone", "current"]
+    elif "image" in name_lower:
+        keywords = ["image", "picture", "photo", "visual"]
+    elif "source" in name_lower or "verify" in name_lower:
+        keywords = ["source", "verify", "evidence", "research"]
+    elif "master" in name_lower or "review" in name_lower:
+        keywords = ["review", "quality", "check", "analyze"]
+
+    return keywords[:5]
+
+
+def _build_args_hint(parameters: dict[str, Any]) -> str:
+    """Build a short hint about required arguments."""
+    if not parameters or "properties" not in parameters:
+        return "no arguments"
+
+    properties = parameters.get("properties", {})
+    required = parameters.get("required", [])
+
+    if required:
+        required_hints = [f"{arg} required" for arg in required[:3]]
+        return ", ".join(required_hints)
+
+    # If no required args, show optional ones
+    optional = list(properties.keys())[:3]
+    if optional:
+        return f"{', '.join(optional)} optional"
+
+    return "see schema for details"
+
+
+def _infer_category(tool_name: str, description: str) -> str:
+    """Infer tool category from name and description."""
+    name_lower = tool_name.lower()
+    desc_lower = description.lower()
+
+    if "weather" in name_lower or "weather" in desc_lower:
+        return "weather"
+    if "wiki" in name_lower or "wikipedia" in desc_lower:
+        return "knowledge"
+    if "search" in name_lower or "search" in desc_lower:
+        return "search"
+    if "time" in name_lower or "date" in name_lower or "datetime" in name_lower:
+        return "time"
+    if "image" in name_lower or "image" in desc_lower:
+        return "image"
+    if "source" in name_lower or "verify" in name_lower or "research" in desc_lower:
+        return "research"
+    if "master" in name_lower or "review" in name_lower:
+        return "review"
+
+    return "general"
+
 
 class ToolValidationError(ValueError):
     """Raised when a model supplies invalid tool arguments."""

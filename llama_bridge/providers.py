@@ -203,20 +203,44 @@ def resolve_model(
             (entry for entry in aliases.values() if entry.model == requested_model),
             None,
         )
-    if alias is None:
-        available = ", ".join(sorted(aliases))
-        raise KeyError(f"Unknown model '{requested_model}'. Available aliases: {available}")
-    upstream_model = alias.model or providers[alias.provider].default_model
-    if not upstream_model:
-        raise KeyError(
-            f"Model alias '{requested_model}' has no model and provider "
-            f"'{alias.provider}' has no default_model configured"
+    if alias is not None:
+        upstream_model = alias.model or providers[alias.provider].default_model
+        if not upstream_model:
+            raise KeyError(
+                f"Model alias '{requested_model}' has no model and provider "
+                f"'{alias.provider}' has no default_model configured"
+            )
+        return ResolvedModel(
+            alias=alias.alias,
+            upstream_model=upstream_model,
+            provider=providers[alias.provider],
         )
-    return ResolvedModel(
-        alias=alias.alias,
-        upstream_model=upstream_model,
-        provider=providers[alias.provider],
-    )
+
+    # Passthrough fallback: treat requested_model as a direct upstream model name
+    # Check if any provider has this as default_model
+    for provider in providers.values():
+        if provider.default_model == requested_model:
+            return ResolvedModel(
+                alias=requested_model,
+                upstream_model=requested_model,
+                provider=provider,
+            )
+
+    # Last resort: use the first configured provider
+    fallback_provider = next(iter(providers.values()), None)
+    if fallback_provider:
+        import logging
+        logging.warning(
+            f"Model '{requested_model}' not found in aliases; forwarding directly to provider '{fallback_provider.name}'"
+        )
+        return ResolvedModel(
+            alias=requested_model,
+            upstream_model=requested_model,
+            provider=fallback_provider,
+        )
+
+    available = ", ".join(sorted(aliases))
+    raise KeyError(f"Unknown model '{requested_model}'. Available aliases: {available}")
 
 
 def _resolve_claude_family_alias(

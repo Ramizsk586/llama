@@ -83,19 +83,39 @@ class BridgeMcpServer:
             return _error(message_id, -32000, str(exc))
 
     def _list_tools(self) -> list[dict[str, Any]]:
-        data = self._request("GET", "/api/tools")
+        # First try to get tools with full schemas
+        data = self._request("GET", "/api/tools?full_schema=true")
         tools = data.get("tools") or data.get("data") or []
+
+        # If that didn't work, fall back to regular endpoint
+        if not tools:
+            data = self._request("GET", "/api/tools")
+            tools = data.get("tools") or data.get("data") or []
+
         if not isinstance(tools, list):
             return []
-        return [
-            {
+
+        result = []
+        for tool in tools:
+            if not isinstance(tool, dict) or not tool.get("name"):
+                continue
+
+            # Get parameters - if missing, try to get from individual endpoint
+            params = tool.get("parameters")
+            if not params and tool.get("name"):
+                try:
+                    detail = self._request("GET", f"/api/tools/{tool['name']}/schema")
+                    if detail.get("ok") and detail.get("tool"):
+                        params = detail["tool"].get("parameters")
+                except Exception:
+                    params = {"type": "object"}
+
+            result.append({
                 "name": str(tool.get("name", "")),
                 "description": str(tool.get("description", "")),
-                "inputSchema": tool.get("parameters") or {"type": "object"},
-            }
-            for tool in tools
-            if isinstance(tool, dict) and tool.get("name")
-        ]
+                "inputSchema": params or {"type": "object"},
+            })
+        return result
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         data = self._request("POST", f"/api/tools/{name}", arguments)
