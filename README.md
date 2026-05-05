@@ -42,6 +42,7 @@ to the user `PATH`, sets `LLAMA_HOME`, and deletes the temporary source clone.
 
 ```powershell
 llama init
+llama configure
 ```
 
 The first command that needs config creates `config.example.yml` if no config exists.
@@ -52,6 +53,13 @@ are kept in the same directory as the exe.
 Opening `llama.exe` with no command runs setup. On Windows, setup saves that
 directory as the user `LLAMA_HOME` environment variable and adds it to the user
 `PATH`, so new terminals can run `llama` from anywhere.
+
+If `env.yml` already exists, `llama init` merges in any newly added default
+sections and preserves your existing providers, API keys, models, and aliases.
+
+`llama configure` opens an interactive terminal wizard that updates `env.yml`
+in place. It can set provider auth, choose default models, update aliases, and
+configure the restricted Telegram bot.
 
 To scan the device, create config, install missing Python packages, and check local
 provider tools:
@@ -95,20 +103,39 @@ llama claude -- --help
 ```powershell
 llama serve
 llama status
+llama start --forever
 llama api status
+llama api --limits
 llama logs
+llama cli --list
+llama configure
 llama pi
 llama claude
 llama codex
 llama copilot
+llama opencode
+llama poolside
+llama bot
+llama telegram status
 llama stop
 ```
 
 `llama api status` checks only the model aliases saved under `anthropic_models`
 in `env.yml` and reports whether each provider/model API responds.
 
+`llama api --limits` opens a terminal view of configured providers and shows
+their tracked quota windows such as hourly, weekly, and monthly limits. It reads
+`providers.<name>.usage_limits` and `providers.<name>.model_limits` from
+`env.yml`, groups providers by period, and shows limit, used, and remaining
+values. `llama api limits` works too.
+
 `llama logs` follows the live log until you press `Ctrl+C`. Use
 `llama logs --no-follow` to print the current log and exit.
+
+`llama cli --list` shows which llama-managed CLI tools are currently usable and
+where they are installed. `llama cli --rm` lists the installed tools and lets
+you choose one to remove, or you can pass a name directly such as
+`llama cli --rm opencode`.
 
 `llama pi` configures and launches the Pi coding agent. If Pi is missing, llama
 installs Node.js/npm through the available OS package manager (`winget`, `brew`,
@@ -219,6 +246,31 @@ copilot_cli:
   max_output_tokens: 2048
   install_package: "@github/copilot"
 ```
+
+`llama opencode` launches OpenCode against the local llama bridge and injects a
+runtime OpenCode config through `OPENCODE_CONFIG_CONTENT`. The generated config
+uses OpenCode's current `provider` schema and registers the bridge as an
+OpenAI-compatible provider at `http://127.0.0.1:8089/v1`.
+
+`llama poolside` installs and launches Poolside Agent CLI. By default it uses
+Poolside's official installers: `curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh`
+on macOS/Linux and `irm https://downloads.poolside.ai/pool/install.ps1 | iex`
+on Windows. It now follows the same provider/model pattern as the other llama
+CLI launchers, writes Poolside `settings.yaml`, sets `POOLSIDE_API_URL` to the
+local bridge, and wires in the bridge MCP tools. You can configure it in
+`env.yml`:
+
+```yaml
+poolside:
+  provider: ollama_cloud
+  model: qwen3.5:cloud
+  config_path: ~/.config/poolside/settings.yaml
+  install_command: "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
+  windows_install_command: "irm https://downloads.poolside.ai/pool/install.ps1 | iex"
+```
+
+Use `llama poolside --provider <name> --model <model>` to override the saved
+provider or model for one launch.
 
 Pass Copilot CLI arguments after `--`:
 

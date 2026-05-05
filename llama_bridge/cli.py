@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import math
 import os
 import re
 import signal
@@ -14,9 +15,12 @@ import time
 import warnings
 from dataclasses import dataclass, replace
 from collections.abc import Callable
+from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 from pathlib import Path
+
+import httpx
 
 from .config import (
     DEFAULT_API_SETTINGS_PATH,
@@ -25,6 +29,7 @@ from .config import (
     DEFAULT_LOG_PATH,
     DEFAULT_PID_PATH,
     ensure_default_dirs,
+    merge_missing_config_fields,
     load_config,
     codex_model_error,
     copilot_cli_model_error,
@@ -69,6 +74,26 @@ class ApiStatusResult:
     ok: bool
     status: str
     detail: str
+
+
+@dataclass(slots=True)
+class CliTarget:
+    name: str
+    display_name: str
+    launcher_command: str
+    finder: Callable[[], str | None]
+    install_method: str
+    package: str | None = None
+    uninstall_hint: str | None = None
+
+
+class SetupCanceled(SystemExit):
+    def __init__(self, message: str = "Setup canceled.") -> None:
+        super().__init__(0)
+        self.message = message
+
+
+DEFAULT_START_IDLE_TIMEOUT_SECONDS = 180
 
 
 ENDPOINT_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
@@ -400,184 +425,245 @@ def main() -> None:
     _enable_terminal_style()
     parser = _build_parser()
     args = parser.parse_args()
+    try:
+        if args.endpoints or args.command == "endpoints":
+            _cmd_endpoints()
+            return
 
-    if args.endpoints or args.command == "endpoints":
-        _cmd_endpoints()
-        return
+        if args.command is None:
+            _cmd_setup(_default_config_path(), install_system=True)
+            _print_note("Run `llama serve` to start the server or `llama claude` to launch Claude Code.")
+            return
 
-    if args.command is None:
-        _cmd_setup(_default_config_path(), install_system=True)
-        _print_note("Run `llama serve` to start the server or `llama claude` to launch Claude Code.")
-        return
-
-    if args.command == "init":
-        _cmd_init(_arg_path(args.config), args.force)
-        return
-    if args.command == "setup":
-        _cmd_setup(_arg_path(args.config), install_system=not args.no_install_system)
-        return
-    if args.command == "serve":
-        config_path = _arg_path(args.config)
-        _ensure_setup(config_path)
-        if args.foreground:
-            _cmd_serve_foreground(
+        if args.command == "init":
+            _cmd_init(_arg_path(args.config), args.force)
+            return
+        if args.command == "configure":
+            _cmd_configure(_arg_path(args.config))
+            return
+        if args.command == "setup":
+            _cmd_setup(_arg_path(args.config), install_system=not args.no_install_system)
+            return
+        if args.command == "serve":
+            config_path = _arg_path(args.config)
+            _ensure_setup(config_path)
+            if args.foreground:
+                _cmd_serve_foreground(
+                    config_path,
+                    args.log_file,
+                    args.idle_timeout,
+                    Path(args.idle_after_file) if args.idle_after_file else None,
+                )
+                return
+            _cmd_start(
                 config_path,
-                args.log_file,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
                 args.idle_timeout,
-                Path(args.idle_after_file) if args.idle_after_file else None,
             )
             return
-        _cmd_start(
-            config_path,
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-            args.idle_timeout,
-        )
-        return
-    if args.command == "start":
-        config_path = _arg_path(args.config)
-        _ensure_setup(config_path)
-        _cmd_start(
-            config_path,
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-        )
-        return
-    if args.command == "stop":
-        config_path = _default_config_path()
-        _cmd_stop(_arg_path(args.pid_file, DEFAULT_PID_PATH, config_path))
-        return
-    if args.command == "logs":
-        config_path = _arg_path(args.config) if args.config else _default_config_path()
-        _cmd_logs(
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            args.follow,
-            args.clear,
-            args.dev,
-            config_path,
-            args.tail,
-            use_active=not args.config and not args.log_file and not args.pid_file,
-        )
-        return
-    if args.command == "status":
-        config_path = _arg_path(args.config)
-        _cmd_status(
-            config_path,
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-        )
-        return
-    if args.command == "api":
-        if args.api_command in {None, "status"}:
-            _cmd_api_status(_arg_path(args.config), args.timeout)
+        if args.command == "start":
+            config_path = _arg_path(args.config)
+            _ensure_setup(config_path)
+            _cmd_start(
+                config_path,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                0 if args.forever else DEFAULT_START_IDLE_TIMEOUT_SECONDS,
+            )
             return
-        parser.print_help()
-        return
-    if args.command == "tools":
-        config_path = _arg_path(args.config)
-        if args.tools_command in {None, "list"}:
-            _cmd_tools_list(config_path)
+        if args.command == "stop":
+            config_path = _default_config_path()
+            _cmd_stop(_arg_path(args.pid_file, DEFAULT_PID_PATH, config_path))
             return
-        if args.tools_command == "score":
-            _cmd_tools_score(config_path, args.query)
+        if args.command == "logs":
+            config_path = _arg_path(args.config) if args.config else _default_config_path()
+            _cmd_logs(
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                args.follow,
+                args.clear,
+                args.dev,
+                config_path,
+                args.tail,
+                use_active=not args.config and not args.log_file and not args.pid_file,
+            )
             return
-        if args.tools_command == "test":
-            _cmd_tools_test(config_path, args.name, args.arguments)
+        if args.command == "status":
+            config_path = _arg_path(args.config)
+            _cmd_status(
+                config_path,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+            )
             return
-        if args.tools_command == "diagnose":
-            _cmd_tools_diagnose(config_path, args.query)
+        if args.command == "api":
+            if args.limits or args.limets or args.api_command == "limits":
+                _cmd_api_limits(_arg_path(args.config))
+                return
+            if args.api_command in {None, "status"}:
+                _cmd_api_status(_arg_path(args.config), args.timeout)
+                return
+            parser.print_help()
             return
-        parser.print_help()
-        return
-    if args.command == "mcp-tools":
-        mcp_tools_main()
-        return
-    if args.command == "master-review":
-        _cmd_master_review(
-            _arg_path(args.config),
-            report_path=Path(args.report_json) if args.report_json else None,
-            mode=args.mode,
-            use_stdin=args.stdin,
-            check_keys=args.check_keys,
-            write_reviewed=Path(args.write_reviewed) if args.write_reviewed else None,
-        )
-        return
-    if args.command == "pi":
-        config_path = _arg_path(args.config)
-        _cmd_pi(
-            config_path,
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-            provider_override=args.provider,
-            model_override=args.model,
-            pi_args=args.pi_args,
-            install_pi=not args.no_install_pi,
-        )
-        return
-    if args.command == "claude":
-        config_path = _arg_path(args.config)
-        _cmd_claude(
-            config_path,
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-            args.claude_args,
-            install_claude=not args.no_install_claude,
-        )
-        return
-    if args.command == "codex":
-        config_path = _arg_path(args.config)
-        _cmd_codex(
-            config_path,
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-            provider_override=args.provider,
-            model_override=args.model,
-            codex_args=args.codex_args,
-            install_codex=not args.no_install_codex,
-        )
-        return
-    if args.command == "copilot":
-        config_path = _arg_path(args.config)
-        _cmd_copilot(
-            config_path,
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-            provider_override=args.provider,
-            model_override=args.model,
-            copilot_args=args.copilot_args,
-            install_copilot=not args.no_install_copilot,
-        )
-        return
-    if args.command == "opencode":
-        config_path = _arg_path(args.config)
-        _cmd_opencode(
-            config_path,
-            _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-            _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-            provider_override=args.provider,
-            model_override=args.model,
-            opencode_args=args.opencode_args,
-            install_opencode=not args.no_install_opencode,
-            project_config=args.project_config,
-        )
-        return
+        if args.command == "tools":
+            config_path = _arg_path(args.config)
+            if args.tools_command in {None, "list"}:
+                _cmd_tools_list(config_path)
+                return
+            if args.tools_command == "score":
+                _cmd_tools_score(config_path, args.query)
+                return
+            if args.tools_command == "test":
+                _cmd_tools_test(config_path, args.name, args.arguments)
+                return
+            if args.tools_command == "diagnose":
+                _cmd_tools_diagnose(config_path, args.query)
+                return
+            parser.print_help()
+            return
+        if args.command == "mcp-tools":
+            mcp_tools_main()
+            return
+        if args.command == "master-review":
+            _cmd_master_review(
+                _arg_path(args.config),
+                report_path=Path(args.report_json) if args.report_json else None,
+                mode=args.mode,
+                use_stdin=args.stdin,
+                check_keys=args.check_keys,
+                write_reviewed=Path(args.write_reviewed) if args.write_reviewed else None,
+            )
+            return
+        if args.command == "pi":
+            config_path = _arg_path(args.config)
+            _cmd_pi(
+                config_path,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                provider_override=args.provider,
+                model_override=args.model,
+                pi_args=args.pi_args,
+                install_pi=not args.no_install_pi,
+            )
+            return
+        if args.command == "claude":
+            config_path = _arg_path(args.config)
+            _cmd_claude(
+                config_path,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                args.claude_args,
+                install_claude=not args.no_install_claude,
+            )
+            return
+        if args.command == "codex":
+            config_path = _arg_path(args.config)
+            _cmd_codex(
+                config_path,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                provider_override=args.provider,
+                model_override=args.model,
+                codex_args=args.codex_args,
+                install_codex=not args.no_install_codex,
+            )
+            return
+        if args.command == "copilot":
+            config_path = _arg_path(args.config)
+            _cmd_copilot(
+                config_path,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                provider_override=args.provider,
+                model_override=args.model,
+                copilot_args=args.copilot_args,
+                install_copilot=not args.no_install_copilot,
+            )
+            return
+        if args.command == "opencode":
+            config_path = _arg_path(args.config)
+            _cmd_opencode(
+                config_path,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                provider_override=args.provider,
+                model_override=args.model,
+                opencode_args=args.opencode_args,
+                install_opencode=not args.no_install_opencode,
+                project_config=args.project_config,
+            )
+            return
+        if args.command == "poolside":
+            config_path = _arg_path(args.config)
+            _cmd_poolside(
+                config_path,
+                args.poolside_args,
+                provider_override=args.provider,
+                model_override=args.model,
+                install_poolside=not args.no_install_poolside,
+            )
+            return
+        if args.command == "cli":
+            config_path = _arg_path(args.config)
+            _cmd_cli(
+                config_path,
+                list_only=args.list,
+                remove_target=args.rm,
+            )
+            return
+        if args.command == "telegram":
+            config_path = _arg_path(args.config)
+            if args.telegram_command == "status":
+                _cmd_telegram_status(config_path)
+                return
+            parser.print_help()
+            return
+        if args.command == "bot":
+            config_path = _arg_path(args.config)
+            if args.bot_command in {None, "setup"}:
+                _cmd_bot_setup(config_path)
+                return
+            if args.bot_command == "status":
+                _cmd_telegram_status(config_path)
+                return
+            if args.bot_command == "send":
+                _cmd_bot_send(
+                    config_path,
+                    " ".join(args.message).strip(),
+                    args.chat_id,
+                )
+                return
+            parser.print_help()
+            return
 
-    parser.print_help()
+        parser.print_help()
+    except SetupCanceled as exc:
+        _print_state("stop", exc.message, "33")
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="llama", description="llama bridge CLI")
+    parser = argparse.ArgumentParser(
+        prog="llama",
+        description="llama bridge CLI",
+        usage="llama [-h] [--endpoints] <command> ...",
+    )
     parser.add_argument(
         "--endpoints",
         action="store_true",
         help="show all HTTP endpoints supported by the bridge",
     )
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
     init_cmd = subparsers.add_parser("init", help="write a default config file")
     init_cmd.add_argument("--config")
     init_cmd.add_argument("--force", action="store_true")
+
+    configure_cmd = subparsers.add_parser(
+        "configure",
+        help="interactive provider and Telegram setup wizard",
+    )
+    configure_cmd.add_argument("--config")
 
     setup_cmd = subparsers.add_parser("setup", help="create config and install missing requirements")
     setup_cmd.add_argument("--config")
@@ -603,6 +689,11 @@ def _build_parser() -> argparse.ArgumentParser:
     start_cmd.add_argument("--config")
     start_cmd.add_argument("--pid-file")
     start_cmd.add_argument("--log-file")
+    start_cmd.add_argument(
+        "--forever",
+        action="store_true",
+        help="disable the default 3-minute idle auto-stop",
+    )
 
     stop_cmd = subparsers.add_parser("stop", help="stop the background bridge")
     stop_cmd.add_argument("--pid-file")
@@ -654,6 +745,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=90.0,
         help="seconds to wait for each API check",
     )
+    api_cmd.add_argument(
+        "--limits",
+        action="store_true",
+        help="open the provider usage and limits terminal view",
+    )
+    api_cmd.add_argument(
+        "--limets",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     api_subparsers = api_cmd.add_subparsers(dest="api_command")
     api_status_cmd = api_subparsers.add_parser(
         "status",
@@ -665,6 +766,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=90.0,
         help="seconds to wait for each API check",
+    )
+    api_subparsers.add_parser(
+        "limits",
+        help="open the provider usage and limits terminal view",
     )
 
     tools_cmd = subparsers.add_parser("tools", help="inspect and test bridge tools")
@@ -821,10 +926,79 @@ def _build_parser() -> argparse.ArgumentParser:
         help="extra arguments passed to opencode",
     )
 
+    poolside_cmd = subparsers.add_parser(
+        "poolside",
+        help="install and launch Poolside Agent CLI",
+    )
+    poolside_cmd.add_argument("--config")
+    poolside_cmd.add_argument("--provider", help="provider name from env.yml to use for Poolside")
+    poolside_cmd.add_argument("--model", help="model name to use for Poolside")
+    poolside_cmd.add_argument(
+        "--no-install-poolside",
+        action="store_true",
+        help="do not install Poolside automatically if it is missing",
+    )
+    poolside_cmd.add_argument(
+        "poolside_args",
+        nargs=argparse.REMAINDER,
+        help="extra arguments passed to pool",
+    )
+
+    cli_cmd = subparsers.add_parser(
+        "cli",
+        help="list and remove CLI tools managed by llama",
+    )
+    cli_cmd.add_argument("--config")
+    cli_cmd.add_argument(
+        "--list",
+        action="store_true",
+        help="show which CLI tools are currently installed and usable",
+    )
+    cli_cmd.add_argument(
+        "--rm",
+        nargs="?",
+        const="__prompt__",
+        metavar="NAME",
+        help="remove one installed CLI by name, or prompt to choose when no name is given",
+    )
+
+    telegram_cmd = subparsers.add_parser(
+        "telegram",
+        help="inspect the restricted Telegram bot configuration",
+    )
+    telegram_cmd.add_argument("--config")
+    telegram_subparsers = telegram_cmd.add_subparsers(dest="telegram_command")
+    telegram_subparsers.add_parser("status", help="show Telegram bot configuration status")
+
+    bot_cmd = subparsers.add_parser(
+        "bot",
+        help="guided Telegram bot setup",
+    )
+    bot_cmd.add_argument("--config")
+    bot_subparsers = bot_cmd.add_subparsers(dest="bot_command")
+    bot_subparsers.add_parser("setup", help="run the Telegram bot setup workflow")
+    bot_subparsers.add_parser("status", help="show Telegram bot configuration status")
+    bot_send_cmd = bot_subparsers.add_parser("send", help="send a Telegram message from the bot")
+    bot_send_cmd.add_argument("--chat-id", help="explicit Telegram chat ID to send to")
+    bot_send_cmd.add_argument("message", nargs="+", help="message text to send")
+
     return parser
 
 
 def _cmd_init(config_path: Path, force: bool) -> None:
+    if config_path.exists():
+        created, changed = merge_missing_config_fields(config_path)
+        _title("llama init")
+        _print_state("ok", "existing config checked and merged forward", "32")
+        _kv_rows(
+            [
+                ("config", str(created)),
+                ("updated", "yes" if changed else "no"),
+            ]
+        )
+        _print_note("Existing providers, API keys, and models were preserved.")
+        return
+
     target_path = _example_config_path(config_path)
     created = write_default_config(target_path, force=force)
     _title("llama init")
@@ -860,6 +1034,211 @@ def _cmd_setup(config_path: Path, install_system: bool = False) -> None:
         _print_state("ok", "python packages: ok", "32")
     for note in result.notes:
         _print_note(note)
+
+
+def _cmd_configure(config_path: Path) -> None:
+    import yaml
+
+    merge_missing_config_fields(config_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+
+    _title("llama configure")
+    _print_note(f"Updating {config_path}")
+
+    providers = raw.setdefault("providers", {})
+    provider_names = list(providers.keys())
+    default_provider = str(
+        raw.get("codex", {}).get("provider")
+        or raw.get("pi", {}).get("provider")
+        or next(iter(provider_names), "ollama_cloud")
+    )
+    selected_provider = _prompt_choice(
+        "Model/auth provider",
+        provider_names,
+        default_provider,
+    )
+    provider_entry = providers.setdefault(selected_provider, {})
+
+    current_key = str(provider_entry.get("api_key") or "")
+    api_key = _prompt_text(
+        f"{selected_provider} API key",
+        current_key,
+        secret=True,
+        allow_blank=True,
+    )
+    if api_key != "":
+        provider_entry["api_key"] = api_key
+
+    current_model = str(provider_entry.get("default_model") or "")
+    model_value = _prompt_text(
+        f"{selected_provider} default model",
+        current_model,
+        secret=False,
+        allow_blank=False,
+    )
+    provider_entry["default_model"] = model_value
+
+    if _prompt_yes_no("Point Claude-style aliases to this provider/model?", default=True):
+        aliases = raw.setdefault("anthropic_models", {})
+        for alias_name in ("haiku", "sonnet", "opus", "small_fast"):
+            aliases[alias_name] = {"provider": selected_provider, "model": model_value}
+
+    for section_name in ("pi", "codex", "copilot_cli", "opencode", "poolside", "telegram"):
+        section = raw.setdefault(section_name, {})
+        if _prompt_yes_no(f"Use {selected_provider} for {section_name}?", default=False):
+            section["provider"] = selected_provider
+            section["model"] = model_value
+
+    telegram = raw.setdefault("telegram", {})
+    configure_telegram = _prompt_yes_no(
+        "Configure Telegram bot now?",
+        default=bool(telegram.get("enabled", False)),
+    )
+    if configure_telegram:
+        telegram["enabled"] = True
+        token_value = _prompt_text(
+            "Telegram bot token",
+            str(telegram.get("bot_token") or ""),
+            secret=True,
+            allow_blank=False,
+        )
+        telegram["bot_token"] = token_value
+        telegram["provider"] = _prompt_choice(
+            "Telegram provider",
+            provider_names,
+            str(telegram.get("provider") or selected_provider),
+        )
+        telegram["model"] = _prompt_text(
+            "Telegram model",
+            str(telegram.get("model") or model_value),
+            allow_blank=False,
+        )
+        chat_ids = _prompt_text(
+            "Allowed chat IDs (comma separated, blank keeps current)",
+            ",".join(str(item) for item in (telegram.get("allowed_chat_ids") or [])),
+            allow_blank=True,
+        )
+        if chat_ids.strip():
+            telegram["allowed_chat_ids"] = [item.strip() for item in chat_ids.split(",") if item.strip()]
+        telegram["max_input_chars"] = int(
+            _prompt_text(
+                "Telegram max input chars",
+                str(telegram.get("max_input_chars") or 4000),
+                allow_blank=False,
+            )
+        )
+        telegram["max_output_tokens"] = int(
+            _prompt_text(
+                "Telegram max output tokens",
+                str(telegram.get("max_output_tokens") or 512),
+                allow_blank=False,
+            )
+        )
+    else:
+        telegram["enabled"] = bool(telegram.get("enabled", False))
+
+    config_path.write_text(
+        yaml.safe_dump(raw, sort_keys=False, allow_unicode=False),
+        encoding="utf-8",
+    )
+
+    _print_state("ok", "configuration updated", "32")
+    _kv_rows(
+        [
+            ("config", str(config_path)),
+            ("provider", selected_provider),
+            ("model", model_value),
+            ("telegram", "enabled" if telegram.get("enabled") else "disabled"),
+        ]
+    )
+
+
+def _cmd_bot_setup(config_path: Path) -> None:
+    import yaml
+
+    merge_missing_config_fields(config_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    providers = raw.setdefault("providers", {})
+    provider_names = list(providers.keys())
+    telegram = raw.setdefault("telegram", {})
+
+    _title("llama bot")
+    _print_note(f"Updating {config_path}")
+
+    telegram["enabled"] = _prompt_yes_no(
+        "Enable Telegram bot?",
+        default=bool(telegram.get("enabled", True)),
+    )
+    if not telegram["enabled"]:
+        config_path.write_text(
+            yaml.safe_dump(raw, sort_keys=False, allow_unicode=False),
+            encoding="utf-8",
+        )
+        _print_state("ok", "Telegram bot remains disabled", "32")
+        return
+
+    telegram["bot_token"] = _prompt_text(
+        "Telegram bot token",
+        str(telegram.get("bot_token") or ""),
+        secret=True,
+        allow_blank=False,
+    )
+    default_provider = str(telegram.get("provider") or next(iter(provider_names), "ollama_cloud"))
+    telegram["provider"] = _prompt_choice(
+        "Telegram provider",
+        provider_names,
+        default_provider,
+    )
+    provider_entry = providers.get(telegram["provider"], {})
+    default_model = str(
+        telegram.get("model")
+        or provider_entry.get("default_model")
+        or ""
+    )
+    telegram["model"] = _prompt_text(
+        "Telegram model",
+        default_model,
+        allow_blank=False,
+    )
+    chat_ids = _prompt_text(
+        "Allowed chat IDs (comma separated, blank means all chats allowed)",
+        ",".join(str(item) for item in (telegram.get("allowed_chat_ids") or [])),
+        allow_blank=True,
+    )
+    telegram["allowed_chat_ids"] = [item.strip() for item in chat_ids.split(",") if item.strip()]
+    telegram["max_input_chars"] = int(
+        _prompt_text(
+            "Telegram max input chars",
+            str(telegram.get("max_input_chars") or 4000),
+            allow_blank=False,
+        )
+    )
+    telegram["max_output_tokens"] = int(
+        _prompt_text(
+            "Telegram max output tokens",
+            str(telegram.get("max_output_tokens") or 512),
+            allow_blank=False,
+        )
+    )
+    telegram["system_prompt"] = _prompt_text(
+        "Telegram bot system prompt",
+        str(telegram.get("system_prompt") or ""),
+        allow_blank=False,
+    )
+
+    config_path.write_text(
+        yaml.safe_dump(raw, sort_keys=False, allow_unicode=False),
+        encoding="utf-8",
+    )
+    _print_state("ok", "Telegram bot configuration updated", "32")
+    _kv_rows(
+        [
+            ("config", str(config_path)),
+            ("provider", telegram["provider"]),
+            ("model", telegram["model"]),
+            ("allowed chats", ", ".join(telegram["allowed_chat_ids"]) or "all"),
+        ]
+    )
 
 
 def _cmd_endpoints() -> None:
@@ -1174,6 +1553,7 @@ def _cmd_start(
     ensure_default_dirs(pid_path.parent)
     ensure_default_dirs(log_path.parent)
     _sync_config_clone_from_root(config_path)
+    load_config(config_path)
     already_running, running_url = _server_is_running(config_path, pid_path)
     if _is_running(pid_path):
         _print_state("run", f"llama server is already running with pid {pid_path.read_text().strip()}", "32")
@@ -1203,6 +1583,10 @@ def _cmd_start(
         _write_active_server_state(config_path, pid_path, log_path)
         _print_state("ok", f"llama started in background on pid {process_id}", "32")
         _kv_rows([("log", str(log_path)), ("logs", "llama logs")])
+        if idle_timeout_seconds == 0:
+            _print_note("Server will stay up until you run `llama stop`.")
+        else:
+            _print_note(f"Server will stop after {idle_timeout_seconds // 60} minutes of inactivity.")
         return
 
     with log_path.open("a", encoding="utf-8") as handle:
@@ -1225,6 +1609,10 @@ def _cmd_start(
     _write_active_server_state(config_path, pid_path, log_path)
     _print_state("ok", f"llama started in background on pid {process.pid}", "32")
     _kv_rows([("log", str(log_path)), ("logs", "llama logs")])
+    if idle_timeout_seconds == 0:
+        _print_note("Server will stay up until you run `llama stop`.")
+    else:
+        _print_note(f"Server will stop after {idle_timeout_seconds // 60} minutes of inactivity.")
 
 
 def _sync_config_clone_from_root(config_path: Path) -> bool:
@@ -1396,6 +1784,302 @@ def _cmd_api_status(config_path: Path, timeout: float = 90.0) -> None:
 
     results = asyncio.run(_check_saved_model_apis(config, timeout, progress=True))
     _print_api_status_table(results)
+
+
+def _cmd_api_limits(config_path: Path) -> None:
+    while True:
+        try:
+            config = load_config(config_path)
+        except Exception as exc:  # noqa: BLE001 - CLI should show config errors plainly.
+            _print_state("fail", f"could not load config: {exc}", "31")
+            return
+
+        _render_api_limits_screen(config)
+        if not sys.stdin.isatty():
+            return
+        try:
+            choice = input("\n[r] refresh  [q] quit > ").strip().lower()
+        except EOFError:
+            return
+        if choice in {"", "r", "refresh"}:
+            continue
+        if choice in {"q", "quit", "exit"}:
+            return
+
+
+def _cmd_telegram_status(config_path: Path) -> None:
+    config = load_config(config_path)
+    telegram = config.telegram
+    _title("llama telegram")
+    _kv_rows(
+        [
+            ("enabled", str(telegram.enabled)),
+            ("token", _configured_label(telegram.bot_token)),
+            ("provider", telegram.provider),
+            ("model", telegram.model or config.providers[telegram.provider].default_model or "-"),
+            ("allowed chats", ", ".join(telegram.allowed_chat_ids) or "all"),
+        ]
+    )
+
+
+def _telegram_state_path(config_path: Path) -> Path:
+    return config_path.parent / "llama.telegram.json"
+
+
+def _read_last_telegram_chat_id(config_path: Path) -> str | None:
+    state_path = _telegram_state_path(config_path)
+    if not state_path.exists():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    chat_id = str(payload.get("chat_id") or "").strip()
+    if chat_id:
+        return chat_id
+    chats = payload.get("chats") or {}
+    if not isinstance(chats, dict) or not chats:
+        return None
+    latest_entry = max(
+        (entry for entry in chats.values() if isinstance(entry, dict)),
+        key=lambda entry: str(entry.get("updated_at") or ""),
+        default=None,
+    )
+    if latest_entry is None:
+        return None
+    chat_id = str(latest_entry.get("chat_id") or "").strip()
+    return chat_id or None
+
+
+def _default_telegram_chat_id(config, config_path: Path) -> str | None:
+    last_chat_id = _read_last_telegram_chat_id(config_path)
+    if last_chat_id:
+        return last_chat_id
+    numeric_allowed = [
+        str(item).strip()
+        for item in (config.telegram.allowed_chat_ids or [])
+        if re.fullmatch(r"-?\d+", str(item).strip())
+    ]
+    if len(numeric_allowed) == 1:
+        return numeric_allowed[0]
+    return None
+
+
+def _cmd_bot_send(config_path: Path, message: str, chat_id: str | None = None) -> None:
+    config = load_config(config_path)
+    telegram = config.telegram
+    if not telegram.enabled:
+        raise SystemExit("Telegram bot is disabled in env.yml.")
+    if not telegram.bot_token or telegram.bot_token.startswith("${"):
+        raise SystemExit("Telegram bot token is not configured.")
+    if not message.strip():
+        raise SystemExit("Message text is required.")
+
+    target_chat_id = str(chat_id or _default_telegram_chat_id(config, config_path) or "").strip()
+    if not target_chat_id:
+        raise SystemExit(
+            "No Telegram chat target found. Use `llama bot send --chat-id <id> <message>` "
+            "or send the bot a message first so it can remember the last chat."
+        )
+
+    response = httpx.post(
+        f"https://api.telegram.org/bot{telegram.bot_token}/sendMessage",
+        json={"chat_id": target_chat_id, "text": message},
+        timeout=httpx.Timeout(30.0, connect=10.0),
+    )
+    response.raise_for_status()
+
+    _title("llama bot send")
+    _print_state("ok", "Telegram message sent", "32")
+    _kv_rows(
+        [
+            ("chat", target_chat_id),
+            ("message", message[:80] + ("..." if len(message) > 80 else "")),
+        ]
+    )
+
+
+def _render_api_limits_screen(config) -> None:
+    _clear_screen()
+    _title("llama api limits")
+    providers = list(config.providers.values())
+    configured = sum(1 for provider in providers if provider.base_url)
+    with_limits = sum(1 for provider in providers if provider.usage_limits)
+    _kv_rows(
+        [
+            ("providers", len(providers)),
+            ("configured", configured),
+            ("with limits", with_limits),
+        ]
+    )
+
+    sections: dict[str, list[tuple[Any, str | None, str | None, dict[str, Any] | None]]] = {}
+    for provider in providers:
+        limits = provider.usage_limits or {}
+        model_limits = provider.model_limits or {}
+        if not limits and not model_limits:
+            sections.setdefault("untracked", []).append((provider, None, None, None))
+            continue
+        for period, entry in limits.items():
+            sections.setdefault(_limit_period_label(period), []).append((provider, None, period, entry))
+        for model_name, per_model_limits in model_limits.items():
+            for period, entry in (per_model_limits or {}).items():
+                sections.setdefault(_limit_period_label(period), []).append((provider, model_name, period, entry))
+
+    for section_name in ["hourly", "daily", "weekly", "monthly", "yearly", "other", "untracked"]:
+        entries = sections.get(section_name, [])
+        if not entries:
+            continue
+        print()
+        print(_style(section_name.upper(), "1;36"))
+        _print_limit_table(entries)
+
+    print()
+    _print_note("Edit `providers.<name>.usage_limits` in env.yml to track quota, usage, and remaining budget.")
+
+
+def _print_limit_table(entries: list[tuple[Any, str | None, str | None, dict[str, Any] | None]]) -> None:
+    headers = ["provider", "type", "unit", "limit", "used", "left", "key", "model"]
+    rows: list[list[str]] = []
+    for provider, model_name, period, entry in entries:
+        if entry is None:
+            rows.append(
+                [
+                    provider.name,
+                    provider.type,
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "set" if provider.api_key else "missing",
+                    model_name or provider.default_model or "-",
+                ]
+            )
+            continue
+
+        unit = str(entry.get("unit", "requests"))
+        limit = _to_number(entry.get("limit"))
+        used = _to_number(entry.get("used"))
+        left = None if limit is None else max(limit - (used or 0), 0)
+        rows.append(
+            [
+                provider.name,
+                f"{provider.type}/{period}",
+                unit,
+                _format_limit_number(limit),
+                _format_limit_number(used),
+                _format_limit_number(left),
+                "set" if provider.api_key else "missing",
+                model_name or provider.default_model or "-",
+            ]
+        )
+
+    widths = [
+        max(len(headers[index]), max((len(row[index]) for row in rows), default=0))
+        for index in range(len(headers))
+    ]
+    print("  " + "  ".join(headers[index].ljust(widths[index]) for index in range(len(headers))))
+    print("  " + "  ".join("-" * widths[index] for index in range(len(headers))))
+    for row in rows:
+        print("  " + "  ".join(row[index].ljust(widths[index]) for index in range(len(headers))))
+
+
+def _limit_period_label(period: str) -> str:
+    normalized = (period or "").strip().lower()
+    if normalized in {"hourly", "hour"}:
+        return "hourly"
+    if normalized in {"daily", "day"}:
+        return "daily"
+    if normalized in {"weekly", "week"}:
+        return "weekly"
+    if normalized in {"monthly", "month"}:
+        return "monthly"
+    if normalized in {"yearly", "year", "annual"}:
+        return "yearly"
+    return "other"
+
+
+def _to_number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_limit_number(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if math.isclose(value, round(value)):
+        return f"{int(round(value)):,}"
+    return f"{value:,.2f}"
+
+
+def _clear_screen() -> None:
+    if sys.stdout.isatty():
+        print("\033[2J\033[H", end="")
+
+
+def _prompt_choice(title: str, options: list[str], default: str) -> str:
+    print()
+    print(_style(title, "1;35"))
+    for index, option in enumerate(options, start=1):
+        marker = "*" if option == default else " "
+        print(f"  {marker} {index}. {option}")
+    try:
+        entered = input(f"Choose [default: {default}]: ").strip()
+    except KeyboardInterrupt as exc:
+        print()
+        raise SetupCanceled() from exc
+    if not entered:
+        return default
+    if entered.isdigit():
+        selected_index = int(entered) - 1
+        if 0 <= selected_index < len(options):
+            return options[selected_index]
+    if entered in options:
+        return entered
+    _print_note(f"Unknown option `{entered}`, keeping {default}.")
+    return default
+
+
+def _prompt_text(
+    title: str,
+    default: str = "",
+    *,
+    secret: bool = False,
+    allow_blank: bool = True,
+) -> str:
+    prompt = f"{title}"
+    if default:
+        preview = "<hidden>" if secret else default
+        prompt += f" [default: {preview}]"
+    prompt += ": "
+    try:
+        entered = input(prompt)
+    except KeyboardInterrupt as exc:
+        print()
+        raise SetupCanceled() from exc
+    if not entered.strip():
+        if default:
+            return default
+        if allow_blank:
+            return ""
+        return _prompt_text(title, default, secret=secret, allow_blank=allow_blank)
+    return entered.strip()
+
+
+def _prompt_yes_no(title: str, *, default: bool) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    try:
+        entered = input(f"{title} [{suffix}]: ").strip().lower()
+    except KeyboardInterrupt as exc:
+        print()
+        raise SetupCanceled() from exc
+    if not entered:
+        return default
+    return entered in {"y", "yes"}
 
 
 def _cmd_tools_list(config_path: Path) -> None:
@@ -2738,14 +3422,30 @@ def _cmd_opencode(
     env["OPENAI_BASE_URL"] = f"{_server_url(config.server.host, config.server.port)}/v1"
 
     opencode_config = {
+        "$schema": "https://opencode.ai/config.json",
         "model": f"llama-bridge/{model}",
-        "providers": {
+        "provider": {
             "llama-bridge": {
-                "apiKey": config.server.auth_token,
-                "baseURL": f"{_server_url(config.server.host, config.server.port)}/v1",
+                "npm": "@ai-sdk/openai-compatible",
+                "name": config.opencode.provider_name,
+                "options": {
+                    "apiKey": config.server.auth_token,
+                    "baseURL": f"{_server_url(config.server.host, config.server.port)}/v1",
+                },
+                "models": {
+                    model: {
+                        "name": model,
+                        "limit": {
+                            "context": config.opencode.context_size,
+                            "output": config.opencode.output_tokens,
+                        },
+                    }
+                },
             }
         },
     }
+    if config.opencode.small_model:
+        opencode_config["small_model"] = f"llama-bridge/{config.opencode.small_model}"
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_config)
 
     return_code = subprocess.run(
@@ -2756,6 +3456,133 @@ def _cmd_opencode(
     if idle_after_file is not None:
         idle_after_file.write_text("closed\n", encoding="utf-8")
     raise SystemExit(return_code)
+
+
+def _cmd_poolside(
+    config_path: Path,
+    poolside_args: list[str],
+    provider_override: str | None = None,
+    model_override: str | None = None,
+    install_poolside: bool = True,
+) -> None:
+    _ensure_setup(config_path)
+    config = load_config(config_path)
+
+    provider_name = provider_override or config.poolside.provider
+    if provider_name not in config.providers:
+        available = ", ".join(sorted(config.providers))
+        raise SystemExit(
+            f"Unknown Poolside provider '{provider_name}'. Available providers: {available}"
+        )
+
+    provider = config.providers[provider_name]
+    model = model_override or config.poolside.model or provider.default_model
+    if not model:
+        raise SystemExit(
+            "Poolside model is not configured. Set poolside.model, set that provider's default_model, "
+            "or pass `llama poolside --model ...`."
+        )
+
+    poolside_executable = _ensure_poolside(
+        install=install_poolside,
+        install_command=config.poolside.install_command,
+        windows_install_command=config.poolside.windows_install_command,
+    )
+    poolside_settings_path = _write_poolside_config(config)
+
+    _title("llama poolside")
+    _print_state("ok", "Poolside environment is ready", "32")
+    _kv_rows(
+        [
+            ("provider", provider_name),
+            ("model", model),
+            ("api url", f"{_server_url(config.server.host, config.server.port)}/v1"),
+            ("config", str(poolside_settings_path)),
+            ("command", poolside_executable),
+        ]
+    )
+
+    passthrough_args = poolside_args
+    if passthrough_args and passthrough_args[0] == "--":
+        passthrough_args = passthrough_args[1:]
+
+    command = [poolside_executable]
+    if "--model" not in passthrough_args and "-m" not in passthrough_args:
+        command.extend(["--model", model])
+    command.extend(passthrough_args)
+
+    env = os.environ.copy()
+    env["POOLSIDE_API_URL"] = f"{_server_url(config.server.host, config.server.port)}/v1"
+    env["POOLSIDE_API_KEY"] = config.server.auth_token
+    env["LLAMA_BRIDGE_API_KEY"] = config.server.auth_token
+
+    raise SystemExit(
+        subprocess.run(
+            command,
+            check=False,
+            env=env,
+        ).returncode
+    )
+
+
+def _write_poolside_config(config) -> Path:
+    import yaml
+
+    settings_path = _resolved_poolside_settings_path(config)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = yaml.safe_load(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    if not isinstance(existing, dict):
+        existing = {}
+
+    pool_section = dict(existing.get("pool") or {})
+    pool_section["api_url"] = f"{_server_url(config.server.host, config.server.port)}/v1"
+    existing["pool"] = pool_section
+
+    mcp_servers = dict(existing.get("mcp_servers") or {})
+    command, args = _mcp_server_command()
+    mcp_servers["llama_bridge_tools"] = {
+        "command": command,
+        "args": args,
+        "env": _mcp_server_env(config),
+    }
+    existing["mcp_servers"] = mcp_servers
+
+    settings_path.write_text(
+        yaml.safe_dump(existing, sort_keys=False, allow_unicode=False),
+        encoding="utf-8",
+    )
+    return settings_path
+
+
+def _resolved_poolside_settings_path(config) -> Path:
+    raw_path = str(config.poolside.config_path or "~/.config/poolside/settings.yaml")
+    if os.name == "nt" and raw_path == "~/.config/poolside/settings.yaml":
+        app_data = os.environ.get("APPDATA")
+        if app_data:
+            return Path(app_data) / "poolside" / "settings.yaml"
+    return Path(os.path.expanduser(raw_path))
+
+
+def _cmd_cli(
+    config_path: Path,
+    list_only: bool = False,
+    remove_target: str | None = None,
+) -> None:
+    _ensure_setup(config_path)
+    config = load_config(config_path)
+    targets = _cli_targets(config)
+
+    if remove_target is not None:
+        if remove_target == "__prompt__":
+            remove_target = _prompt_cli_target_name(targets)
+        if not remove_target:
+            raise SystemExit(1)
+        _remove_cli_target(targets, remove_target)
+        return
+
+    _print_cli_targets(targets, heading="llama cli")
+    if not list_only:
+        _print_note("Use `llama cli --rm` to choose one to remove.")
 
 
 def _write_codex_config(config, provider_name: str, model: str) -> tuple[Path, Path]:
@@ -4454,6 +5281,29 @@ def _find_opencode_executable() -> str | None:
     return _first_existing(candidates)
 
 
+def _find_poolside_executable() -> str | None:
+    poolside_executable = shutil.which("pool")
+    if poolside_executable:
+        return poolside_executable
+    candidates = []
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.extend(
+            [
+                Path(local_app_data) / "Programs" / "pool" / "bin" / "pool.exe",
+                Path(local_app_data) / "Programs" / "pool" / "bin" / "pool.cmd",
+            ]
+        )
+    home = Path.home()
+    candidates.extend(
+        [
+            home / ".local" / "bin" / "pool",
+            home / ".poolside" / "bin" / "pool",
+        ]
+    )
+    return _first_existing(candidates)
+
+
 def _ensure_opencode(install: bool = True, package: str | None = None) -> str:
     opencode_executable = _find_opencode_executable()
     if opencode_executable:
@@ -4485,7 +5335,199 @@ def _ensure_opencode(install: bool = True, package: str | None = None) -> str:
     return opencode_executable
 
 
-    return opencode_config_path
+def _ensure_poolside(
+    install: bool = True,
+    install_command: str = "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh",
+    windows_install_command: str = "irm https://downloads.poolside.ai/pool/install.ps1 | iex",
+) -> str:
+    poolside_executable = _find_poolside_executable()
+    if poolside_executable:
+        return poolside_executable
+    if not install:
+        raise SystemExit("Poolside CLI was not found. Install Poolside and try again.")
+
+    _print_state("install", "Poolside CLI was not found, installing it now", "36")
+    if os.name == "nt":
+        process = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                windows_install_command,
+            ],
+            check=False,
+        )
+        install_hint = windows_install_command
+    else:
+        process = subprocess.run(
+            ["sh", "-c", install_command],
+            check=False,
+        )
+        install_hint = install_command
+    if process.returncode != 0:
+        raise SystemExit(f"Poolside install failed. Try `{install_hint}`.")
+
+    poolside_executable = _find_poolside_executable()
+    if not poolside_executable:
+        raise SystemExit("Poolside installed, but `pool` is not on PATH. Restart your terminal and try again.")
+    return poolside_executable
+
+
+def _cli_targets(config) -> list[CliTarget]:
+    return [
+        CliTarget(
+            name="claude",
+            display_name="Claude Code",
+            launcher_command="llama claude",
+            finder=_find_claude_executable,
+            install_method="npm",
+            package="@anthropic-ai/claude-code",
+            uninstall_hint="npm uninstall -g @anthropic-ai/claude-code",
+        ),
+        CliTarget(
+            name="pi",
+            display_name="Pi",
+            launcher_command="llama pi",
+            finder=_find_pi_executable,
+            install_method="npm",
+            package=config.pi.install_package,
+            uninstall_hint=f"npm uninstall -g {config.pi.install_package}",
+        ),
+        CliTarget(
+            name="codex",
+            display_name="Codex",
+            launcher_command="llama codex",
+            finder=_find_codex_executable,
+            install_method="npm",
+            package=config.codex.install_package,
+            uninstall_hint=f"npm uninstall -g {config.codex.install_package}",
+        ),
+        CliTarget(
+            name="copilot",
+            display_name="Copilot CLI",
+            launcher_command="llama copilot",
+            finder=_find_copilot_executable,
+            install_method="npm",
+            package=config.copilot_cli.install_package,
+            uninstall_hint=f"npm uninstall -g {config.copilot_cli.install_package}",
+        ),
+        CliTarget(
+            name="opencode",
+            display_name="OpenCode",
+            launcher_command="llama opencode",
+            finder=_find_opencode_executable,
+            install_method="npm",
+            package=config.opencode.install_package,
+            uninstall_hint=f"npm uninstall -g {config.opencode.install_package}",
+        ),
+        CliTarget(
+            name="poolside",
+            display_name="Poolside",
+            launcher_command="llama poolside",
+            finder=_find_poolside_executable,
+            install_method="standalone",
+            uninstall_hint="delete the Poolside installation directory",
+        ),
+    ]
+
+
+def _print_cli_targets(targets: list[CliTarget], heading: str) -> None:
+    _title(heading)
+    headers = ["name", "status", "launcher", "install", "path"]
+    rows: list[list[str]] = []
+    for target in targets:
+        path = target.finder()
+        rows.append(
+            [
+                target.name,
+                "usable" if path else "missing",
+                target.launcher_command,
+                target.install_method,
+                path or "-",
+            ]
+        )
+
+    widths = [
+        max(len(headers[index]), max((len(row[index]) for row in rows), default=0))
+        for index in range(len(headers))
+    ]
+    print("  " + "  ".join(headers[index].ljust(widths[index]) for index in range(len(headers))))
+    print("  " + "  ".join("-" * widths[index] for index in range(len(headers))))
+    for row in rows:
+        print("  " + "  ".join(row[index].ljust(widths[index]) for index in range(len(headers))))
+
+
+def _prompt_cli_target_name(targets: list[CliTarget]) -> str | None:
+    installed = [target for target in targets if target.finder()]
+    if not installed:
+        _title("llama cli")
+        _print_state("ok", "No managed CLI tools are currently installed", "32")
+        return None
+
+    _print_cli_targets(installed, heading="llama cli --rm")
+    choice = input("\nChoose a CLI name to remove (or press Enter to cancel): ").strip().lower()
+    if not choice:
+        _print_note("Canceled.")
+        return None
+    return choice
+
+
+def _remove_cli_target(targets: list[CliTarget], name: str) -> None:
+    target = next((item for item in targets if item.name == name), None)
+    if target is None:
+        available = ", ".join(sorted(item.name for item in targets))
+        raise SystemExit(f"Unknown CLI '{name}'. Available names: {available}")
+
+    executable_path = target.finder()
+    if not executable_path:
+        _title("llama cli --rm")
+        _print_state("ok", f"{target.display_name} is already not installed", "32")
+        return
+
+    _title("llama cli --rm")
+    _print_state("run", f"Removing {target.display_name}", "36")
+    _kv_rows(
+        [
+            ("name", target.name),
+            ("path", executable_path),
+        ]
+    )
+
+    if target.install_method == "npm":
+        npm_executable = _find_npm_executable()
+        if not npm_executable or not target.package:
+            raise SystemExit(f"npm was not found. Try `{target.uninstall_hint}`.")
+        process = subprocess.run(
+            [npm_executable, "uninstall", "-g", target.package],
+            check=False,
+        )
+        if process.returncode != 0:
+            raise SystemExit(f"CLI remove failed. Try `{target.uninstall_hint}`.")
+    elif target.name == "poolside":
+        _remove_poolside_install(executable_path)
+    else:
+        raise SystemExit(f"Remove is not implemented for {target.name}.")
+
+    _print_state("ok", f"Removed {target.display_name}", "32")
+
+
+def _remove_poolside_install(executable_path: str) -> None:
+    path = Path(executable_path)
+    candidates = [path]
+    if path.name.lower().startswith("pool") and path.parent.name.lower() == "bin":
+        candidates.insert(0, path.parent.parent)
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            shutil.rmtree(candidate, ignore_errors=False)
+            return
+        if candidate.is_file():
+            candidate.unlink(missing_ok=True)
+            return
+
+    raise SystemExit("Could not determine which Poolside files to remove.")
 
 
 def _first_existing(paths: list[Path]) -> str | None:

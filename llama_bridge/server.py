@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import json
+import logging
 import os
 import re
 import signal
+import subprocess
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, AsyncIterable
@@ -26,6 +30,8 @@ from .anthropic import (
 )
 from .config import (
     BridgeConfig,
+    DEFAULT_LOG_PATH,
+    DEFAULT_PID_PATH,
     load_config,
     resolve_codex_model,
     resolve_pi_model,
@@ -43,6 +49,7 @@ from .tool_management import ToolManager
 
 
 DEV_LOG_ENABLED = os.environ.get("LLAMA_DEV_LOG") == "1"
+LOGGER = logging.getLogger(__name__)
 
 
 def create_app(
@@ -68,6 +75,7 @@ def create_app(
     app.state.threads = {}
     app.state.fine_tuning_jobs = {}
     app.state.last_request_at = time.monotonic()
+    app.state.telegram_task = None
 
     @app.middleware("http")
     async def track_activity(request: Request, call_next):
@@ -81,8 +89,18 @@ def create_app(
                 _shutdown_after_idle(app, idle_timeout_seconds, idle_after_file)
             )
 
+    if config.telegram.enabled and config.telegram.bot_token and not config.telegram.bot_token.startswith("${"):
+        @app.on_event("startup")
+        async def start_telegram_bot() -> None:
+            app.state.telegram_task = asyncio.create_task(_run_embedded_telegram_bot(app))
+
     @app.on_event("shutdown")
     async def close_providers() -> None:
+        telegram_task = getattr(app.state, "telegram_task", None)
+        if telegram_task is not None:
+            telegram_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await telegram_task
         for provider in app.state.providers.values():
             await provider.aclose()
         await app.state.tools.aclose()
@@ -164,7 +182,13 @@ def create_app(
             )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        payload = _with_bridge_tools({**body, "model": resolved.upstream_model}, app.state.tools, config, tool_manager=app.state.tool_manager)
+        payload = _with_bridge_tools(
+            {**body, "model": resolved.upstream_model},
+            app.state.tools,
+            config,
+            tool_manager=app.state.tool_manager,
+            provider_config=resolved.provider,
+        )
         provider = _provider_for(app, resolved)
         _write_dev_log(
             config,
@@ -216,7 +240,13 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         payload = _completion_request_to_chat_completion(body, resolved.upstream_model)
-        payload = _with_bridge_tools(payload, app.state.tools, config, tool_manager=app.state.tool_manager)
+        payload = _with_bridge_tools(
+            payload,
+            app.state.tools,
+            config,
+            tool_manager=app.state.tool_manager,
+            provider_config=resolved.provider,
+        )
         provider = _provider_for(app, resolved)
         if bool(body.get("stream")):
             _log_streaming_tool_policy(config, "openai_completion", payload)
@@ -550,6 +580,7 @@ def create_app(
             app.state.tools,
             config,
             tool_manager=app.state.tool_manager,
+            provider_config=resolved.provider,
         )
         provider = _provider_for(app, resolved)
         if bool(body.get("stream")):
@@ -637,6 +668,7 @@ def create_app(
             app.state.tools,
             config,
             tool_manager=app.state.tool_manager,
+            provider_config=resolved.provider,
         )
         provider = _provider_for(app, resolved)
         _write_dev_log(
@@ -1023,6 +1055,7 @@ def create_app(
             app.state.tools,
             config,
             tool_manager=app.state.tool_manager,
+            provider_config=resolved.provider,
         )
         provider = _provider_for(app, resolved)
         if bool(body.get("stream", True)):
@@ -1312,6 +1345,7 @@ def create_app(
             app.state.tools,
             config,
             tool_manager=app.state.tool_manager,
+            provider_config=resolved.provider,
         )
 
         if stream:
@@ -1401,13 +1435,17 @@ def _with_bridge_tools(
     enable_filtering: bool = True,
     max_exposed_tools: int = 5,
     tool_manager: ToolManager | None = None,
+    provider_config: ProviderConfig | None = None,
 ) -> dict[str, Any]:
     """
     Merge bridge tools into request, optionally filtering by relevance.
     Uses ToolManager for compact-first tool management when enabled.
     """
+    query = _latest_user_text(payload.get("messages", []))[:500]
+    request_profile = _request_tool_profile(config, provider_config, payload.get("model"), query)
+
     if tool_manager and config and config.tools.management_enabled:
-        return _with_managed_tools(payload, registry, config, tool_manager)
+        return _with_managed_tools(payload, registry, config, tool_manager, request_profile)
 
     bridge_tools = registry.openai_tools()
     if not bridge_tools:
@@ -1418,13 +1456,11 @@ def _with_bridge_tools(
         max_exposed_tools = max(1, int(config.tools.max_exposed or max_exposed_tools))
 
     if enable_filtering:
-        query = _latest_user_text(payload.get("messages", []))[:500]
-
         if query:
             filtered_tools, scores = select_relevant_tools(
                 bridge_tools,
                 query,
-                max_tools=max_exposed_tools,
+                max_tools=min(max_exposed_tools, int(request_profile.get("max_tools", max_exposed_tools))),
                 min_score=config.tools.confidence_threshold if config else 0.5,
                 force_for_keywords=config.tools.force_for_keywords if config else True,
                 default_search_provider=config.tools.default_search_provider if config else "tavily",
@@ -1455,7 +1491,7 @@ def _with_bridge_tools(
 
     merged = {**payload}
     if config is not None:
-        merged = _with_tool_instructions(merged, config, bridge_tools)
+        merged = _with_tool_instructions(merged, config, bridge_tools, request_profile)
     tools = list(merged.get("tools") or [])
     existing = {
         ((tool.get("function") or {}).get("name") or tool.get("name"))
@@ -1476,47 +1512,59 @@ def _with_managed_tools(
     registry: ToolRegistry,
     config: BridgeConfig,
     tool_manager: ToolManager,
+    request_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Handle tool integration with compact-first management system."""
     query = _latest_user_text(payload.get("messages", []))[:500]
 
     # Get tools based on policy
-    tools = tool_manager.schemas_for_request(query, "openai", None)
+    tools = tool_manager.schemas_for_request(query, "openai", request_profile)
 
     # Add compact manifest as system instruction
-    compact_manifest = tool_manager.compact_manifest(query, "openai")
-    compact_text = tool_manager.compact_instruction_text()
+    compact_manifest = tool_manager.compact_manifest(query, "openai", request_profile)
+    compact_text = tool_manager.compact_instruction_text(request_profile)
 
     if compact_manifest:
         manifest_lines = []
         for tool in compact_manifest:
             line = f"- {tool['name']}: {tool['summary']}"
-            if tool.get('use_when'):
+            if tool.get('use_when') and not (request_profile or {}).get("minimal"):
                 line += f" (use when: {', '.join(tool['use_when'][:3])})"
-            if tool.get('args_hint'):
+            if tool.get('args_hint') and not (request_profile or {}).get("minimal"):
                 line += f" [args: {tool['args_hint']}]"
             manifest_lines.append(line)
 
         if manifest_lines:
             compact_text += "\n\nAvailable bridge tools, compact view:\n" + "\n".join(manifest_lines)
-            compact_text += "\n\nNeed exact parameters? Call tool_schema_get with the tool name.\n"
-            compact_text += "Unsure which tool? Call tool_catalog_search with your query."
+            if (request_profile or {}).get("include_management_tools", True) and tool_manager.management_openai_tools():
+                compact_text += "\n\nNeed exact parameters? Call tool_schema_get with the tool name.\n"
+                compact_text += "Unsure which tool? Call tool_catalog_search with your query."
 
     merged = {**payload}
 
+    if not tools and not compact_text:
+        merged.pop("tools", None)
+        merged.pop("tool_choice", None)
+        return merged
+
     # Add compact instructions to system message
     messages = list(merged.get("messages") or [])
-    if messages and messages[0].get("role") == "system":
-        messages[0] = {
-            **messages[0],
-            "content": f"{messages[0].get('content') or ''}\n\n{compact_text}".strip(),
-        }
-    else:
-        messages.insert(0, {"role": "system", "content": compact_text})
+    if compact_text:
+        if messages and messages[0].get("role") == "system":
+            messages[0] = {
+                **messages[0],
+                "content": f"{messages[0].get('content') or ''}\n\n{compact_text}".strip(),
+            }
+        else:
+            messages.insert(0, {"role": "system", "content": compact_text})
 
     merged["messages"] = messages
-    merged["tools"] = tools
-    merged.setdefault("tool_choice", "auto")
+    if tools:
+        merged["tools"] = tools
+        merged.setdefault("tool_choice", "auto")
+    else:
+        merged.pop("tools", None)
+        merged.pop("tool_choice", None)
 
     # Log the decision
     _write_dev_log(
@@ -1553,6 +1601,96 @@ def _log_streaming_tool_policy(config: BridgeConfig, route: str, payload: dict[s
     )
 
 
+def _request_tool_profile(
+    config: BridgeConfig | None,
+    provider_config: ProviderConfig | None,
+    model: Any,
+    query: str,
+) -> dict[str, Any]:
+    profile = {
+        "minimal": False,
+        "max_tools": max(1, int(config.tools.max_exposed)) if config else 5,
+        "max_manifest_tools": max(0, int(config.tools.compact_manifest_max_tools)) if config else 5,
+        "include_management_tools": bool(config.tools.always_expose_management_tools) if config else True,
+        "disable_fallback": False,
+        "attach_system_instructions": True,
+    }
+    if provider_config is None or config is None:
+        return profile
+
+    model_name = str(model or "")
+    model_limits = (provider_config.model_limits or {}).get(model_name, {}) or {}
+    tokens_per_minute = _limit_int(model_limits.get("tokens_per_minute"))
+    low_token_budget = provider_config.type == "groq" or (
+        tokens_per_minute is not None and tokens_per_minute <= 12000
+    )
+
+    if low_token_budget:
+        profile.update(
+            {
+                "minimal": True,
+                "max_tools": min(profile["max_tools"], max(1, int(model_limits.get("max_tools", 1)))),
+                "max_manifest_tools": min(
+                    profile["max_manifest_tools"],
+                    max(0, int(model_limits.get("max_manifest_tools", 1))),
+                ),
+                "include_management_tools": bool(model_limits.get("include_management_tools", False)),
+                "disable_fallback": True,
+            }
+        )
+
+    if _is_lightweight_chat_query(query):
+        profile.update(
+            {
+                "include_management_tools": False,
+                "max_manifest_tools": 0,
+            }
+        )
+        if low_token_budget:
+            profile["attach_system_instructions"] = False
+
+    return profile
+
+
+def _limit_int(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_lightweight_chat_query(query: str) -> bool:
+    text = (query or "").strip().lower()
+    if not text:
+        return True
+    words = text.split()
+    if len(words) > 4:
+        return False
+    factual_markers = (
+        "weather",
+        "time",
+        "date",
+        "today",
+        "latest",
+        "news",
+        "search",
+        "find",
+        "lookup",
+        "price",
+        "source",
+        "verify",
+        "citation",
+        "wiki",
+        "wikipedia",
+        "fetch",
+        "image",
+        "research",
+    )
+    return not any(marker in text for marker in factual_markers)
+
+
 def _latest_user_text(messages: Any) -> str:
     if not isinstance(messages, list):
         return ""
@@ -1577,8 +1715,11 @@ def _with_tool_instructions(
     payload: dict[str, Any],
     config: BridgeConfig,
     selected_tools: list[dict[str, Any]],
+    request_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not selected_tools:
+        return payload
+    if request_profile and not request_profile.get("attach_system_instructions", True):
         return payload
     instructions = config.tools.tool_system_instructions or (
         "Tool-use rules:\n"
@@ -1589,6 +1730,11 @@ def _with_tool_instructions(
         "- Do not invent citations, URLs, prices, dates, or weather data.\n"
         "- If sources are returned, mention them accurately."
     )
+    if request_profile and request_profile.get("minimal"):
+        instructions = config.tools.tool_system_instructions or (
+            "Use a tool only when it is clearly needed for current facts or external data. "
+            "Otherwise answer directly."
+        )
     try:
         pi_model = resolve_pi_model(config)
     except Exception:
@@ -1673,7 +1819,10 @@ async def _chat_completion_with_bridge_tools(
     tool_manager = getattr(app.state, "tool_manager", None)
     bridge_tool_names = set(app.state.tools._tools)
     management_tool_names = (
-        set(tool_manager._management_tools.keys()) if tool_manager else set()
+        {
+            ((tool.get("function") or {}).get("name") or tool.get("name") or "")
+            for tool in (tool_manager.management_openai_tools() if tool_manager else [])
+        }
     )
 
     for _round in range(max_rounds):
@@ -3343,6 +3492,7 @@ async def _gemini_generate_content(
         app.state.tools,
         config,
         tool_manager=app.state.tool_manager,
+        provider_config=resolved.provider,
     )
     provider = _provider_for(app, resolved)
     if stream:
@@ -3925,3 +4075,622 @@ def _stream_error_event(message: str) -> str:
             },
         },
     )
+
+
+async def _run_embedded_telegram_bot(app: FastAPI) -> None:
+    config = app.state.bridge_config
+    telegram = config.telegram
+    model = telegram.model or config.providers[telegram.provider].default_model
+    if not model:
+        LOGGER.warning("Telegram bot skipped: no model configured for provider %s", telegram.provider)
+        return
+
+    telegram_poll_timeout_seconds = 30.0
+    telegram_timeout = httpx.Timeout(
+        connect=10.0,
+        read=telegram_poll_timeout_seconds + 15.0,
+        write=30.0,
+        pool=30.0,
+    )
+    bridge_timeout = httpx.Timeout(
+        connect=10.0,
+        read=max(10.0, float(telegram.response_timeout_seconds)),
+        write=30.0,
+        pool=30.0,
+    )
+    offset = 0
+    server_base_url = f"{_local_server_url(config.server.host, config.server.port)}/v1"
+    headers = {"x-api-key": config.server.auth_token} if config.server.auth_token else {}
+
+    LOGGER.info("Telegram bot worker started for provider=%s model=%s", telegram.provider, model)
+    try:
+        async with httpx.AsyncClient(timeout=telegram_timeout) as client:
+            await _telegram_set_my_commands(client, telegram.bot_token or "")
+            while True:
+                try:
+                    response = await client.get(
+                        f"https://api.telegram.org/bot{telegram.bot_token}/getUpdates",
+                        params={"timeout": int(telegram_poll_timeout_seconds), "offset": offset + 1},
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                except httpx.ReadTimeout:
+                    payload = {"result": []}
+                except httpx.HTTPError:
+                    LOGGER.exception("Telegram bot poll failed")
+                    await asyncio.sleep(max(1.0, float(telegram.poll_interval_seconds)))
+                    continue
+                for update in payload.get("result", []):
+                    offset = max(offset, int(update.get("update_id", 0)))
+                    await _handle_embedded_telegram_update(
+                        app,
+                        client,
+                        telegram,
+                        server_base_url,
+                        headers,
+                        model,
+                        bridge_timeout,
+                        update,
+                    )
+                await asyncio.sleep(max(0.5, float(telegram.poll_interval_seconds)))
+    except asyncio.CancelledError:
+        LOGGER.info("Telegram bot worker stopped")
+        raise
+    except Exception:
+        LOGGER.exception("Telegram bot worker crashed")
+
+
+async def _handle_embedded_telegram_update(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    telegram: Any,
+    server_base_url: str,
+    headers: dict[str, str],
+    model: str,
+    bridge_timeout: httpx.Timeout,
+    update: dict[str, Any],
+) -> None:
+    message = update.get("message") or update.get("edited_message") or {}
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+    chat_username = str(chat.get("username") or "").strip()
+    text = str(message.get("text") or "").strip()
+    if not chat_id or not text:
+        return
+    app.state.last_request_at = time.monotonic()
+
+    allowed_chat_matches = {chat_id}
+    if chat_username:
+        allowed_chat_matches.add(chat_username)
+        allowed_chat_matches.add(f"@{chat_username.lstrip('@')}")
+    if telegram.allowed_chat_ids and not any(
+        str(allowed).strip() in allowed_chat_matches for allowed in telegram.allowed_chat_ids
+    ):
+        await _telegram_send_message(client, telegram.bot_token or "", chat_id, "This chat is not allowed.")
+        return
+    _write_telegram_last_chat(app.state.bridge_config, chat_id, chat_username)
+
+    canned_response = _telegram_canned_response(text)
+    if canned_response is not None:
+        await _telegram_send_message(client, telegram.bot_token or "", chat_id, canned_response)
+        return
+
+    pending_command = _telegram_pending_command(app.state.bridge_config, chat_id)
+    command_text = text
+    if pending_command is not None and not text.startswith("/"):
+        command_text = f"/{pending_command} {text}"
+        _clear_telegram_pending_command(app.state.bridge_config, chat_id)
+
+    command_response, body, restart_requested = _telegram_command_response(
+        app,
+        telegram.system_prompt,
+        command_text,
+        model,
+        chat_id,
+    )
+    if command_response is not None:
+        await _telegram_send_message(client, telegram.bot_token or "", chat_id, command_response)
+        if restart_requested:
+            asyncio.create_task(_telegram_restart_server_process(app.state.bridge_config))
+        return
+
+    if body is None:
+        body = {
+            "model": model,
+            "messages": _telegram_messages(telegram.system_prompt, text[: telegram.max_input_chars]),
+            "max_tokens": telegram.max_output_tokens,
+            "stream": False,
+        }
+    progress_steps = _telegram_progress_steps(body.get("_telegram_mode"))
+    typing_task = asyncio.create_task(
+        _telegram_typing_loop(client, telegram.bot_token or "", chat_id)
+    )
+    try:
+        for step in progress_steps:
+            await _telegram_send_message(client, telegram.bot_token or "", chat_id, step)
+        response = await client.post(
+            f"{server_base_url}/chat/completions",
+            headers=headers,
+            json=body,
+            timeout=bridge_timeout,
+        )
+        response.raise_for_status()
+        content = _chat_completion_text(response.json()) or "I couldn't produce a reply."
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Telegram bridge request failed")
+        content = f"Bridge request failed: {exc}"
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
+
+    await _telegram_send_message(
+        client,
+        telegram.bot_token or "",
+        chat_id,
+        _telegram_polish_text(content)[:3500],
+    )
+
+
+def _telegram_messages(system_prompt: str, user_text: str) -> list[dict[str, str]]:
+    messages = [{"role": "user", "content": user_text}]
+    styled_system_prompt = _telegram_style_system_prompt(system_prompt)
+    if styled_system_prompt.strip():
+        messages.insert(0, {"role": "system", "content": styled_system_prompt})
+    return messages
+
+
+async def _telegram_send_message(
+    client: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: str,
+    text: str,
+) -> None:
+    response = await client.post(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+    )
+    response.raise_for_status()
+
+
+async def _telegram_send_chat_action(
+    client: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: str,
+    action: str = "typing",
+) -> None:
+    response = await client.post(
+        f"https://api.telegram.org/bot{bot_token}/sendChatAction",
+        json={"chat_id": chat_id, "action": action},
+    )
+    response.raise_for_status()
+
+
+async def _telegram_typing_loop(
+    client: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: str,
+    interval_seconds: float = 4.0,
+) -> None:
+    while True:
+        with contextlib.suppress(Exception):
+            await _telegram_send_chat_action(client, bot_token, chat_id, "typing")
+        await asyncio.sleep(interval_seconds)
+
+
+async def _telegram_set_my_commands(client: httpx.AsyncClient, bot_token: str) -> None:
+    if not bot_token:
+        return
+    response = await client.post(
+        f"https://api.telegram.org/bot{bot_token}/setMyCommands",
+        json={"commands": _telegram_command_definitions()},
+    )
+    response.raise_for_status()
+
+
+def _telegram_command_definitions() -> list[dict[str, str]]:
+    return [
+        {"command": "help", "description": "Show available commands"},
+        {"command": "status", "description": "Show bot and server status"},
+        {"command": "restart", "description": "Restart the llama server"},
+        {"command": "web", "description": "Web search a query"},
+        {"command": "search", "description": "Search the web"},
+        {"command": "deep", "description": "Run deeper research"},
+        {"command": "deepresearch", "description": "Run deeper research"},
+        {"command": "summarize", "description": "Summarize text or a topic"},
+        {"command": "explain", "description": "Explain a topic clearly"},
+        {"command": "clear", "description": "Reset context for the next message"},
+    ]
+
+
+def _telegram_canned_response(user_text: str) -> str | None:
+    normalized = re.sub(r"[^\w\s]", "", user_text.lower()).strip()
+    compact = " ".join(normalized.split())
+
+    if user_text.strip() == "/":
+        return _telegram_help_text()
+
+    greeting_messages = {
+        "hi",
+        "hii",
+        "hiii",
+        "hello",
+        "hey",
+        "yo",
+        "hola",
+        "namaste",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
+    thanks_messages = {
+        "thanks",
+        "thank you",
+        "thx",
+        "ty",
+    }
+    bye_messages = {
+        "bye",
+        "goodbye",
+        "see you",
+        "see ya",
+        "tc",
+        "take care",
+    }
+
+    if compact in greeting_messages:
+        return (
+            "Hello! I'm Zara.\n\n"
+            "I can help with research, summaries, explanations, coding questions, and quick fact checks. "
+            "Send me what you need, and I'll keep it clear and concise."
+        )
+    if compact in thanks_messages:
+        return "You're welcome. If you want, send the next question and I'll help with that too."
+    if compact in bye_messages:
+        return "Take care. I'm here whenever you need help again."
+    return None
+
+
+def _telegram_style_system_prompt(system_prompt: str) -> str:
+    style_rules = (
+        "For Telegram replies, sound like a modern assistant. "
+        "Write in clean plain text with natural phrasing. "
+        "Do not use Markdown markers like *, **, _, #, >, or backticks. "
+        "Avoid raw bullet syntax like '* item'. "
+        "Use short paragraphs, and only use the '•' bullet when it truly helps readability. "
+        "Keep greetings and simple replies warm, natural, and brief."
+    )
+    base = system_prompt.strip()
+    if not base:
+        return style_rules
+    return f"{base}\n\n{style_rules}"
+
+
+def _telegram_polish_text(text: str) -> str:
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"\*([^*\n]+)\*", r"\1", cleaned)
+    cleaned = re.sub(r"__([^_]+)__", r"\1", cleaned)
+    cleaned = re.sub(r"_([^_\n]+)_", r"\1", cleaned)
+    cleaned = re.sub(r"^\s*#+\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"^\s*[-*]\s+", "• ", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = cleaned.strip()
+    return cleaned or "I couldn't produce a reply."
+
+
+def _telegram_command_response(
+    app: FastAPI,
+    system_prompt: str,
+    text: str,
+    model: str,
+    chat_id: str,
+) -> tuple[str | None, dict[str, Any] | None, bool]:
+    parsed = _telegram_parse_command(text)
+    if parsed is None:
+        return None, None, False
+
+    command, argument = parsed
+    if command == "start":
+        return _telegram_start_text(), None, False
+    if command in {"help", "commands"}:
+        return _telegram_help_text(), None, False
+    if command == "status":
+        idle_for = max(0, int(time.monotonic() - app.state.last_request_at))
+        return (
+            "Llama server is running.\n\n"
+            f"Model: {model}\n"
+            f"Idle timer: active\n"
+            f"Last activity: {idle_for} seconds ago\n\n"
+            "Use /help to see available commands."
+        ), None, False
+    if command == "restart":
+        return "Restarting the llama server now. Give me a few seconds, then send your next message.", None, True
+    if command == "clear":
+        _clear_telegram_pending_command(app.state.bridge_config, chat_id)
+        return (
+            "Done. I cleared the pending command and reset the next request."
+        ), None, False
+    if command in {"web", "search"}:
+        if not argument:
+            _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
+            return (
+                "Web search mode is ready.\n\n"
+                "Send the query you want me to search for."
+            ), None, False
+        return None, _telegram_command_body(
+            system_prompt,
+            model,
+            argument,
+            (
+                "Use web or search tools when needed. "
+                "Return a crisp, well-structured answer in plain text for Telegram. "
+                "Prefer current information and mention sources naturally when relevant."
+            ),
+            telegram_mode="web",
+        ), False
+    if command in {"deep", "deepresearch", "research"}:
+        if not argument:
+            _set_telegram_pending_command(app.state.bridge_config, chat_id, "deepresearch")
+            return (
+                "Deep research mode is ready.\n\n"
+                "Send the topic, question, or problem you want me to research."
+            ), None, False
+        return None, _telegram_command_body(
+            system_prompt,
+            model,
+            argument,
+            (
+                "Do a deeper research-style answer. "
+                "Use tools when helpful, verify current facts, and organize the reply clearly with concise sections. "
+                "Keep the writing clean and plain-text for Telegram."
+            ),
+            max_tokens= min(1200, max(700, 2 * 512)),
+            telegram_mode="deepresearch",
+        ), False
+    if command == "summarize":
+        if not argument:
+            _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
+            return "Summarize mode is ready.\n\nSend the text or topic you want summarized.", None, False
+        return None, _telegram_command_body(
+            system_prompt,
+            model,
+            argument,
+            "Summarize this clearly in plain text for Telegram. Keep only the important points.",
+            telegram_mode="summarize",
+        ), False
+    if command == "explain":
+        if not argument:
+            _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
+            return "Explain mode is ready.\n\nSend the topic you want me to explain.", None, False
+        return None, _telegram_command_body(
+            system_prompt,
+            model,
+            argument,
+            "Explain this clearly like a modern assistant. Use simple wording and practical examples when helpful.",
+            telegram_mode="explain",
+        ), False
+
+    return (
+        "Unknown command.\n\nUse /help to see the available Telegram commands.",
+        None,
+        False,
+    )
+
+
+def _telegram_command_body(
+    system_prompt: str,
+    model: str,
+    user_text: str,
+    task_instruction: str,
+    max_tokens: int = 512,
+    telegram_mode: str | None = None,
+) -> dict[str, Any]:
+    command_prompt = (
+        f"{task_instruction}\n\n"
+        f"User request:\n{user_text.strip()}"
+    )
+    body = {
+        "model": model,
+        "messages": _telegram_messages(system_prompt, command_prompt),
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    if telegram_mode:
+        body["_telegram_mode"] = telegram_mode
+    return body
+
+
+def _telegram_parse_command(text: str) -> tuple[str, str] | None:
+    match = re.match(r"^\s*/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+(.*))?\s*$", text)
+    if not match:
+        return None
+    command = match.group(1).lower()
+    argument = (match.group(2) or "").strip()
+    return command, argument
+
+
+def _telegram_help_text() -> str:
+    return (
+        "Available commands\n\n"
+        "/help - Show this command list\n"
+        "/status - Show current bot/server status\n"
+        "/restart - Restart the llama server\n"
+        "/web <query> - Do a web-backed search style answer\n"
+        "/search <query> - Same as /web\n"
+        "/deep <topic> - Run a deeper research-style answer\n"
+        "/summarize <text> - Summarize text or a topic\n"
+        "/explain <topic> - Explain something clearly\n"
+        "/clear - Reset context for the next message\n\n"
+        "You can also just type normally without any command."
+    )
+
+
+def _telegram_start_text() -> str:
+    return (
+        "Hello! I'm Zara.\n\n"
+        "I can help with web search, deep research, summaries, explanations, coding questions, and quick fact checks.\n\n"
+        "Try one of these:\n"
+        "/web latest AI news\n"
+        "/deep compare OpenAI and Anthropic models\n"
+        "/summarize paste text here\n"
+        "/explain how RAG works\n\n"
+        "Use /help to see the full command list."
+    )
+
+
+def _telegram_state_path(config: BridgeConfig) -> Path:
+    return config.source_path.parent / "llama.telegram.json"
+
+
+def _read_telegram_state(config: BridgeConfig) -> dict[str, Any]:
+    state_path = _telegram_state_path(config)
+    if not state_path.exists():
+        return {}
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_telegram_state(config: BridgeConfig, payload: dict[str, Any]) -> None:
+    _telegram_state_path(config).write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_telegram_last_chat(config: BridgeConfig, chat_id: str, chat_username: str) -> None:
+    payload = _read_telegram_state(config)
+    chats = payload.setdefault("chats", {})
+    chat_entry = chats.setdefault(chat_id, {})
+    chat_entry["chat_id"] = chat_id
+    chat_entry["chat_username"] = chat_username
+    chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    payload["chat_id"] = chat_id
+    payload["chat_username"] = chat_username
+    payload["updated_at"] = chat_entry["updated_at"]
+    _write_telegram_state(config, payload)
+
+
+def _set_telegram_pending_command(config: BridgeConfig, chat_id: str, command: str) -> None:
+    payload = _read_telegram_state(config)
+    chats = payload.setdefault("chats", {})
+    chat_entry = chats.setdefault(chat_id, {"chat_id": chat_id})
+    chat_entry["pending_command"] = command
+    chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    _write_telegram_state(config, payload)
+
+
+def _clear_telegram_pending_command(config: BridgeConfig, chat_id: str) -> None:
+    payload = _read_telegram_state(config)
+    chats = payload.get("chats") or {}
+    chat_entry = chats.get(chat_id)
+    if not isinstance(chat_entry, dict):
+        return
+    chat_entry.pop("pending_command", None)
+    chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    _write_telegram_state(config, payload)
+
+
+def _telegram_pending_command(config: BridgeConfig, chat_id: str) -> str | None:
+    payload = _read_telegram_state(config)
+    chats = payload.get("chats") or {}
+    chat_entry = chats.get(chat_id)
+    if not isinstance(chat_entry, dict):
+        return None
+    command = str(chat_entry.get("pending_command") or "").strip().lower()
+    return command or None
+
+
+def _telegram_progress_steps(mode: Any) -> list[str]:
+    if mode == "deepresearch":
+        return [
+            "Step 1/4: Understanding your research goal",
+            "Step 2/4: Building the research plan",
+            "Step 3/4: Collecting and checking information",
+            "Step 4/4: Writing the final answer",
+        ]
+    if mode == "web":
+        return [
+            "Step 1/3: Understanding your search request",
+            "Step 2/3: Looking for current information",
+            "Step 3/3: Preparing the final answer",
+        ]
+    if mode in {"summarize", "explain"}:
+        return [
+            "Working on it now",
+        ]
+    return []
+
+
+async def _telegram_restart_server_process(config: BridgeConfig) -> None:
+    await asyncio.sleep(1.0)
+    LOGGER.warning("Restarting llama server process on Telegram command")
+    config_path = config.source_path
+    pid_path = config_path.parent / DEFAULT_PID_PATH.name
+    log_path = config_path.parent / DEFAULT_LOG_PATH.name
+    helper_code = (
+        "import subprocess, sys, time;"
+        "python_exe, config_path, pid_path, log_path, cwd = sys.argv[1:];"
+        "subprocess.run([python_exe, '-m', 'llama_bridge', 'stop', '--pid-file', pid_path], cwd=cwd, check=False);"
+        "deadline=time.time()+20.0;"
+        "while time.time()<deadline and __import__('pathlib').Path(pid_path).exists(): time.sleep(0.25);"
+        "time.sleep(1.0);"
+        "subprocess.run([python_exe, '-m', 'llama_bridge', 'start', '--config', config_path, '--pid-file', pid_path, '--log-file', log_path], cwd=cwd, check=False)"
+    )
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(config_path.parent),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW
+            | subprocess.DETACHED_PROCESS
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        )
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            helper_code,
+            sys.executable,
+            str(config_path),
+            str(pid_path),
+            str(log_path),
+            str(config_path.parent),
+        ],
+        **popen_kwargs,
+    )
+
+
+def _chat_completion_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    message = (choices[0] or {}).get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _local_server_url(host: str, port: int) -> str:
+    local_host = host
+    if host in {"0.0.0.0", "::"}:
+        local_host = "127.0.0.1"
+    return f"http://{local_host}:{port}"

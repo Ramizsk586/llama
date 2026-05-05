@@ -66,6 +66,15 @@ providers:
     api_key: ${OLLAMA_API_KEY}
     supports_tools: true
     default_model: qwen3.5:cloud
+    usage_limits:
+      hourly:
+        limit: 1000
+        used: 0
+        unit: requests
+      monthly:
+        limit: 50000
+        used: 0
+        unit: requests
 
   nvidia_nim:
     type: nvidia_nim
@@ -174,6 +183,24 @@ opencode:
   provider: ollama_cloud
   model: qwen3.5:cloud
   install_package: "opencode-ai"
+
+poolside:
+  provider: ollama_cloud
+  model: qwen3.5:cloud
+  config_path: ~/.config/poolside/settings.yaml
+  install_command: "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
+  windows_install_command: "irm https://downloads.poolside.ai/pool/install.ps1 | iex"
+
+telegram:
+  enabled: false
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  allowed_chat_ids: []
+  provider: ollama_cloud
+  model: qwen3.5:cloud
+  system_prompt: "You are a restricted Telegram bot powered by llama bridge. Answer helpfully, keep replies concise, use bridge tools only when clearly needed, and refuse unsafe or privileged actions."
+  max_input_chars: 4000
+  max_output_tokens: 512
+  poll_interval_seconds: 2.0
 
 tools:
   enabled: true
@@ -314,6 +341,8 @@ class ProviderConfig:
     timeout: float = 300.0
     supports_tools: bool = True
     extra_body: dict[str, Any] = field(default_factory=dict)
+    usage_limits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    model_limits: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -364,6 +393,33 @@ class OpenCodeConfig:
     output_tokens: int = 8192
     small_model: str | None = None
     write_project_config: bool = False
+
+
+@dataclass(slots=True)
+class PoolsideConfig:
+    provider: str = "ollama_cloud"
+    model: str | None = None
+    config_path: str = "~/.config/poolside/settings.yaml"
+    install_command: str = "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
+    windows_install_command: str = "irm https://downloads.poolside.ai/pool/install.ps1 | iex"
+
+
+@dataclass(slots=True)
+class TelegramBotConfig:
+    enabled: bool = False
+    bot_token: str | None = None
+    allowed_chat_ids: list[str] = field(default_factory=list)
+    provider: str = "ollama_cloud"
+    model: str | None = None
+    system_prompt: str = (
+        "You are a restricted Telegram bot powered by llama bridge. "
+        "Answer helpfully, keep replies concise, use bridge tools only when clearly needed, "
+        "and refuse unsafe or privileged actions."
+    )
+    max_input_chars: int = 4000
+    max_output_tokens: int = 512
+    poll_interval_seconds: float = 2.0
+    response_timeout_seconds: float = 180.0
 
 
 @dataclass(slots=True)
@@ -488,6 +544,8 @@ class BridgeConfig:
     codex: CodexConfig
     copilot_cli: CopilotCliConfig
     opencode: OpenCodeConfig
+    poolside: PoolsideConfig
+    telegram: TelegramBotConfig
     vs_copilot_models: list[VsCopilotModel]
     tools: ToolConfig
     master_review: MasterReviewConfig
@@ -805,6 +863,46 @@ def write_default_config(
     return path
 
 
+def merge_missing_config_fields(path: Path) -> tuple[Path, bool]:
+    import yaml
+
+    ensure_default_dirs(path.parent)
+    try:
+        template_text = _default_config_template_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        template_text = DEFAULT_CONFIG_TEMPLATE
+    template_raw = yaml.safe_load(template_text) or {}
+
+    if path.exists():
+        existing_raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        merged = _merge_missing_values(existing_raw, template_raw)
+        changed = merged != existing_raw
+        if changed:
+            path.write_text(
+                yaml.safe_dump(merged, sort_keys=False, allow_unicode=False),
+                encoding="utf-8",
+            )
+        return path, changed
+
+    path.write_text(
+        yaml.safe_dump(template_raw, sort_keys=False, allow_unicode=False),
+        encoding="utf-8",
+    )
+    return path, True
+
+
+def _merge_missing_values(existing: Any, template: Any) -> Any:
+    if isinstance(existing, dict) and isinstance(template, dict):
+        merged = dict(existing)
+        for key, template_value in template.items():
+            if key in merged:
+                merged[key] = _merge_missing_values(merged[key], template_value)
+            else:
+                merged[key] = template_value
+        return merged
+    return existing
+
+
 def load_config(path: Path | None = None) -> BridgeConfig:
     import yaml
 
@@ -844,6 +942,8 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             timeout=float(value.get("timeout", 300)),
             supports_tools=bool(value.get("supports_tools", True)),
             extra_body=value.get("extra_body", {}) or {},
+            usage_limits=value.get("usage_limits", {}) or {},
+            model_limits=value.get("model_limits", {}) or {},
         )
 
     aliases: dict[str, ModelAlias] = {}
@@ -935,6 +1035,52 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             f"Unknown provider referenced by opencode.provider: {opencode.provider}"
         )
 
+    poolside_raw = raw.get("poolside", {}) or {}
+    poolside = PoolsideConfig(
+        provider=poolside_raw.get("provider", codex.provider),
+        model=poolside_raw.get("model"),
+        config_path=poolside_raw.get("config_path", "~/.config/poolside/settings.yaml"),
+        install_command=poolside_raw.get(
+            "install_command",
+            "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh",
+        ),
+        windows_install_command=poolside_raw.get(
+            "windows_install_command",
+            "irm https://downloads.poolside.ai/pool/install.ps1 | iex",
+        ),
+    )
+    if poolside.provider not in providers:
+        raise ValueError(
+            f"Unknown provider referenced by poolside.provider: {poolside.provider}"
+        )
+
+    telegram_raw = raw.get("telegram", {}) or {}
+    telegram = TelegramBotConfig(
+        enabled=bool(telegram_raw.get("enabled", False)),
+        bot_token=telegram_raw.get("bot_token"),
+        allowed_chat_ids=[str(item) for item in (telegram_raw.get("allowed_chat_ids") or [])],
+        provider=str(telegram_raw.get("provider", codex.provider)),
+        model=telegram_raw.get("model"),
+        system_prompt=str(
+            telegram_raw.get(
+                "system_prompt",
+                "You are a restricted Telegram bot powered by llama bridge. "
+                "Answer helpfully, keep replies concise, use bridge tools only when clearly needed, "
+                "and refuse unsafe or privileged actions.",
+            )
+        ),
+        max_input_chars=max(200, int(telegram_raw.get("max_input_chars", 4000))),
+        max_output_tokens=max(64, int(telegram_raw.get("max_output_tokens", 512))),
+        poll_interval_seconds=max(0.5, float(telegram_raw.get("poll_interval_seconds", 2.0))),
+        response_timeout_seconds=max(
+            10.0, float(telegram_raw.get("response_timeout_seconds", 180.0))
+        ),
+    )
+    if telegram.provider not in providers:
+        raise ValueError(
+            f"Unknown provider referenced by telegram.provider: {telegram.provider}"
+        )
+
     vs_copilot_models = _load_vs_copilot_models(raw, providers, aliases, pi, codex)
     tools = _load_tool_config(raw)
     master_review = _load_master_review_config(raw)
@@ -947,6 +1093,8 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         codex=codex,
         copilot_cli=copilot_cli,
         opencode=opencode,
+        poolside=poolside,
+        telegram=telegram,
         vs_copilot_models=vs_copilot_models,
         tools=tools,
         master_review=master_review,
