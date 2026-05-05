@@ -108,12 +108,14 @@ llama api status
 llama api --limits
 llama logs
 llama cli --list
+llama cli --support
 llama configure
 llama pi
 llama claude
 llama codex
 llama copilot
 llama opencode
+llama openclaw
 llama poolside
 llama bot
 llama telegram status
@@ -186,9 +188,10 @@ values. `llama api limits` works too.
 `llama logs --no-follow` to print the current log and exit.
 
 `llama cli --list` shows which llama-managed CLI tools are currently usable and
-where they are installed. `llama cli --rm` lists the installed tools and lets
-you choose one to remove, or you can pass a name directly such as
-`llama cli --rm opencode`.
+where they are installed. `llama cli --support` shows all CLI tools supported by
+llama bridge, even when they are not installed. `llama cli --rm` lists the
+installed tools and lets you choose one to remove, or you can pass a name
+directly such as `llama cli --rm opencode`.
 
 `llama pi` configures and launches the Pi coding agent. If Pi is missing, llama
 installs Node.js/npm through the available OS package manager (`winget`, `brew`,
@@ -305,22 +308,64 @@ runtime OpenCode config through `OPENCODE_CONFIG_CONTENT`. The generated config
 uses OpenCode's current `provider` schema and registers the bridge as an
 OpenAI-compatible provider at `http://127.0.0.1:8089/v1`.
 
+`llama openclaw` launches OpenClaw through Ollama's integration while writing a
+separate managed OpenClaw config at `~/.openclaw/llama-openclaw.json`. That
+managed config enables OpenClaw sandboxing for all sessions, uses a dedicated
+workspace, disables host bind mounts, keeps Docker sandbox networking at `none`,
+forces exec into the sandbox, and keeps patch writes workspace-contained. By
+default the sandbox has `workspaceAccess: none`, so OpenClaw tools cannot write
+to your normal drives or project files unless you explicitly opt in:
+
+```yaml
+openclaw:
+  provider: ollama_cloud
+  model: qwen3.5:cloud
+  config_path: ~/.openclaw/llama-openclaw.json
+  workspace: ~/.openclaw/llama-workspace
+  workspace_access: none
+  sandbox_backend: docker
+  install_package: "openclaw"
+```
+
+Useful OpenClaw commands:
+
+```powershell
+llama openclaw
+llama openclaw --model qwen3.5:cloud
+llama openclaw status
+llama openclaw configure
+llama openclaw channels
+llama openclaw sandbox-explain
+llama openclaw stop
+```
+
 `llama poolside` installs and launches Poolside Agent CLI. By default it uses
-Poolside's official installers: `curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh`
-on macOS/Linux and `irm https://downloads.poolside.ai/pool/install.ps1 | iex`
-on Windows. It now follows the same provider/model pattern as the other llama
-CLI launchers, writes Poolside `settings.yaml`, sets `POOLSIDE_API_URL` to the
-local bridge, and wires in the bridge MCP tools. You can configure it in
+Poolside's official installer: `curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh`
+on macOS/Linux, and on Windows it tries that installer through Git Bash when Git
+is installed. If the shell installer is unavailable or rejects the Windows
+environment, it falls back to `irm https://downloads.poolside.ai/pool/install.ps1 | iex`. It now follows the same provider/model pattern as the other llama
+CLI launchers, writes Poolside `settings.yaml` when possible, passes configured
+Poolside auth through environment variables, and wires in the bridge MCP tools.
+You can configure it in
 `env.yml`:
 
 ```yaml
 poolside:
   provider: ollama_cloud
   model: qwen3.5:cloud
+  api_url: null  # Optional Poolside deployment URL; leave null for saved/default Poolside setup.
+  api_key: ${POOLSIDE_API_KEY}
+  token: ${POOLSIDE_TOKEN}
   config_path: ~/.config/poolside/settings.yaml
   install_command: "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
   windows_install_command: "irm https://downloads.poolside.ai/pool/install.ps1 | iex"
 ```
+
+When `poolside.api_key` or `poolside.token` is configured, `llama poolside`
+exports it as `POOLSIDE_API_KEY` or `POOLSIDE_TOKEN` so Poolside can authenticate
+without prompting. When `poolside.api_url` is configured, it also exports
+`POOLSIDE_STANDALONE_BASE_URL` in addition to `POOLSIDE_API_URL`.
+Leave these unset to use credentials saved by `pool setup` or `pool login`.
 
 Use `llama poolside --provider <name> --model <model>` to override the saved
 provider or model for one launch.

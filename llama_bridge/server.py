@@ -149,6 +149,19 @@ def create_app(
             "owned_by": resolved.provider.name,
         }
 
+    @app.get("/v1/v0/agents")
+    @app.get("/v0/agents")
+    async def poolside_list_agents(
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _check_auth(config, x_api_key, authorization)
+        agents = _poolside_agent_records(config)
+        return {
+            "agents": agents,
+            "data": agents,
+        }
+
     @app.post("/v1/chat/completions")
     async def create_chat_completion(
         request: Request,
@@ -2445,6 +2458,22 @@ def _available_model_ids(config: BridgeConfig) -> list[str]:
         | {model.model for model in config.vs_copilot_models if model.model}
     )
     return sorted(model_ids)
+
+
+def _poolside_agent_records(config: BridgeConfig) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for model_id in _available_model_ids(config):
+        records.append(
+            {
+                "id": model_id,
+                "name": model_id,
+                "display_name": model_id,
+                "description": f"llama bridge model {model_id}",
+                "model": model_id,
+                "model_ref": model_id,
+            }
+        )
+    return records
 
 
 def _ollama_model_ids(config: BridgeConfig) -> list[str]:

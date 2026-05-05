@@ -34,15 +34,24 @@ from .config import (
     codex_model_error,
     copilot_cli_model_error,
     openai_model_error,
+    openclaw_model_error,
     opencode_model_error,
     pi_model_error,
     resolve_codex_model,
     resolve_copilot_cli_model,
     resolve_openai_model,
+    resolve_openclaw_model,
     resolve_opencode_model,
     resolve_pi_model,
     write_claude_api_settings,
     write_default_config,
+)
+from .llama_claw import (
+    ensure_openclaw_safety_config,
+    find_ollama_executable,
+    find_openclaw_executable,
+    run_ollama_openclaw,
+    run_openclaw_command,
 )
 from .master import MasterReviewer
 from .mcp_tools import main as mcp_tools_main
@@ -594,6 +603,22 @@ def main() -> None:
                 project_config=args.project_config,
             )
             return
+        if args.command == "openclaw":
+            config_path = _arg_path(args.config)
+            _cmd_openclaw(
+                config_path,
+                openclaw_command=args.openclaw_command,
+                openclaw_args=args.openclaw_args,
+                provider_override=args.provider,
+                model_override=args.model,
+                config_path_override=args.openclaw_config,
+                workspace_override=args.workspace,
+                workspace_access=args.workspace_access,
+                sandbox_backend=args.sandbox_backend,
+                yes=not args.no_yes,
+                prepare_only=args.prepare_only,
+            )
+            return
         if args.command == "poolside":
             config_path = _arg_path(args.config)
             _cmd_poolside(
@@ -609,6 +634,7 @@ def main() -> None:
             _cmd_cli(
                 config_path,
                 list_only=args.list,
+                support_only=args.support,
                 remove_target=args.rm,
             )
             return
@@ -931,6 +957,50 @@ def _build_parser() -> argparse.ArgumentParser:
         help="extra arguments passed to opencode",
     )
 
+    openclaw_cmd = subparsers.add_parser(
+        "openclaw",
+        help="configure and launch OpenClaw through Ollama with llama safety defaults",
+    )
+    openclaw_cmd.add_argument(
+        "openclaw_command",
+        nargs="?",
+        choices=["launch", "configure", "channels", "stop", "status", "sandbox-explain"],
+        default="launch",
+        help="OpenClaw action to run (default: launch)",
+    )
+    openclaw_cmd.add_argument("--config")
+    openclaw_cmd.add_argument("--openclaw-config", help="managed OpenClaw config path")
+    openclaw_cmd.add_argument("--provider", help="provider name from env.yml to choose the OpenClaw model")
+    openclaw_cmd.add_argument("--model", help="Ollama model name to use for OpenClaw")
+    openclaw_cmd.add_argument("--workspace", help="dedicated OpenClaw workspace directory")
+    openclaw_cmd.add_argument(
+        "--workspace-access",
+        choices=["none", "ro", "rw"],
+        default=None,
+        help="sandbox access to the OpenClaw workspace (default: env.yml openclaw.workspace_access)",
+    )
+    openclaw_cmd.add_argument(
+        "--sandbox-backend",
+        choices=["docker", "ssh", "openshell"],
+        default=None,
+        help="OpenClaw sandbox backend (default: env.yml openclaw.sandbox_backend)",
+    )
+    openclaw_cmd.add_argument(
+        "--no-yes",
+        action="store_true",
+        help="do not pass --yes to ollama launch openclaw",
+    )
+    openclaw_cmd.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="write the managed OpenClaw safety config and exit",
+    )
+    openclaw_cmd.add_argument(
+        "openclaw_args",
+        nargs=argparse.REMAINDER,
+        help="extra arguments passed to Ollama/OpenClaw after --",
+    )
+
     poolside_cmd = subparsers.add_parser(
         "poolside",
         help="install and launch Poolside Agent CLI",
@@ -958,6 +1028,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--list",
         action="store_true",
         help="show which CLI tools are currently installed and usable",
+    )
+    cli_cmd.add_argument(
+        "--support",
+        action="store_true",
+        help="show which CLI tools are supported by llama bridge",
     )
     cli_cmd.add_argument(
         "--rm",
@@ -1091,7 +1166,7 @@ def _cmd_configure(config_path: Path) -> None:
         for alias_name in ("haiku", "sonnet", "opus", "small_fast"):
             aliases[alias_name] = {"provider": selected_provider, "model": model_value}
 
-    for section_name in ("pi", "codex", "copilot_cli", "opencode", "poolside", "telegram"):
+    for section_name in ("pi", "codex", "copilot_cli", "opencode", "openclaw", "poolside", "telegram"):
         section = raw.setdefault(section_name, {})
         if _prompt_yes_no(f"Use {selected_provider} for {section_name}?", default=False):
             section["provider"] = selected_provider
@@ -3479,6 +3554,102 @@ def _cmd_opencode(
     raise SystemExit(return_code)
 
 
+def _cmd_openclaw(
+    config_path: Path,
+    openclaw_command: str,
+    openclaw_args: list[str],
+    provider_override: str | None = None,
+    model_override: str | None = None,
+    config_path_override: str | None = None,
+    workspace_override: str | None = None,
+    workspace_access: str | None = None,
+    sandbox_backend: str | None = None,
+    yes: bool = True,
+    prepare_only: bool = False,
+) -> None:
+    _ensure_setup(config_path)
+    config = load_config(config_path)
+
+    provider_name = provider_override or config.openclaw.provider
+    if provider_name not in config.providers:
+        available = ", ".join(sorted(config.providers))
+        raise SystemExit(
+            f"Unknown OpenClaw provider '{provider_name}'. Available providers: {available}"
+        )
+
+    model = resolve_openclaw_model(
+        config,
+        provider_name=provider_name,
+        model_override=model_override,
+    )
+    if not model:
+        raise SystemExit(openclaw_model_error(config, provider_name))
+
+    safety = ensure_openclaw_safety_config(
+        config_path=config_path_override or config.openclaw.config_path,
+        workspace=workspace_override or config.openclaw.workspace,
+        workspace_access=workspace_access or config.openclaw.workspace_access,
+        sandbox_backend=sandbox_backend or config.openclaw.sandbox_backend,
+        model=model,
+    )
+
+    _title("llama openclaw")
+    _print_state("ok", "OpenClaw safety config is ready", "32")
+    _kv_rows(
+        [
+            ("provider", provider_name),
+            ("model", model),
+            ("config", str(safety.config_path)),
+            ("workspace", str(safety.workspace)),
+            ("sandbox", f"{safety.sandbox_backend}, mode=all, access={safety.workspace_access}"),
+            ("host binds", "disabled"),
+            ("network", "none"),
+        ]
+    )
+
+    if prepare_only:
+        _print_note("Prepared only. Run `llama openclaw` to launch.")
+        return
+
+    command = openclaw_command or "launch"
+    if command == "status":
+        _print_state("tool", f"ollama: {find_ollama_executable() or 'missing'}", "36")
+        _print_state("tool", f"openclaw: {find_openclaw_executable() or 'missing'}", "36")
+        _print_note("This command reports llama's managed OpenClaw config without contacting the gateway.")
+        return
+    if command == "launch":
+        raise SystemExit(
+            run_ollama_openclaw(
+                model=model,
+                safety=safety,
+                passthrough_args=openclaw_args,
+                yes=yes,
+            )
+        )
+    if command == "configure":
+        raise SystemExit(
+            run_ollama_openclaw(
+                model=model,
+                safety=safety,
+                passthrough_args=openclaw_args,
+                config_only=True,
+                yes=False,
+            )
+        )
+    if command == "channels":
+        raise SystemExit(
+            run_openclaw_command(
+                ["configure", "--section", "channels", *openclaw_args],
+                safety=safety,
+            )
+        )
+    if command == "stop":
+        raise SystemExit(run_openclaw_command(["gateway", "stop", *openclaw_args], safety=safety))
+    if command == "sandbox-explain":
+        raise SystemExit(run_openclaw_command(["sandbox", "explain", *openclaw_args], safety=safety))
+    raise SystemExit(f"Unknown OpenClaw command: {command}")
+
+
 def _cmd_poolside(
     config_path: Path,
     poolside_args: list[str],
@@ -3510,6 +3681,8 @@ def _cmd_poolside(
         windows_install_command=config.poolside.windows_install_command,
     )
     poolside_settings_path = _write_poolside_config(config)
+    poolside_api_url = _poolside_api_url(config)
+    poolside_api_key = _configured_poolside_api_key(config)
 
     _title("llama poolside")
     _print_state("ok", "Poolside environment is ready", "32")
@@ -3517,7 +3690,8 @@ def _cmd_poolside(
         [
             ("provider", provider_name),
             ("model", model),
-            ("api url", f"{_server_url(config.server.host, config.server.port)}/v1"),
+            ("api url", poolside_api_url or "poolside default"),
+            ("auth", "configured" if poolside_api_key else "stored login or interactive setup"),
             ("config", str(poolside_settings_path)),
             ("command", poolside_executable),
         ]
@@ -3533,8 +3707,13 @@ def _cmd_poolside(
     command.extend(passthrough_args)
 
     env = os.environ.copy()
-    env["POOLSIDE_API_URL"] = f"{_server_url(config.server.host, config.server.port)}/v1"
-    env["POOLSIDE_API_KEY"] = config.server.auth_token
+    if poolside_api_url:
+        env["POOLSIDE_API_URL"] = poolside_api_url
+        env["POOLSIDE_STANDALONE_BASE_URL"] = poolside_api_url
+    if config.poolside.api_key and not str(config.poolside.api_key).startswith("${"):
+        env["POOLSIDE_API_KEY"] = str(config.poolside.api_key)
+    if config.poolside.token and not str(config.poolside.token).startswith("${"):
+        env["POOLSIDE_TOKEN"] = str(config.poolside.token)
     env["LLAMA_BRIDGE_API_KEY"] = config.server.auth_token
 
     raise SystemExit(
@@ -3555,9 +3734,21 @@ def _write_poolside_config(config) -> Path:
     if not isinstance(existing, dict):
         existing = {}
 
-    pool_section = dict(existing.get("pool") or {})
-    pool_section["api_url"] = f"{_server_url(config.server.host, config.server.port)}/v1"
-    existing["pool"] = pool_section
+    poolside_api_url = _poolside_api_url(config)
+    if poolside_api_url:
+        pool_section = dict(existing.get("pool") or {})
+        pool_section["api_url"] = poolside_api_url
+        existing["pool"] = pool_section
+    else:
+        pool_section = dict(existing.get("pool") or {})
+        if _is_llama_bridge_poolside_url(config, pool_section.get("api_url")):
+            pool_section.pop("api_url", None)
+            if pool_section:
+                existing["pool"] = pool_section
+            else:
+                existing.pop("pool", None)
+        if _is_llama_bridge_poolside_url(config, existing.get("api_url")):
+            existing.pop("api_url", None)
 
     mcp_servers = dict(existing.get("mcp_servers") or {})
     command, args = _mcp_server_command()
@@ -3568,30 +3759,62 @@ def _write_poolside_config(config) -> Path:
     }
     existing["mcp_servers"] = mcp_servers
 
-    settings_path.write_text(
-        yaml.safe_dump(existing, sort_keys=False, allow_unicode=False),
-        encoding="utf-8",
-    )
+    try:
+        settings_path.write_text(
+            yaml.safe_dump(existing, sort_keys=False, allow_unicode=False),
+            encoding="utf-8",
+        )
+    except PermissionError:
+        _print_state(
+            "warn",
+            f"Could not update Poolside settings at {settings_path}; continuing with environment auth",
+            "33",
+        )
     return settings_path
+
+
+def _poolside_api_url(config) -> str | None:
+    api_url = str(config.poolside.api_url or "").strip()
+    if not api_url or api_url.startswith("${"):
+        return None
+    return api_url.rstrip("/")
+
+
+def _configured_poolside_api_key(config) -> str | None:
+    for value in (config.poolside.api_key, config.poolside.token):
+        key = str(value or "").strip()
+        if key and not key.startswith("${"):
+            return key
+    return None
+
+
+def _is_llama_bridge_poolside_url(config, value: Any) -> bool:
+    api_url = str(value or "").strip().rstrip("/")
+    if not api_url:
+        return False
+    bridge_base = f"{_server_url(config.server.host, config.server.port)}/v1".rstrip("/")
+    localhost_base = f"http://127.0.0.1:{config.server.port}/v1"
+    return api_url in {bridge_base, localhost_base, f"http://localhost:{config.server.port}/v1"}
 
 
 def _resolved_poolside_settings_path(config) -> Path:
     raw_path = str(config.poolside.config_path or "~/.config/poolside/settings.yaml")
-    if os.name == "nt" and raw_path == "~/.config/poolside/settings.yaml":
-        app_data = os.environ.get("APPDATA")
-        if app_data:
-            return Path(app_data) / "poolside" / "settings.yaml"
     return Path(os.path.expanduser(raw_path))
 
 
 def _cmd_cli(
     config_path: Path,
     list_only: bool = False,
+    support_only: bool = False,
     remove_target: str | None = None,
 ) -> None:
     _ensure_setup(config_path)
     config = load_config(config_path)
     targets = _cli_targets(config)
+
+    if support_only:
+        _print_supported_cli_targets(targets)
+        return
 
     if remove_target is not None:
         if remove_target == "__prompt__":
@@ -5369,18 +5592,45 @@ def _ensure_poolside(
 
     _print_state("install", "Poolside CLI was not found, installing it now", "36")
     if os.name == "nt":
-        process = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                windows_install_command,
-            ],
-            check=False,
-        )
-        install_hint = windows_install_command
+        git_bash = _find_git_bash()
+        if git_bash:
+            _print_state("install", f"Git Bash found, running Poolside installer with {git_bash}", "36")
+            process = subprocess.run(
+                [git_bash, "-lc", install_command],
+                check=False,
+            )
+            install_hint = install_command
+            if process.returncode != 0:
+                _print_state(
+                    "warn",
+                    "Poolside shell installer did not complete under Git Bash, falling back to PowerShell",
+                    "33",
+                )
+                process = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        windows_install_command,
+                    ],
+                    check=False,
+                )
+                install_hint = windows_install_command
+        else:
+            process = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    windows_install_command,
+                ],
+                check=False,
+            )
+            install_hint = windows_install_command
     else:
         process = subprocess.run(
             ["sh", "-c", install_command],
@@ -5444,6 +5694,15 @@ def _cli_targets(config) -> list[CliTarget]:
             uninstall_hint=f"npm uninstall -g {config.opencode.install_package}",
         ),
         CliTarget(
+            name="openclaw",
+            display_name="OpenClaw",
+            launcher_command="llama openclaw",
+            finder=find_openclaw_executable,
+            install_method="npm",
+            package=config.openclaw.install_package,
+            uninstall_hint=f"npm uninstall -g {config.openclaw.install_package}",
+        ),
+        CliTarget(
             name="poolside",
             display_name="Poolside",
             launcher_command="llama poolside",
@@ -5470,6 +5729,28 @@ def _print_cli_targets(targets: list[CliTarget], heading: str) -> None:
             ]
         )
 
+    widths = [
+        max(len(headers[index]), max((len(row[index]) for row in rows), default=0))
+        for index in range(len(headers))
+    ]
+    print("  " + "  ".join(headers[index].ljust(widths[index]) for index in range(len(headers))))
+    print("  " + "  ".join("-" * widths[index] for index in range(len(headers))))
+    for row in rows:
+        print("  " + "  ".join(row[index].ljust(widths[index]) for index in range(len(headers))))
+
+
+def _print_supported_cli_targets(targets: list[CliTarget]) -> None:
+    _title("llama cli --support")
+    headers = ["name", "launcher", "install", "package"]
+    rows = [
+        [
+            target.name,
+            target.launcher_command,
+            target.install_method,
+            target.package or "-",
+        ]
+        for target in targets
+    ]
     widths = [
         max(len(headers[index]), max((len(row[index]) for row in rows), default=0))
         for index in range(len(headers))

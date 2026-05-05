@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,20 +18,98 @@ import httpx
 try:
     from .config import BridgeConfig, TelegramBotConfig, load_config
     from .providers import OpenAICompatibleProvider, build_provider
-    from .tools import ToolRegistry, select_relevant_tools
+    from .tools import ToolRegistry, classify_query_intent, select_relevant_tools
 except ImportError:
     try:
         from llama_bridge.config import BridgeConfig, TelegramBotConfig, load_config
         from llama_bridge.providers import OpenAICompatibleProvider, build_provider
-        from llama_bridge.tools import ToolRegistry, select_relevant_tools
+        from llama_bridge.tools import ToolRegistry, classify_query_intent, select_relevant_tools
     except ImportError:
         from config import BridgeConfig, TelegramBotConfig, load_config
         from providers import OpenAICompatibleProvider, build_provider
-        from tools import ToolRegistry, select_relevant_tools
+        from tools import ToolRegistry, classify_query_intent, select_relevant_tools
 
 
 LOGGER = logging.getLogger("uvicorn.error.teligram")
 BOT_DOCS_DIRNAME = "bot_docs"
+
+LOG_MESSAGE_PREFIXES = (
+    ("Telegram ", ""),
+    ("Teligram ", ""),
+)
+
+LOG_MESSAGE_REPLACEMENTS = (
+    ("message received:", "recv"),
+    ("message sent:", "sent"),
+    ("photo sent:", "photo"),
+    ("poll sent:", "poll"),
+    ("provider request:", "provider ->"),
+    ("provider response:", "provider <-"),
+    ("provider call failed", "provider failed"),
+    ("upstream chat completion", "upstream"),
+    ("deterministic tool call:", "tool ->"),
+    ("tool call:", "tool ->"),
+    ("autonomous tool mode:", "auto-tools"),
+    ("route:", "route"),
+    ("bot doc edited:", "doc edited"),
+    ("message rejected:", "rejected"),
+    ("poll answer received", "poll answer"),
+    ("polling started:", "started"),
+    ("polling loop error", "poll loop failed"),
+    ("update handling failed", "update failed"),
+    ("sendMessage failed", "sendMessage failed"),
+    ("sendPhoto failed", "sendPhoto failed"),
+    ("sendPoll failed", "sendPoll failed"),
+)
+
+
+def _color_enabled() -> bool:
+    return sys.stderr.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _style(text: str, code: str) -> str:
+    if not _color_enabled():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _compact_log_message(message: str) -> str:
+    for prefix, replacement in LOG_MESSAGE_PREFIXES:
+        if message.startswith(prefix):
+            message = replacement + message[len(prefix) :]
+            break
+    for old, new in LOG_MESSAGE_REPLACEMENTS:
+        message = message.replace(old, new, 1)
+    message = re.sub(r"\s+", " ", message).strip()
+    return message
+
+
+class TeligramLogFormatter(logging.Formatter):
+    LEVEL_STYLES = {
+        logging.DEBUG: "2",
+        logging.INFO: "34",
+        logging.WARNING: "33",
+        logging.ERROR: "31",
+        logging.CRITICAL: "1;31",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        level_style = self.LEVEL_STYLES.get(record.levelno, "37")
+        label = _style(f"{record.levelname}:", level_style)
+        message = _compact_log_message(record.getMessage())
+        message = self._color_key_values(message)
+        output = f"{label} {message}"
+        if record.exc_info:
+            exception = self.formatException(record.exc_info)
+            if _color_enabled():
+                exception = _style(exception, "31")
+            output = f"{output}\n{exception}"
+        return output
+
+    def _color_key_values(self, message: str) -> str:
+        if not _color_enabled():
+            return message
+        return re.sub(r"\b([a-zA-Z_][a-zA-Z0-9_-]*)(=)", lambda match: f"{_style(match.group(1), '2')}=", message)
 
 WORKSPACE_DOC_ORDER = [
     "IDENTITY.md",
@@ -325,6 +404,8 @@ COMMANDS = [
     ("remember", "Add a memory note"),
     ("docs", "Show editable bot docs"),
     ("editdoc", "Edit MEMORY.md or USER.md"),
+    ("image", "Find and send an image"),
+    ("poll", "Create a Telegram poll"),
     ("web", "Web/search mode"),
     ("deep", "Deeper research mode"),
     ("summarize", "Summarize text"),
@@ -461,6 +542,12 @@ Follow the workspace documents in this priority:
 7. User request
 </operating_rules>"""
     )
+    parts.append(
+        """<format_enforcement>
+Before sending a final answer, obey explicit formatting rules from MEMORY.md and USER.md.
+If those documents say not to use a character or Markdown style, avoid it even when the model's default style would use it.
+</format_enforcement>"""
+    )
     return "\n\n".join(parts)
 
 
@@ -488,6 +575,32 @@ class Conversation:
         max_messages = max(2, self.max_turns * 2)
         if len(self.messages) > max_messages:
             self.messages = self.messages[-max_messages:]
+
+
+@dataclass(slots=True)
+class OutputRules:
+    avoid_asterisk: bool = False
+
+    @classmethod
+    def from_documents(cls, documents: dict[str, str]) -> "OutputRules":
+        combined = "\n".join(
+            documents.get(name, "")
+            for name in ("USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md")
+        ).lower()
+        avoid_asterisk = bool(
+            re.search(
+                r"(do\s*not|don't|dont|never|avoid|without|no)\s+(?:use\s+)?(?:the\s+)?(?:character\s+)?[\"'`]*\*[\"'`]*",
+                combined,
+            )
+            or re.search(r"[\"'`]*\*[\"'`]*\s+(?:in|inside)\s+(?:the\s+)?response", combined)
+        )
+        return cls(avoid_asterisk=avoid_asterisk)
+
+    def apply(self, text: str) -> str:
+        cleaned = text
+        if self.avoid_asterisk:
+            cleaned = remove_asterisk_markdown(cleaned)
+        return cleaned.strip() or "I couldn't produce a reply."
 
 
 class TeligramBot:
@@ -538,6 +651,8 @@ class TeligramBot:
         )
         self.conversations: dict[str, Conversation] = {}
         self.pending_commands: dict[str, str] = {}
+        self.sent_polls: dict[str, str] = {}
+        self.output_rules = OutputRules.from_documents(self.workspace_documents)
         self.allowed_chat_ids = {str(item).strip() for item in self.telegram.allowed_chat_ids if str(item).strip()}
 
     @property
@@ -554,6 +669,7 @@ class TeligramBot:
     def reload_workspace(self) -> None:
         ensure_required_workspace_files(self.workspace)
         self.workspace_documents = read_workspace_document_map(self.workspace)
+        self.output_rules = OutputRules.from_documents(self.workspace_documents)
         self.agent_name = self.agent_name or extract_identity_name(self.workspace_documents.get("IDENTITY.md")) or "Teligram"
         self.system_prompt = build_system_prompt(
             self.telegram.system_prompt,
@@ -599,7 +715,7 @@ class TeligramBot:
         return result if isinstance(result, dict) else {}
 
     async def send_message(self, chat_id: str, text: str) -> None:
-        chunks = split_telegram_message(polish_telegram_text(text))
+        chunks = split_telegram_message(self.prepare_output_text(text))
         for chunk in chunks:
             try:
                 response = await self.http.post(
@@ -615,6 +731,53 @@ class TeligramBot:
             except Exception:
                 LOGGER.exception("Telegram sendMessage failed for chat %s", chat_id)
                 return
+
+    def prepare_output_text(self, text: str) -> str:
+        return self.output_rules.apply(polish_telegram_text(text))
+
+    async def send_photo(self, chat_id: str, photo: str, caption: str | None = None) -> None:
+        payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo}
+        if caption:
+            payload["caption"] = self.prepare_output_text(caption)[:1024]
+        try:
+            response = await self.http.post(f"{self.api_base}/sendPhoto", json=payload)
+            response.raise_for_status()
+            LOGGER.info("Telegram photo sent: chat=%s caption_chars=%s", chat_id, len(payload.get("caption", "")))
+        except Exception:
+            LOGGER.exception("Telegram sendPhoto failed for chat %s", chat_id)
+            await self.send_message(chat_id, "I found an image, but Telegram could not send it.")
+
+    async def send_poll(
+        self,
+        chat_id: str,
+        question: str,
+        options: list[str],
+        *,
+        is_anonymous: bool = False,
+        allows_multiple_answers: bool = False,
+    ) -> None:
+        clean_options = [self.prepare_output_text(option)[:100] for option in options if option.strip()]
+        if len(clean_options) < 2:
+            await self.send_message(chat_id, "A poll needs at least two options.")
+            return
+        payload = {
+            "chat_id": chat_id,
+            "question": self.prepare_output_text(question)[:300],
+            "options": clean_options[:10],
+            "is_anonymous": is_anonymous,
+            "allows_multiple_answers": allows_multiple_answers,
+        }
+        try:
+            response = await self.http.post(f"{self.api_base}/sendPoll", json=payload)
+            response.raise_for_status()
+            result = (response.json().get("result") or {}).get("poll") or {}
+            poll_id = str(result.get("id") or "")
+            if poll_id:
+                self.sent_polls[poll_id] = chat_id
+            LOGGER.info("Telegram poll sent: chat=%s options=%s", chat_id, len(clean_options))
+        except Exception:
+            LOGGER.exception("Telegram sendPoll failed for chat %s", chat_id)
+            await self.send_message(chat_id, "I could not create that poll.")
 
     async def send_typing(self, chat_id: str) -> None:
         response = await self.http.post(
@@ -644,7 +807,7 @@ class TeligramBot:
     async def get_updates(self, offset: int | None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "timeout": 30,
-            "allowed_updates": ["message", "edited_message"],
+            "allowed_updates": ["message", "edited_message", "poll", "poll_answer"],
         }
         if offset is not None:
             payload["offset"] = offset
@@ -705,8 +868,23 @@ class TeligramBot:
             result = await self.try_edit_workspace_document(filename, instruction)
             await self.send_message(chat_id, result)
             return True
+        if command == "image":
+            if not argument:
+                self.pending_commands[chat_id] = "image"
+                await self.send_message(chat_id, "Send /image followed by what image you want.")
+                return True
+            await self.handle_image_request(chat_id, argument)
+            return True
+        if command == "poll":
+            if not argument:
+                self.pending_commands[chat_id] = "poll"
+                await self.send_message(chat_id, "Send /poll Question | option 1 | option 2")
+                return True
+            await self.handle_poll_request(chat_id, argument)
+            return True
         if command == "summarize":
             if not argument:
+                self.pending_commands[chat_id] = "summarize"
                 await self.send_message(chat_id, "Send /summarize followed by the text you want summarized.")
                 return True
             await self.run_command_prompt(
@@ -717,12 +895,14 @@ class TeligramBot:
             return True
         if command == "explain":
             if not argument:
+                self.pending_commands[chat_id] = "explain"
                 await self.send_message(chat_id, "Send /explain followed by the topic you want explained.")
                 return True
             await self.run_command_prompt(
                 chat_id,
                 argument,
                 "Explain the user's topic clearly and practically. Use plain language and a short example when useful.",
+                mode=self.autonomous_tool_mode(argument),
             )
             return True
         if command == "web":
@@ -753,6 +933,45 @@ class TeligramBot:
 
         await self.send_message(chat_id, "Unknown command. Send /help to see available commands.")
         return True
+
+    async def handle_image_request(self, chat_id: str, query: str) -> None:
+        image = await self.find_image_candidate(query)
+        if image is None:
+            await self.send_message(chat_id, "I could not find a sendable image for that.")
+            return
+        url = str(image.get("image_url") or image.get("thumbnail") or "").strip()
+        title = str(image.get("title") or query).strip()
+        source = str(image.get("source_url") or "").strip()
+        caption = title
+        if source:
+            caption = f"{title}\nSource: {source}"
+        await self.send_photo(chat_id, url, caption)
+
+    async def find_image_candidate(self, query: str) -> dict[str, Any] | None:
+        if not self.tools or "image_research" not in self.available_tool_names():
+            LOGGER.info("Telegram image request skipped: image_research unavailable")
+            return None
+        LOGGER.info("Telegram deterministic tool call: mode=image tool=image_research")
+        result = await self.tools.call_structured(
+            "image_research",
+            {"query": query, "max_results": 3},
+        )
+        if not result.get("ok"):
+            LOGGER.warning("Telegram image tool failed: %s", result.get("error"))
+            return None
+        images = ((result.get("data") or {}).get("images") or [])
+        for image in images:
+            if isinstance(image, dict) and (image.get("image_url") or image.get("thumbnail")):
+                return image
+        return None
+
+    async def handle_poll_request(self, chat_id: str, argument: str) -> None:
+        parsed = parse_poll_request(argument)
+        if parsed is None:
+            await self.send_message(chat_id, "Use /poll Question | option 1 | option 2")
+            return
+        question, options = parsed
+        await self.send_poll(chat_id, question, options)
 
     async def try_edit_workspace_document(self, filename: str, instruction: str) -> str:
         normalized = normalize_doc_filename(filename)
@@ -842,7 +1061,7 @@ class TeligramBot:
         mode: str | None = None,
     ) -> None:
         trimmed = user_text[: self.telegram.max_input_chars]
-        evidence = await self.collect_tool_evidence(mode, trimmed) if mode in {"web", "deep"} else None
+        evidence = await self.collect_tool_evidence(mode, trimmed) if mode in {"web", "deep", "weather", "time", "wiki"} else None
         evidence_block = f"\n\nTool evidence:\n{evidence}" if evidence else ""
         messages = [
             {"role": "system", "content": self.system_prompt},
@@ -970,9 +1189,23 @@ class TeligramBot:
 
         tool_name = self.preferred_research_tool(mode, names)
         if tool_name is None:
-            return "No web or research tool is currently configured."
+            return "No relevant bridge tool is currently configured."
 
-        if tool_name == "source_research":
+        if tool_name == "weather_current":
+            arguments: dict[str, Any] = {
+                "location": extract_weather_location(query) or query,
+                "temperature_unit": "celsius",
+                "wind_speed_unit": "kmh",
+            }
+        elif tool_name == "datetime_now":
+            arguments = {"country": getattr(self.config.tools, "country", None) or "India"}
+        elif tool_name == "wikipedia_search":
+            arguments = {
+                "query": query,
+                "limit": 5,
+                "language": "en",
+            }
+        elif tool_name == "source_research":
             arguments: dict[str, Any] = {
                 "query": query,
                 "max_results": 5,
@@ -997,7 +1230,7 @@ class TeligramBot:
                 "hl": "en",
             }
 
-        LOGGER.info("Telegram deterministic tool call: %s", tool_name)
+        LOGGER.info("Telegram deterministic tool call: mode=%s tool=%s", mode, tool_name)
         result = await self.tools.call_structured(tool_name, arguments)
         evidence = json.dumps(result, ensure_ascii=True, indent=2)
         if len(evidence) > 14_000:
@@ -1014,6 +1247,12 @@ class TeligramBot:
         }
 
     def preferred_research_tool(self, mode: str, names: set[str]) -> str | None:
+        if mode == "weather" and "weather_current" in names:
+            return "weather_current"
+        if mode == "time" and "datetime_now" in names:
+            return "datetime_now"
+        if mode == "wiki" and "wikipedia_search" in names:
+            return "wikipedia_search"
         if mode == "deep" and "source_research" in names:
             return "source_research"
         preferred = str(getattr(self.config.tools, "default_search_provider", "tavily")).lower()
@@ -1029,12 +1268,58 @@ class TeligramBot:
             return "source_research"
         return None
 
+    def autonomous_tool_mode(self, text: str) -> str | None:
+        if not self.tools_available():
+            return None
+        stripped = text.strip()
+        if not stripped or parse_command(stripped) is not None:
+            return None
+        if self.canned_response(stripped) is not None or parse_natural_doc_edit(stripped) is not None:
+            return None
+
+        lowered = stripped.lower()
+        no_tool_markers = (
+            "write a poem",
+            "write a story",
+            "rewrite",
+            "proofread",
+            "summarize this",
+            "translate",
+            "debug this",
+            "refactor",
+            "implement",
+        )
+        if any(marker in lowered for marker in no_tool_markers):
+            return None
+
+        try:
+            intents = classify_query_intent(stripped)
+        except Exception:
+            LOGGER.exception("Telegram autonomous intent classification failed")
+            intents = {}
+
+        if intents.get("weather", 0) > 0:
+            return "weather"
+        if intents.get("time", 0) > 0:
+            return "time"
+        if should_use_current_web(stripped):
+            return "deep" if should_use_deep_research(stripped) else "web"
+        if intents.get("verify", 0) > 0:
+            return "deep"
+        if intents.get("web_search", 0) > 0:
+            return "web"
+        if intents.get("encyclopedia", 0) > 0 and should_use_wikipedia(stripped):
+            return "wiki"
+        return None
+
     async def handle_update(self, update: dict[str, Any]) -> None:
+        poll_answer = update.get("poll_answer")
+        if isinstance(poll_answer, dict):
+            await self.handle_poll_answer_update(poll_answer)
+            return
+
         message = update.get("message") or update.get("edited_message") or {}
         if not isinstance(message, dict):
-            return
-        text = message.get("text")
-        if not isinstance(text, str) or not text.strip():
             return
         chat = message.get("chat") or {}
         if not isinstance(chat, dict) or chat.get("id") is None:
@@ -1047,6 +1332,13 @@ class TeligramBot:
             return
         self.write_last_chat(chat_id, username)
 
+        if not await self.handle_non_text_message(chat_id, message):
+            return
+
+        text = message.get("text") or message.get("caption")
+        if not isinstance(text, str) or not text.strip():
+            return
+
         text = text.strip()
         LOGGER.info(
             "Telegram message received: chat=%s username=%s text_chars=%s",
@@ -1057,6 +1349,16 @@ class TeligramBot:
         pending = self.pending_commands.pop(chat_id, None)
         if pending and not text.startswith("/"):
             text = f"/{pending} {text}"
+        natural_poll = parse_natural_poll_request(text)
+        if natural_poll is not None:
+            LOGGER.info("Telegram route: natural_poll_request")
+            await self.send_poll(chat_id, natural_poll[0], natural_poll[1])
+            return
+        natural_image_query = parse_natural_image_request(text)
+        if natural_image_query is not None:
+            LOGGER.info("Telegram route: natural_image_request")
+            await self.handle_image_request(chat_id, natural_image_query)
+            return
         if await self.handle_command(chat_id, text):
             LOGGER.info("Telegram route: command/canned command=%s", parse_command(text)[0] if parse_command(text) else "-")
             return
@@ -1080,13 +1382,114 @@ class TeligramBot:
         conversation.user(trimmed)
         typing_task = asyncio.create_task(self.typing_loop(chat_id))
         try:
-            reply = await self.call_model(conversation.export())
+            messages = conversation.export()
+            auto_mode = self.autonomous_tool_mode(trimmed)
+            if auto_mode:
+                LOGGER.info("Telegram autonomous tool mode: mode=%s", auto_mode)
+                evidence = await self.collect_tool_evidence(auto_mode, trimmed)
+                if evidence:
+                    messages = with_last_user_evidence(messages, auto_mode, evidence)
+            reply = await self.call_model(messages)
             conversation.assistant(reply)
         finally:
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await typing_task
         await self.send_message(chat_id, reply)
+
+    async def handle_non_text_message(self, chat_id: str, message: dict[str, Any]) -> bool:
+        if isinstance(message.get("poll"), dict):
+            await self.answer_incoming_poll(chat_id, message["poll"])
+            return False
+
+        caption = message.get("caption")
+        has_caption = isinstance(caption, str) and caption.strip()
+        if isinstance(message.get("photo"), list):
+            if has_caption:
+                return True
+            await self.send_message(
+                chat_id,
+                "I received the photo. I can respond to its caption or context, but image understanding is not enabled yet.",
+            )
+            return False
+
+        attachment_types = [
+            "document",
+            "video",
+            "animation",
+            "audio",
+            "voice",
+            "video_note",
+            "sticker",
+            "location",
+            "contact",
+        ]
+        for kind in attachment_types:
+            if kind in message:
+                if has_caption:
+                    return True
+                await self.send_message(chat_id, self.attachment_response(kind, message.get(kind)))
+                return False
+        return True
+
+    def attachment_response(self, kind: str, payload: Any) -> str:
+        if kind == "location" and isinstance(payload, dict):
+            return (
+                "I received the location.\n\n"
+                f"Latitude: {payload.get('latitude')}\n"
+                f"Longitude: {payload.get('longitude')}"
+            )
+        if kind == "contact":
+            return "I received the contact, but I do not store contact details."
+        if kind == "voice":
+            return "I received a voice message. Speech transcription is not enabled yet, so please send text too."
+        if kind == "audio":
+            return "I received audio. Audio transcription is not enabled yet, so please send text too."
+        if kind == "document":
+            name = payload.get("file_name") if isinstance(payload, dict) else None
+            suffix = f": {name}" if name else ""
+            return f"I received the document{suffix}. File reading is not enabled yet, so send the text you want me to use."
+        return f"I received a {kind}, but I cannot process that media type yet."
+
+    async def answer_incoming_poll(self, chat_id: str, poll: dict[str, Any]) -> None:
+        question = str(poll.get("question") or "").strip()
+        options = [
+            str(option.get("text") or "").strip()
+            for option in poll.get("options") or []
+            if isinstance(option, dict) and str(option.get("text") or "").strip()
+        ]
+        if not question or not options:
+            await self.send_message(chat_id, "I received the poll, but I could not read its question/options.")
+            return
+
+        quick = answer_simple_poll(question, options)
+        if quick:
+            await self.send_message(chat_id, f"I can't vote in Telegram polls, but my answer is: {quick}")
+            return
+
+        option_lines = "\n".join(f"- {option}" for option in options)
+        prompt = (
+            "Answer this Telegram poll. Pick the best option and briefly explain. "
+            "Do not claim you voted; bots cannot vote in user-created polls.\n\n"
+            f"Question: {question}\nOptions:\n{option_lines}"
+        )
+        reply = await self.call_model(
+            [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=min(self.telegram.max_output_tokens, 300),
+        )
+        await self.send_message(chat_id, f"I can't vote in Telegram polls, but here's my answer:\n\n{reply}")
+
+    async def handle_poll_answer_update(self, poll_answer: dict[str, Any]) -> None:
+        poll_id = str(poll_answer.get("poll_id") or "")
+        chat_id = self.sent_polls.get(poll_id)
+        if not chat_id:
+            LOGGER.info("Telegram poll answer received for untracked poll=%s", poll_id or "-")
+            return
+        option_ids = poll_answer.get("option_ids") or []
+        LOGGER.info("Telegram poll answer received: poll=%s options=%s", poll_id, option_ids)
 
     async def poll_forever(self) -> None:
         offset: int | None = None
@@ -1202,6 +1605,8 @@ class TeligramBot:
             "/memory - Show memory summary\n"
             "/remember <note> - Save a memory note or rule\n"
             "/docs - Show editable bot docs\n"
+            "/image <query> - Find and send an image\n"
+            "/poll Question | option 1 | option 2 - Create a poll\n"
             "/web <query> - Web/search mode\n"
             "/deep <topic> - Deeper research mode\n"
             "/summarize <text> - Summarize text\n"
@@ -1258,6 +1663,41 @@ def parse_doc_command_argument(argument: str) -> tuple[str | None, str]:
     return parts[0], parts[1].strip() if len(parts) > 1 else ""
 
 
+def parse_poll_request(argument: str) -> tuple[str, list[str]] | None:
+    pieces = [piece.strip() for piece in re.split(r"\s*\|\s*", argument) if piece.strip()]
+    if len(pieces) >= 3:
+        return pieces[0], pieces[1:]
+
+    match = re.match(r"(?is)^\s*(.+?)\s*(?:options?|choices?)\s*:\s*(.+)$", argument)
+    if not match:
+        return None
+    question = match.group(1).strip(" :-")
+    options = [item.strip(" .") for item in re.split(r"\s*,\s*", match.group(2)) if item.strip()]
+    if len(options) < 2:
+        return None
+    return question, options
+
+
+def parse_natural_poll_request(text: str) -> tuple[str, list[str]] | None:
+    match = re.match(r"(?is)^\s*(?:create|make|send)\s+(?:a\s+)?poll\s*[:,-]?\s*(.+)$", text)
+    if not match:
+        return None
+    return parse_poll_request(match.group(1).strip())
+
+
+def parse_natural_image_request(text: str) -> str | None:
+    patterns = [
+        r"(?is)^\s*(?:send|show|find|get)\s+(?:me\s+)?(?:an?\s+)?(?:image|photo|picture)\s+(?:of|for|about)?\s*(.+)$",
+        r"(?is)^\s*(?:image|photo|picture)\s+(?:of|for|about)\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text)
+        if match:
+            query = match.group(1).strip(" .")
+            return query or None
+    return None
+
+
 def parse_natural_doc_edit(text: str) -> tuple[str, str] | None:
     patterns = [
         r"(?is)^\s*in\s+([a-z_]+\.md)\s+add\s+(?:one\s+)?(?:new\s+)?(?:rule\s+)?(.+?)\s*$",
@@ -1269,6 +1709,46 @@ def parse_natural_doc_edit(text: str) -> tuple[str, str] | None:
         if match:
             return match.group(1), match.group(2).strip()
     return None
+
+
+def answer_simple_poll(question: str, options: list[str]) -> str | None:
+    arithmetic = solve_simple_arithmetic(question)
+    if arithmetic is not None:
+        for option in options:
+            if normalize_number_text(option) == normalize_number_text(str(arithmetic)):
+                return option
+        return str(arithmetic)
+    return None
+
+
+def solve_simple_arithmetic(text: str) -> int | float | None:
+    match = re.search(r"(-?\d+(?:\.\d+)?)\s*([+\-xX*/])\s*(-?\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    left = float(match.group(1))
+    op = match.group(2)
+    right = float(match.group(3))
+    if op == "+":
+        value = left + right
+    elif op == "-":
+        value = left - right
+    elif op in {"x", "X", "*"}:
+        value = left * right
+    elif op == "/":
+        if right == 0:
+            return None
+        value = left / right
+    else:
+        return None
+    return int(value) if value.is_integer() else value
+
+
+def normalize_number_text(value: str) -> str:
+    try:
+        number = float(value.strip())
+    except ValueError:
+        return value.strip().lower()
+    return str(int(number)) if number.is_integer() else str(number)
 
 
 def normalize_doc_filename(filename: str) -> str | None:
@@ -1359,6 +1839,84 @@ def looks_news_like(query: str) -> bool:
     return any(word in text for word in ("news", "latest", "today", "current", "election", "results"))
 
 
+def should_use_current_web(query: str) -> bool:
+    text = query.lower()
+    current_markers = (
+        "latest",
+        "current",
+        "recent",
+        "today",
+        "now",
+        "news",
+        "price",
+        "schedule",
+        "release",
+        "released",
+        "version",
+        "results",
+        "result",
+        "election",
+        "poll",
+        "polls",
+        "won",
+        "win",
+        "lose",
+        "lost",
+        "loose",
+        "seat",
+        "seats",
+        "chief minister",
+    )
+    if any(marker in text for marker in current_markers):
+        return True
+
+    current_year = datetime.now(UTC).year
+    years = [int(year) for year in re.findall(r"\b20\d{2}\b", text)]
+    return any(year >= current_year - 1 for year in years)
+
+
+def should_use_deep_research(query: str) -> bool:
+    text = query.lower()
+    explanation_markers = ("why", "how", "reason", "reasons", "analysis", "analyze", "explain")
+    high_change_markers = ("election", "results", "result", "poll", "won", "lose", "lost", "loose", "policy", "law")
+    return any(marker in text for marker in explanation_markers) and any(marker in text for marker in high_change_markers)
+
+
+def should_use_wikipedia(query: str) -> bool:
+    return not should_use_current_web(query)
+
+
+def extract_weather_location(query: str) -> str | None:
+    text = query.strip()
+    match = re.search(r"(?i)\b(?:weather|temperature|rain|wind|humidity)\s+(?:in|at|for)\s+(.+)$", text)
+    if match:
+        return match.group(1).strip(" ?.!")
+    match = re.search(r"(?i)\b(?:in|at|for)\s+([A-Za-z][A-Za-z\s,.-]+)$", text)
+    if match:
+        return match.group(1).strip(" ?.!")
+    return None
+
+
+def with_last_user_evidence(
+    messages: list[dict[str, str]],
+    mode: str,
+    evidence: str,
+) -> list[dict[str, str]]:
+    updated = [dict(message) for message in messages]
+    evidence_block = (
+        f"\n\nAutonomous tool mode: {mode}\n"
+        "Use the tool evidence below before answering. If the evidence is insufficient or conflicts with the user premise, "
+        "say so clearly. Do not rely on stale model memory for current facts.\n\n"
+        f"Tool evidence:\n{evidence}"
+    )
+    for index in range(len(updated) - 1, -1, -1):
+        if updated[index].get("role") == "user":
+            updated[index]["content"] = f"{updated[index].get('content') or ''}{evidence_block}"
+            return updated
+    updated.append({"role": "user", "content": evidence_block.strip()})
+    return updated
+
+
 def split_telegram_message(text: str) -> list[str]:
     if len(text) <= TELEGRAM_MESSAGE_LIMIT:
         return [text]
@@ -1386,6 +1944,17 @@ def polish_telegram_text(text: str) -> str:
     cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     return cleaned or "I couldn't produce a reply."
+
+
+def remove_asterisk_markdown(text: str) -> str:
+    cleaned = text
+    # Convert common Markdown bullets to hyphen bullets before removing emphasis markers.
+    cleaned = re.sub(r"(?m)^(\s*)\*+\s+", r"\1- ", cleaned)
+    cleaned = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"\*([^*\n]+)\*", r"\1", cleaned)
+    cleaned = cleaned.replace("*", "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned
 
 
 def help_text() -> str:
@@ -1418,15 +1987,31 @@ async def _run_bot(config_path: str | None, workspace: str | None) -> None:
 
 
 def run_teligram(config_path: str | None = None, workspace: str | None = None) -> None:
-    logging.basicConfig(
-        level=os.environ.get("TELIGRAM_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _configure_teligram_logging(os.environ.get("TELIGRAM_LOG_LEVEL", "INFO"))
     resolved_config_path = config_path or os.environ.get("LLAMA_CONFIG")
     try:
         asyncio.run(_run_bot(resolved_config_path, workspace))
     except KeyboardInterrupt:
         LOGGER.info("Teligram stopped")
+
+
+def _configure_teligram_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(TeligramLogFormatter())
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+    logging.getLogger("uvicorn.error").handlers.clear()
+    LOGGER.setLevel(level)
+    LOGGER.propagate = True
+
+    if level > logging.DEBUG:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

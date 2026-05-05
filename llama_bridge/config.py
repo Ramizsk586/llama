@@ -65,7 +65,7 @@ providers:
     base_url: https://ollama.com
     api_key: ${OLLAMA_API_KEY}
     supports_tools: true
-    default_model: qwen3.5:cloud
+    default_model: gemma4:31b
     usage_limits:
       hourly:
         limit: 1000
@@ -145,20 +145,20 @@ providers:
 anthropic_models:
   haiku:
     provider: ollama_cloud
-    model: qwen3.5:cloud
+    model: gemma4:31b
   sonnet:
     provider: ollama_cloud
-    model: qwen3.5:cloud
+    model: gemma4:31b
   opus:
     provider: ollama_cloud
-    model: qwen3.5:cloud
+    model: gemma4:31b
   small_fast:
     provider: ollama_cloud
-    model: qwen3.5:cloud
+    model: gemma4:31b
 
 pi:
   provider: ollama_cloud
-  model: qwen3.5:cloud
+  model: gemma4:31b
   api: openai-completions
   config_dir: ~/.pi/agent
   install_package: "@mariozechner/pi-coding-agent"
@@ -166,14 +166,14 @@ pi:
 
 codex:
   provider: ollama_cloud
-  model: qwen3.5:cloud
+  model: gemma4:31b
   config_path: ~/.codex/config.toml
   profile: llama_bridge
   install_package: "@openai/codex"
 
 copilot_cli:
   provider: ollama_cloud
-  model: qwen3.5:cloud
+  model: gemma4:31b
   wire_api: responses
   max_prompt_tokens: 65536
   max_output_tokens: 2048
@@ -181,12 +181,24 @@ copilot_cli:
 
 opencode:
   provider: ollama_cloud
-  model: qwen3.5:cloud
+  model: gemma4:31b
   install_package: "opencode-ai"
+
+openclaw:
+  provider: ollama_cloud
+  model: gemma4:31b
+  config_path: ~/.openclaw/llama-openclaw.json
+  workspace: ~/.openclaw/llama-workspace
+  workspace_access: none
+  sandbox_backend: docker
+  install_package: "openclaw"
 
 poolside:
   provider: ollama_cloud
-  model: qwen3.5:cloud
+  model: gemma4:31b
+  api_url: http://127.0.0.1:8089/v1
+  api_key: ${ change-me }
+  token: ${POOLSIDE_TOKEN}
   config_path: ~/.config/poolside/settings.yaml
   install_command: "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
   windows_install_command: "irm https://downloads.poolside.ai/pool/install.ps1 | iex"
@@ -196,7 +208,7 @@ telegram:
   bot_token: ${TELEGRAM_BOT_TOKEN}
   allowed_chat_ids: []
   provider: ollama_cloud
-  model: qwen3.5:cloud
+  model: gemma4:31b
   system_prompt: "You are a restricted Telegram bot powered by llama bridge. Answer helpfully, keep replies concise, use bridge tools only when clearly needed, and refuse unsafe or privileged actions."
   max_input_chars: 4000
   max_output_tokens: 512
@@ -299,9 +311,9 @@ master_review:
 
 vs_copilot:
   models:
-    - name: qwen3.5:cloud
+    - name: gemma4:31b
       provider: ollama_cloud
-      model: qwen3.5:cloud
+      model: gemma4:31b
       context_size: 65536
       modified_at: "2026-04-02T09:00:00-08:00"
       size: 1000000000
@@ -396,9 +408,23 @@ class OpenCodeConfig:
 
 
 @dataclass(slots=True)
+class OpenClawConfig:
+    provider: str = "ollama_cloud"
+    model: str | None = None
+    config_path: str = "~/.openclaw/llama-openclaw.json"
+    workspace: str = "~/.openclaw/llama-workspace"
+    workspace_access: str = "none"
+    sandbox_backend: str = "docker"
+    install_package: str = "openclaw"
+
+
+@dataclass(slots=True)
 class PoolsideConfig:
     provider: str = "ollama_cloud"
     model: str | None = None
+    api_url: str | None = None
+    api_key: str | None = None
+    token: str | None = None
     config_path: str = "~/.config/poolside/settings.yaml"
     install_command: str = "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
     windows_install_command: str = "irm https://downloads.poolside.ai/pool/install.ps1 | iex"
@@ -544,6 +570,7 @@ class BridgeConfig:
     codex: CodexConfig
     copilot_cli: CopilotCliConfig
     opencode: OpenCodeConfig
+    openclaw: OpenClawConfig
     poolside: PoolsideConfig
     telegram: TelegramBotConfig
     vs_copilot_models: list[VsCopilotModel]
@@ -699,6 +726,43 @@ def opencode_model_error(config: BridgeConfig, provider_name: str | None = None)
         f"Config: {config.source_path}. Provider: {selected_provider}. "
         "Set opencode.model, set that provider's default_model, configure a model "
         "alias for that provider, or pass `llama opencode --model ...`."
+    )
+
+
+def resolve_openclaw_model(
+    config: BridgeConfig,
+    provider_name: str | None = None,
+    model_override: str | None = None,
+) -> str | None:
+    selected_provider = provider_name or config.openclaw.provider
+    provider = config.providers[selected_provider]
+    if model_override:
+        return model_override
+    if config.openclaw.model:
+        return config.openclaw.model
+    if provider.default_model:
+        return provider.default_model
+
+    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    for alias_name in preferred_aliases:
+        alias = config.anthropic_models.get(alias_name)
+        if alias and alias.provider == selected_provider and alias.model:
+            return alias.model
+
+    for alias in config.anthropic_models.values():
+        if alias.provider == selected_provider and alias.model:
+            return alias.model
+
+    return None
+
+
+def openclaw_model_error(config: BridgeConfig, provider_name: str | None = None) -> str:
+    selected_provider = provider_name or config.openclaw.provider
+    return (
+        "OpenClaw model is not configured. "
+        f"Config: {config.source_path}. Provider: {selected_provider}. "
+        "Set openclaw.model, set that provider's default_model, configure a model "
+        "alias for that provider, or pass `llama openclaw --model ...`."
     )
 
 
@@ -1035,10 +1099,28 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             f"Unknown provider referenced by opencode.provider: {opencode.provider}"
         )
 
+    openclaw_raw = raw.get("openclaw", {}) or {}
+    openclaw = OpenClawConfig(
+        provider=openclaw_raw.get("provider", codex.provider),
+        model=openclaw_raw.get("model"),
+        config_path=openclaw_raw.get("config_path", "~/.openclaw/llama-openclaw.json"),
+        workspace=openclaw_raw.get("workspace", "~/.openclaw/llama-workspace"),
+        workspace_access=str(openclaw_raw.get("workspace_access", "none")),
+        sandbox_backend=str(openclaw_raw.get("sandbox_backend", "docker")),
+        install_package=openclaw_raw.get("install_package", "openclaw"),
+    )
+    if openclaw.provider not in providers:
+        raise ValueError(
+            f"Unknown provider referenced by openclaw.provider: {openclaw.provider}"
+        )
+
     poolside_raw = raw.get("poolside", {}) or {}
     poolside = PoolsideConfig(
         provider=poolside_raw.get("provider", codex.provider),
         model=poolside_raw.get("model"),
+        api_url=poolside_raw.get("api_url"),
+        api_key=poolside_raw.get("api_key"),
+        token=poolside_raw.get("token"),
         config_path=poolside_raw.get("config_path", "~/.config/poolside/settings.yaml"),
         install_command=poolside_raw.get(
             "install_command",
@@ -1093,6 +1175,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         codex=codex,
         copilot_cli=copilot_cli,
         opencode=opencode,
+        openclaw=openclaw,
         poolside=poolside,
         telegram=telegram,
         vs_copilot_models=vs_copilot_models,
