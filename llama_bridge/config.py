@@ -213,6 +213,10 @@ telegram:
   max_input_chars: 4000
   max_output_tokens: 512
   poll_interval_seconds: 2.0
+  autonomous_enabled: true
+  autonomous_interval_seconds: 1800
+  self_evolution_enabled: true
+  self_evolution_min_events: 3
 
 tools:
   enabled: true
@@ -448,6 +452,10 @@ class TelegramBotConfig:
     max_output_tokens: int = 512
     poll_interval_seconds: float = 2.0
     response_timeout_seconds: float = 180.0
+    autonomous_enabled: bool = True
+    autonomous_interval_seconds: float = 1800.0
+    self_evolution_enabled: bool = True
+    self_evolution_min_events: int = 3
 
 
 @dataclass(slots=True)
@@ -1159,6 +1167,12 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         response_timeout_seconds=max(
             10.0, float(telegram_raw.get("response_timeout_seconds", 180.0))
         ),
+        autonomous_enabled=bool(telegram_raw.get("autonomous_enabled", True)),
+        autonomous_interval_seconds=max(
+            60.0, float(telegram_raw.get("autonomous_interval_seconds", 1800.0))
+        ),
+        self_evolution_enabled=bool(telegram_raw.get("self_evolution_enabled", True)),
+        self_evolution_min_events=max(1, int(telegram_raw.get("self_evolution_min_events", 3))),
     )
     if telegram.provider not in providers:
         raise ValueError(

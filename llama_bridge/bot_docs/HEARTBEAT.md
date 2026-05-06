@@ -2,7 +2,10 @@
 
 ## Scheduled Behaviors
 
-No scheduled behaviors are enabled yet.
+- Every 30 minutes, read HEARTBEAT.md and MEMORY.md.
+- Run the self-evolution loop to curate memory and agent-created skills.
+- If a daily task is listed here, complete only safe Telegram/tool work autonomously and send a concise completion report.
+- If a task is unclear, unsafe, or requires credentials, ask the user for confirmation.
 
 ## Future Ideas
 

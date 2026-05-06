@@ -23,7 +23,7 @@ BUILD_MODULES = (
     "uvicorn",
     "yaml",
 )
-SPINNER_FRAMES = ("|", "/", "-", "\\")
+PROGRESS_FRAMES = ("   ", ".  ", ".. ", "...")
 
 
 def main() -> int:
@@ -92,8 +92,10 @@ def main() -> int:
 
 
 def _banner() -> None:
-    print("llama setup")
-    print("This will clone the repo, build llama.exe, install only the packaged runtime, and delete the temp codebase.")
+    print()
+    print("Llama Bridge Setup")
+    print("------------------")
+    print("Installing the packaged llama.exe runtime.")
     print()
 
 
@@ -257,6 +259,10 @@ def _missing_python_modules(python: str, modules: tuple[str, ...]) -> list[str]:
 
 def _build_llama_exe(build_python: str, source_dir: Path) -> None:
     add_data_args: list[str] = []
+    icon_args: list[str] = []
+    icon_path = source_dir / "assets" / "llama_bridge.ico"
+    if icon_path.exists():
+        icon_args = ["--icon", str(icon_path)]
     for filename in (
         "IDENTITY.md",
         "SOUL.md",
@@ -265,6 +271,7 @@ def _build_llama_exe(build_python: str, source_dir: Path) -> None:
         "TOOLS.md",
         "MEMORY.md",
         "HEARTBEAT.md",
+        "EVOLUTION.md",
     ):
         source_file = source_dir / "llama_bridge" / "bot_docs" / filename
         if source_file.exists():
@@ -279,6 +286,7 @@ def _build_llama_exe(build_python: str, source_dir: Path) -> None:
         "--onedir",
         "--name",
         APP_NAME,
+        *icon_args,
         "--collect-all",
         "fastapi",
         "--collect-all",
@@ -306,8 +314,9 @@ def _build_llama_exe(build_python: str, source_dir: Path) -> None:
 def _copy_tree(source: Path, target: Path) -> None:
     if target.exists():
         shutil.rmtree(target)
-    print(f"> Preparing runtime files: {target}")
+    _status_line("COPY", f"Preparing runtime files: {target}")
     shutil.copytree(source, target)
+    _status_line("OK", "Runtime files prepared")
 
 
 def _replace_install_dir(staging_dir: Path, install_dir: Path) -> None:
@@ -371,8 +380,8 @@ def _set_user_env(name: str, value: str) -> None:
 
 
 def _run(command: list[str], label: str, cwd: Path | None = None) -> None:
-    spinner = _Spinner(label)
-    spinner.start()
+    progress = _ProgressLine(label)
+    progress.start()
     try:
         process = subprocess.Popen(command, cwd=cwd)
         while True:
@@ -383,13 +392,13 @@ def _run(command: list[str], label: str, cwd: Path | None = None) -> None:
                 break
             time.sleep(0.1)
     except FileNotFoundError as exc:
-        spinner.fail("command not found")
+        progress.fail("command not found")
         raise RuntimeError(f"Command not found: {command[0]}") from exc
     except subprocess.CalledProcessError as exc:
-        spinner.fail(f"failed ({exc.returncode})")
+        progress.fail(f"failed ({exc.returncode})")
         raise RuntimeError(f"{label} failed with exit code {exc.returncode}") from exc
     else:
-        spinner.succeed()
+        progress.succeed()
 
 
 def _cleanup_stale_temp_dirs() -> None:
@@ -400,35 +409,48 @@ def _cleanup_stale_temp_dirs() -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-class _Spinner:
+def _status_line(status: str, label: str) -> None:
+    print(f"{status:<6} {label}")
+
+
+class _ProgressLine:
     def __init__(self, label: str) -> None:
         self.label = label
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._animate, daemon=True)
         self._index = 0
+        self._last_width = 0
 
     def start(self) -> None:
-        print(f"[ ] {self.label}", flush=True)
+        self._write("RUN   ", "")
         self._thread.start()
 
     def succeed(self) -> None:
-        self._finish("[ok]")
+        self._finish("OK    ")
 
     def fail(self, detail: str) -> None:
-        self._finish(f"[x] {detail}")
+        self._finish("FAIL  ", detail)
 
-    def _finish(self, suffix: str) -> None:
+    def _finish(self, status: str, detail: str = "") -> None:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=0.5)
-        print(f"\r{suffix} {self.label}{' ' * 20}")
+        self._write(status, detail)
+        print()
 
     def _animate(self) -> None:
         while not self._stop.is_set():
-            frame = SPINNER_FRAMES[self._index % len(SPINNER_FRAMES)]
+            frame = PROGRESS_FRAMES[self._index % len(PROGRESS_FRAMES)]
             self._index += 1
-            print(f"\r[{frame}] {self.label}", end="", flush=True)
-            time.sleep(0.12)
+            self._write("RUN   ", frame)
+            time.sleep(0.35)
+
+    def _write(self, status: str, detail: str) -> None:
+        suffix = f" {detail}" if detail else ""
+        line = f"\r{status} {self.label}{suffix}"
+        padding = " " * max(0, self._last_width - len(line))
+        self._last_width = len(line)
+        print(f"{line}{padding}", end="", flush=True)
 
 
 def _launched_by_double_click() -> bool:

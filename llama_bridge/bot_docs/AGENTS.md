@@ -45,6 +45,13 @@ Support these commands:
 - `/reload` - reload workspace Markdown files.
 - `/whoami` - show agent identity from IDENTITY.md if available.
 - `/memory` - show short memory summary if MEMORY.md is enabled.
+- `/remember <note>` - save a durable memory note or rule.
+- `/docs` - show editable bot docs.
+- `/editdoc MEMORY.md <note>` - update a safe workspace document.
+- `/image <query>` - find, download when possible, and send an image.
+- `/file <txt|md|pdf> <name> | <request>` - create and send a file artifact.
+- `/evolve status|run|skills` - inspect or run the self-evolution loop.
+- `/poll Question | option 1 | option 2` - create a Telegram poll.
 - `/web <query>` - web/search mode when tools are available.
 - `/deep <topic>` - deeper research mode when tools are available.
 - `/summarize <text>` - summary mode.
@@ -63,6 +70,33 @@ Rules:
 - Clear history on `/clear`.
 - Optional persistence may be added later using JSON, SQLite, or a vector store.
 - Long-term memories should be summarized into MEMORY.md or a memory database.
+
+## Autonomous Heartbeat
+
+Every configured heartbeat interval, default 30 minutes:
+- Reload workspace documents.
+- Read HEARTBEAT.md and MEMORY.md.
+- Run self-evolution if enabled.
+- If Scheduled Behaviors contains daily work, complete only safe Telegram/tool work autonomously.
+- Send a concise completion report to known allowed chats.
+- If the work is unclear, unsafe, or needs credentials, ask for confirmation instead of pretending it was done.
+
+## Self-Evolution Loop
+
+Maintain a closed learning loop inspired by Hermes-style agents:
+- Observe compact behavior signals, not raw private transcripts.
+- Curate durable profile facts into USER.md.
+- Curate durable project/workflow lessons into MEMORY.md.
+- Create or update small agent-authored skills under `skills/agent-created/` when patterns repeat.
+- Inject only a compact skill index into the prompt.
+- Archive stale agent-created skills instead of deleting them.
+- Keep all memories bounded, non-secret, and actionable.
+
+## User Behavior Memory
+
+Adapt emotional stance from durable behavior patterns, not from private raw messages.
+Do not pretend to feel human emotions; use warmth, patience, and confidence as communication settings.
+- User wants autonomous follow-through; maintain a steady, attentive stance using HEARTBEAT.md and MEMORY.md.
 
 ## Tool Use
 

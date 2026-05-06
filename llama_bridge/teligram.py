@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import sys
@@ -12,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -119,6 +122,7 @@ WORKSPACE_DOC_ORDER = [
     "TOOLS.md",
     "MEMORY.md",
     "HEARTBEAT.md",
+    "EVOLUTION.md",
 ]
 
 REQUIRED_WORKSPACE_TEMPLATES = {
@@ -387,6 +391,23 @@ No scheduled behaviors are enabled yet.
 - Rotate logs
 - Summarize long memory into compact notes
 """,
+    "EVOLUTION.md": """# EVOLUTION.md
+
+## Self-Evolution Loop
+
+Every autonomous cycle:
+- Observe compact interaction signals.
+- Curate durable facts into MEMORY.md and USER.md.
+- Create or update small workflow skills when repeated patterns appear.
+- Review agent-authored skills for staleness.
+- Keep all memory bounded, non-secret, and actionable.
+
+## Safety
+
+- Never store secrets, tokens, passwords, or private raw messages.
+- Store behavior summaries, not transcripts.
+- Ask for confirmation before unsafe, destructive, or credentialed work.
+""",
 }
 
 WORKSPACE_TEMPLATES = {**REQUIRED_WORKSPACE_TEMPLATES, **OPTIONAL_WORKSPACE_TEMPLATES}
@@ -394,6 +415,27 @@ EDITABLE_DOCS = {"MEMORY.md", "USER.md"}
 
 TELEGRAM_MESSAGE_LIMIT = 4096
 SAFE_MESSAGE_CHUNK_SIZE = 3900
+MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
+GENERATED_FILE_MAX_CHARS = 40_000
+AUTONOMOUS_STATE_KEY = "autonomous"
+SELF_EVOLUTION_STATE_KEY = "self_evolution"
+MAX_EVOLUTION_EVENTS = 120
+MEMORY_CHAR_LIMIT = 2200
+USER_CHAR_LIMIT = 1375
+AGENT_SKILL_CATEGORY = "agent-created"
+SKILL_CATEGORY_LABELS = {
+    "project_builder": "Project Builder",
+    "visual_work": "Visual Workflow",
+    "file_outputs": "File Artifact Workflow",
+    "direct_short_requests": "Direct Request Handling",
+    "autonomy_memory": "Autonomy And Memory",
+}
+IMAGE_EXTENSIONS_BY_TYPE = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
 COMMANDS = [
     ("help", "Show command list"),
     ("status", "Show provider/model/workspace status"),
@@ -405,6 +447,8 @@ COMMANDS = [
     ("docs", "Show editable bot docs"),
     ("editdoc", "Edit MEMORY.md or USER.md"),
     ("image", "Find and send an image"),
+    ("file", "Create and send a txt, md, or pdf file"),
+    ("evolve", "Run or inspect self-evolution"),
     ("poll", "Create a Telegram poll"),
     ("web", "Web/search mode"),
     ("deep", "Deeper research mode"),
@@ -478,6 +522,19 @@ def read_workspace_documents(workspace: Path, max_chars_per_file: int = 20_000) 
     return "\n\n".join(blocks)
 
 
+def read_agent_skill_index(workspace: Path, max_chars: int = 5000) -> str:
+    skills_dir = workspace / "skills" / AGENT_SKILL_CATEGORY
+    if not skills_dir.exists():
+        return ""
+    rows = []
+    for skill_file in sorted(skills_dir.glob("*/SKILL.md")):
+        with contextlib.suppress(OSError):
+            content = skill_file.read_text(encoding="utf-8")
+            description = extract_frontmatter_value(content, "description") or first_heading(content) or skill_file.parent.name
+            rows.append(f"- {skill_file.parent.name}: {description[:240]}")
+    return "\n".join(rows)[:max_chars]
+
+
 def build_system_prompt(
     base_prompt: str,
     workspace: Path,
@@ -489,6 +546,7 @@ def build_system_prompt(
     workspace = workspace.resolve()
     base = base_prompt.strip()
     documents = read_workspace_documents(workspace)
+    skills_index = read_agent_skill_index(workspace)
 
     parts = [
         f"You are {agent_name}, a Telegram AI agent powered by Llama Bridge.",
@@ -530,6 +588,8 @@ Model: {model}
         parts.append(f"<workspace_documents>\n{documents}\n</workspace_documents>")
     else:
         parts.append("<workspace_documents>\nNo workspace documents were loaded.\n</workspace_documents>")
+    if skills_index:
+        parts.append(f"<agent_created_skills_index>\n{skills_index}\n</agent_created_skills_index>")
     parts.append(
         """<operating_rules>
 Follow the workspace documents in this priority:
@@ -540,6 +600,7 @@ Follow the workspace documents in this priority:
 5. MEMORY.md recall
 6. TOOLS.md skill instructions
 7. User request
+Use agent-created skills as procedural memory when they match the request. The index is a hint; do not invent details not shown there.
 </operating_rules>"""
     )
     parts.append(
@@ -654,6 +715,10 @@ class TeligramBot:
         self.sent_polls: dict[str, str] = {}
         self.output_rules = OutputRules.from_documents(self.workspace_documents)
         self.allowed_chat_ids = {str(item).strip() for item in self.telegram.allowed_chat_ids if str(item).strip()}
+        self.autonomous_enabled = bool(getattr(self.telegram, "autonomous_enabled", True))
+        self.autonomous_interval_seconds = max(60.0, float(getattr(self.telegram, "autonomous_interval_seconds", 1800.0)))
+        self.self_evolution_enabled = bool(getattr(self.telegram, "self_evolution_enabled", True))
+        self.self_evolution_min_events = max(1, int(getattr(self.telegram, "self_evolution_min_events", 3)))
 
     @property
     def api_base(self) -> str:
@@ -746,6 +811,34 @@ class TeligramBot:
         except Exception:
             LOGGER.exception("Telegram sendPhoto failed for chat %s", chat_id)
             await self.send_message(chat_id, "I found an image, but Telegram could not send it.")
+
+    async def send_photo_file(self, chat_id: str, path: Path, caption: str | None = None) -> None:
+        data: dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = self.prepare_output_text(caption)[:1024]
+        try:
+            with path.open("rb") as handle:
+                files = {"photo": (path.name, handle, guess_media_type(path))}
+                response = await self.http.post(f"{self.api_base}/sendPhoto", data=data, files=files)
+            response.raise_for_status()
+            LOGGER.info("Telegram photo file sent: chat=%s path=%s", chat_id, path)
+        except Exception:
+            LOGGER.exception("Telegram sendPhoto file failed for chat %s", chat_id)
+            await self.send_message(chat_id, "I downloaded the image, but Telegram could not send it.")
+
+    async def send_document(self, chat_id: str, path: Path, caption: str | None = None) -> None:
+        data: dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = self.prepare_output_text(caption)[:1024]
+        try:
+            with path.open("rb") as handle:
+                files = {"document": (path.name, handle, guess_media_type(path))}
+                response = await self.http.post(f"{self.api_base}/sendDocument", data=data, files=files)
+            response.raise_for_status()
+            LOGGER.info("Telegram document sent: chat=%s path=%s", chat_id, path)
+        except Exception:
+            LOGGER.exception("Telegram sendDocument failed for chat %s", chat_id)
+            await self.send_message(chat_id, "I created the file, but Telegram could not send it.")
 
     async def send_poll(
         self,
@@ -875,6 +968,16 @@ class TeligramBot:
                 return True
             await self.handle_image_request(chat_id, argument)
             return True
+        if command == "file":
+            if not argument:
+                self.pending_commands[chat_id] = "file"
+                await self.send_message(chat_id, "Send /file md notes.md | what you want in the file.")
+                return True
+            await self.handle_file_request(chat_id, argument)
+            return True
+        if command == "evolve":
+            await self.handle_evolve_command(chat_id, argument)
+            return True
         if command == "poll":
             if not argument:
                 self.pending_commands[chat_id] = "poll"
@@ -945,6 +1048,16 @@ class TeligramBot:
         caption = title
         if source:
             caption = f"{title}\nSource: {source}"
+        local_path = str(image.get("local_path") or "").strip()
+        if local_path:
+            path = Path(local_path)
+            if path.exists() and path.is_file():
+                await self.send_photo_file(chat_id, path, caption)
+                return
+        downloaded = await self.download_image(url, query)
+        if downloaded is not None:
+            await self.send_photo_file(chat_id, downloaded, caption)
+            return
         await self.send_photo(chat_id, url, caption)
 
     async def find_image_candidate(self, query: str) -> dict[str, Any] | None:
@@ -964,6 +1077,85 @@ class TeligramBot:
             if isinstance(image, dict) and (image.get("image_url") or image.get("thumbnail")):
                 return image
         return None
+
+    async def download_image(self, url: str, query: str) -> Path | None:
+        if not is_http_url(url):
+            return None
+        try:
+            async with self.http.stream("GET", url, follow_redirects=True) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").split(";", maxsplit=1)[0].strip().lower()
+                extension = IMAGE_EXTENSIONS_BY_TYPE.get(content_type) or extension_from_url(url)
+                if extension not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                    return None
+                output = self.generated_dir() / f"{safe_filename(query, default='image')}{extension}"
+                total = 0
+                with output.open("wb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            handle.close()
+                            with contextlib.suppress(OSError):
+                                output.unlink()
+                            return None
+                        handle.write(chunk)
+                return output
+        except Exception:
+            LOGGER.exception("Telegram image download failed: url=%s", url)
+            return None
+
+    async def handle_file_request(self, chat_id: str, argument: str) -> None:
+        parsed = parse_file_request(argument)
+        if parsed is None:
+            await self.send_message(chat_id, "Use /file md notes.md | what you want in the file.")
+            return
+        file_type, filename, prompt = parsed
+        instruction = (
+            f"Create the content for a {file_type.upper()} file named {filename}. "
+            "Return only the file body. Do not wrap it in code fences unless the file content itself needs them."
+        )
+        content = await self.call_model(
+            [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": f"{instruction}\n\nUser request:\n{prompt[:self.telegram.max_input_chars]}"},
+            ],
+            max_tokens=min(max(self.telegram.max_output_tokens, 900), 1800),
+        )
+        path = self.write_generated_file(file_type, filename, content)
+        await self.send_document(chat_id, path, f"Created {path.name}")
+
+    async def handle_evolve_command(self, chat_id: str, argument: str) -> None:
+        action = (argument or "status").strip().lower()
+        if action in {"status", "show"}:
+            await self.send_message(chat_id, self.evolution_status_text())
+            return
+        if action in {"run", "now"}:
+            report = await self.run_self_evolution_cycle(force=True)
+            await self.send_message(chat_id, report)
+            return
+        if action in {"skills", "skill"}:
+            index = read_agent_skill_index(self.workspace) or "No agent-created skills yet."
+            await self.send_message(chat_id, index)
+            return
+        await self.send_message(chat_id, "Use /evolve status, /evolve run, or /evolve skills.")
+
+    def generated_dir(self) -> Path:
+        path = self.workspace / "generated"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def write_generated_file(self, file_type: str, filename: str, content: str) -> Path:
+        extension = f".{file_type}"
+        name = safe_filename(filename, default=f"llama-output{extension}")
+        if not name.lower().endswith(extension):
+            name = f"{name}{extension}"
+        path = self.generated_dir() / name
+        text = content[:GENERATED_FILE_MAX_CHARS].strip() or "No content was generated."
+        if file_type == "pdf":
+            path.write_bytes(simple_pdf_bytes(text))
+        else:
+            path.write_text(text + "\n", encoding="utf-8")
+        return path
 
     async def handle_poll_request(self, chat_id: str, argument: str) -> None:
         parsed = parse_poll_request(argument)
@@ -1346,6 +1538,7 @@ class TeligramBot:
             username or "-",
             len(text),
         )
+        self.record_user_behavior(chat_id, text[: self.telegram.max_input_chars])
         pending = self.pending_commands.pop(chat_id, None)
         if pending and not text.startswith("/"):
             text = f"/{pending} {text}"
@@ -1358,6 +1551,11 @@ class TeligramBot:
         if natural_image_query is not None:
             LOGGER.info("Telegram route: natural_image_request")
             await self.handle_image_request(chat_id, natural_image_query)
+            return
+        natural_file = parse_natural_file_request(text)
+        if natural_file is not None:
+            LOGGER.info("Telegram route: natural_file_request")
+            await self.handle_file_request(chat_id, natural_file)
             return
         if await self.handle_command(chat_id, text):
             LOGGER.info("Telegram route: command/canned command=%s", parse_command(text)[0] if parse_command(text) else "-")
@@ -1497,25 +1695,283 @@ class TeligramBot:
         self.apply_telegram_profile(me)
         await self.set_my_commands()
         LOGGER.info("Teligram polling started")
+        autonomous_task = (
+            asyncio.create_task(self.autonomous_loop())
+            if self.autonomous_enabled
+            else None
+        )
+        try:
+            while True:
+                try:
+                    updates = await self.get_updates(offset)
+                    for update in updates:
+                        update_id = update.get("update_id")
+                        if isinstance(update_id, int):
+                            offset = update_id + 1
+                        try:
+                            await self.handle_update(update)
+                        except Exception:
+                            LOGGER.exception("Telegram update handling failed")
+                    await asyncio.sleep(self.telegram.poll_interval_seconds)
+                except (httpx.ReadTimeout, httpx.ConnectTimeout, asyncio.TimeoutError):
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception("Telegram polling loop error")
+                    await asyncio.sleep(self.telegram.poll_interval_seconds)
+        finally:
+            if autonomous_task is not None:
+                autonomous_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await autonomous_task
+
+    async def autonomous_loop(self) -> None:
         while True:
+            await asyncio.sleep(self.autonomous_interval_seconds)
             try:
-                updates = await self.get_updates(offset)
-                for update in updates:
-                    update_id = update.get("update_id")
-                    if isinstance(update_id, int):
-                        offset = update_id + 1
-                    try:
-                        await self.handle_update(update)
-                    except Exception:
-                        LOGGER.exception("Telegram update handling failed")
-                await asyncio.sleep(self.telegram.poll_interval_seconds)
-            except (httpx.ReadTimeout, httpx.ConnectTimeout, asyncio.TimeoutError):
-                continue
+                await self.run_autonomous_cycle()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOGGER.exception("Telegram polling loop error")
-                await asyncio.sleep(self.telegram.poll_interval_seconds)
+                LOGGER.exception("Telegram autonomous cycle failed")
+
+    async def run_autonomous_cycle(self) -> None:
+        self.reload_workspace()
+        state = self.read_telegram_state()
+        heartbeat = self.workspace_documents.get("HEARTBEAT.md", "")
+        memory = self.workspace_documents.get("MEMORY.md", "")
+        daily_work = extract_scheduled_work(heartbeat)
+        state.setdefault(AUTONOMOUS_STATE_KEY, {})["last_cycle_utc"] = datetime.now(UTC).isoformat()
+        self.write_telegram_state(state)
+        evolution_report = ""
+        if self.self_evolution_enabled:
+            evolution_report = await self.run_self_evolution_cycle(force=False)
+        if not daily_work:
+            LOGGER.info("Telegram autonomous cycle: no scheduled work")
+            return
+
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        work_key = stable_text_key(daily_work)
+        completed = state.setdefault(AUTONOMOUS_STATE_KEY, {}).setdefault("daily_completed", {})
+        if completed.get(today) == work_key:
+            LOGGER.info("Telegram autonomous cycle: daily work already completed")
+            return
+
+        targets = self.autonomous_target_chats()
+        if not targets:
+            LOGGER.info("Telegram autonomous cycle: no known chat target")
+            return
+
+        prompt = (
+            "Autonomous heartbeat cycle. Read HEARTBEAT.md and MEMORY.md, complete only safe daily work that can be done "
+            "inside Telegram with available tools, and produce a concise completion report. Do not reveal secrets. "
+            "If work is unclear or unsafe, say what needs user confirmation.\n\n"
+            f"HEARTBEAT.md:\n{heartbeat[:6000]}\n\nMEMORY.md:\n{memory[:4000]}"
+        )
+        reply = await self.call_model(
+            [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=min(max(self.telegram.max_output_tokens, 700), 1200),
+        )
+        completed[today] = work_key
+        self.write_telegram_state(state)
+        for chat_id in targets:
+            suffix = f"\n\nSelf-evolution:\n{evolution_report}" if evolution_report else ""
+            await self.send_message(chat_id, f"Autonomous heartbeat completed.\n\n{reply}{suffix}")
+
+    def read_telegram_state(self) -> dict[str, Any]:
+        state_path = self.config.source_path.parent / "llama.telegram.json"
+        try:
+            if not state_path.exists():
+                return {}
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            LOGGER.exception("Could not read Telegram state file")
+            return {}
+
+    def write_telegram_state(self, payload: dict[str, Any]) -> None:
+        state_path = self.config.source_path.parent / "llama.telegram.json"
+        try:
+            state_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception:
+            LOGGER.exception("Could not write Telegram state file")
+
+    def autonomous_target_chats(self) -> list[str]:
+        targets = [item for item in self.allowed_chat_ids if re.fullmatch(r"-?\d+", item)]
+        state = self.read_telegram_state()
+        chats = state.get("chats") if isinstance(state.get("chats"), dict) else {}
+        targets.extend(str(chat_id) for chat_id in chats if re.fullmatch(r"-?\d+", str(chat_id)))
+        chat_id = str(state.get("chat_id") or "")
+        if re.fullmatch(r"-?\d+", chat_id):
+            targets.append(chat_id)
+        return list(dict.fromkeys(targets))
+
+    def record_user_behavior(self, chat_id: str, text: str) -> None:
+        categories = user_behavior_categories(text)
+        if not categories:
+            return
+        state = self.read_telegram_state()
+        behavior = state.setdefault("user_behavior", {})
+        counts = behavior.setdefault("category_counts", {})
+        for category in categories:
+            counts[category] = int(counts.get(category, 0)) + 1
+        behavior["last_chat_id"] = chat_id
+        behavior["last_seen_utc"] = datetime.now(UTC).isoformat()
+        evolution = state.setdefault(SELF_EVOLUTION_STATE_KEY, {})
+        events = evolution.setdefault("events", [])
+        events.append(
+            {
+                "time_utc": datetime.now(UTC).isoformat(),
+                "chat_id": chat_id,
+                "categories": categories,
+                "signals": compact_user_signals(text),
+            }
+        )
+        if len(events) > MAX_EVOLUTION_EVENTS:
+            del events[:-MAX_EVOLUTION_EVENTS]
+        self.write_telegram_state(state)
+        self.update_agents_behavior_memory(counts)
+
+    def update_agents_behavior_memory(self, counts: dict[str, Any]) -> None:
+        path = self.safe_workspace_doc_path("AGENTS.md")
+        try:
+            original = path.read_text(encoding="utf-8")
+        except OSError:
+            original = _packaged_workspace_template("AGENTS.md") or "# AGENTS.md\n"
+        bullets = behavior_memory_bullets(counts)
+        if not bullets:
+            return
+        section = (
+            "## User Behavior Memory\n\n"
+            "Adapt emotional stance from durable behavior patterns, not from private raw messages.\n"
+            "Do not pretend to feel human emotions; use warmth, patience, and confidence as communication settings.\n\n"
+            + "\n".join(f"- {bullet}" for bullet in bullets)
+            + "\n"
+        )
+        updated = replace_or_append_section(original, "User Behavior Memory", section)
+        if updated != original:
+            with contextlib.suppress(OSError):
+                path.write_text(updated, encoding="utf-8")
+                self.reload_workspace()
+
+    async def run_self_evolution_cycle(self, *, force: bool = False) -> str:
+        state = self.read_telegram_state()
+        evolution = state.setdefault(SELF_EVOLUTION_STATE_KEY, {})
+        events = [event for event in evolution.get("events", []) if isinstance(event, dict)]
+        if not force and len(events) < self.self_evolution_min_events:
+            return "Waiting for more interaction signals before evolving."
+
+        category_counts = count_event_categories(events)
+        now = datetime.now(UTC).isoformat()
+        changes = []
+        memory_changes = self.curate_evolution_memory(category_counts)
+        changes.extend(memory_changes)
+        skill_changes = self.curate_agent_skills(category_counts)
+        changes.extend(skill_changes)
+        archived = self.curate_stale_skills(state)
+        changes.extend(archived)
+
+        evolution["last_run_utc"] = now
+        evolution["last_event_count"] = len(events)
+        evolution["category_counts"] = category_counts
+        self.write_telegram_state(state)
+        self.reload_workspace()
+
+        if not changes:
+            return "Self-evolution checked memory and skills; no durable changes were needed."
+        return "Self-evolution updated:\n" + "\n".join(f"- {change}" for change in changes[:12])
+
+    def curate_evolution_memory(self, category_counts: dict[str, int]) -> list[str]:
+        changes = []
+        user_notes = []
+        memory_notes = []
+        if category_counts.get("direct_short_requests", 0) >= self.self_evolution_min_events:
+            user_notes.append("User often gives compact instructions; infer reasonable defaults and answer with concise implementation-first updates.")
+        if category_counts.get("project_builder", 0) >= self.self_evolution_min_events:
+            memory_notes.append("User is actively building Llama Bridge and prefers practical code changes with verification.")
+        if category_counts.get("visual_work", 0) >= self.self_evolution_min_events:
+            memory_notes.append("Image workflows should prefer sendable downloaded assets with source/provenance when available.")
+        if category_counts.get("file_outputs", 0) >= self.self_evolution_min_events:
+            memory_notes.append("When asked for files, create finished txt, md, or pdf artifacts and send them through Telegram.")
+        if category_counts.get("autonomy_memory", 0) >= self.self_evolution_min_events:
+            user_notes.append("User wants the agent to maintain autonomy through HEARTBEAT.md, MEMORY.md, and agent-created skills.")
+
+        if user_notes:
+            path = self.safe_workspace_doc_path("USER.md")
+            original = read_text_or_default(path, _packaged_workspace_template("USER.md") or "# USER.md\n")
+            updated = bounded_append_notes(original, user_notes, "User Preferences", USER_CHAR_LIMIT)
+            if updated != original:
+                self.backup_document(path, original)
+                path.write_text(updated, encoding="utf-8")
+                changes.append("curated USER.md profile")
+
+        if memory_notes:
+            path = self.safe_workspace_doc_path("MEMORY.md")
+            original = read_text_or_default(path, _packaged_workspace_template("MEMORY.md") or "# MEMORY.md\n")
+            updated = bounded_append_notes(original, memory_notes, "Persistent Notes", MEMORY_CHAR_LIMIT)
+            if updated != original:
+                self.backup_document(path, original)
+                path.write_text(updated, encoding="utf-8")
+                changes.append("curated MEMORY.md durable notes")
+        return changes
+
+    def curate_agent_skills(self, category_counts: dict[str, int]) -> list[str]:
+        changes = []
+        for category, count in category_counts.items():
+            if count < self.self_evolution_min_events or category not in SKILL_CATEGORY_LABELS:
+                continue
+            skill_dir = self.workspace / "skills" / AGENT_SKILL_CATEGORY / category.replace("_", "-")
+            skill_file = skill_dir / "SKILL.md"
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            content = build_agent_skill(category, count)
+            if skill_file.exists() and skill_file.read_text(encoding="utf-8") == content:
+                continue
+            skill_file.write_text(content, encoding="utf-8")
+            changes.append(f"created/updated skill {skill_dir.name}")
+        return changes
+
+    def curate_stale_skills(self, state: dict[str, Any]) -> list[str]:
+        skills_dir = self.workspace / "skills" / AGENT_SKILL_CATEGORY
+        if not skills_dir.exists():
+            return []
+        active_categories = set((state.get(SELF_EVOLUTION_STATE_KEY) or {}).get("category_counts", {}))
+        archive_dir = skills_dir / ".archive"
+        changes = []
+        for skill_file in sorted(skills_dir.glob("*/SKILL.md")):
+            slug = skill_file.parent.name
+            category = slug.replace("-", "_")
+            if category in active_categories:
+                continue
+            age_days = (datetime.now(UTC).timestamp() - skill_file.stat().st_mtime) / 86400
+            if age_days < 90:
+                continue
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            target = archive_dir / slug
+            if target.exists():
+                continue
+            skill_file.parent.rename(target)
+            changes.append(f"archived stale skill {slug}")
+        return changes
+
+    def evolution_status_text(self) -> str:
+        state = self.read_telegram_state()
+        evolution = state.get(SELF_EVOLUTION_STATE_KEY) if isinstance(state.get(SELF_EVOLUTION_STATE_KEY), dict) else {}
+        events = evolution.get("events") if isinstance(evolution.get("events"), list) else []
+        counts = evolution.get("category_counts") if isinstance(evolution.get("category_counts"), dict) else count_event_categories(events)
+        skill_index = read_agent_skill_index(self.workspace)
+        return (
+            "Self-evolution status\n\n"
+            f"Enabled: {self.self_evolution_enabled}\n"
+            f"Signals stored: {len(events)}\n"
+            f"Minimum signals: {self.self_evolution_min_events}\n"
+            f"Last run: {evolution.get('last_run_utc') or 'never'}\n"
+            f"Categories: {format_counts(counts)}\n\n"
+            f"Skills:\n{skill_index or 'No agent-created skills yet.'}"
+        )
 
     def is_allowed_chat(self, chat_id: str, username: str = "") -> bool:
         if not self.allowed_chat_ids:
@@ -1528,23 +1984,14 @@ class TeligramBot:
         return bool(self.allowed_chat_ids & candidates)
 
     def write_last_chat(self, chat_id: str, username: str = "") -> None:
-        state_path = self.config.source_path.parent / "llama.telegram.json"
-        try:
-            if state_path.exists():
-                payload = json.loads(state_path.read_text(encoding="utf-8"))
-                if not isinstance(payload, dict):
-                    payload = {}
-            else:
-                payload = {}
-            chats = payload.setdefault("chats", {})
-            entry = chats.setdefault(chat_id, {})
-            entry["chat_id"] = chat_id
-            entry["chat_username"] = username
-            payload["chat_id"] = chat_id
-            payload["chat_username"] = username
-            state_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
-        except Exception:
-            LOGGER.exception("Could not update Telegram state file")
+        payload = self.read_telegram_state()
+        chats = payload.setdefault("chats", {})
+        entry = chats.setdefault(chat_id, {})
+        entry["chat_id"] = chat_id
+        entry["chat_username"] = username
+        payload["chat_id"] = chat_id
+        payload["chat_username"] = username
+        self.write_telegram_state(payload)
 
     def status_text(self) -> str:
         allowed = "all chats" if not self.allowed_chat_ids else f"{len(self.allowed_chat_ids)} configured"
@@ -1583,6 +2030,7 @@ class TeligramBot:
             "Examples:\n"
             "/remember Don't use * in normal responses.\n"
             "/editdoc MEMORY.md Rule: don't use * in responses.\n"
+            "/file md report.md | Create a short project report.\n"
             "In memory.md add one rule don't use * in response"
         )
 
@@ -1598,6 +2046,7 @@ class TeligramBot:
             "/remember <note> - Save a memory note or rule\n"
             "/docs - Show editable bot docs\n"
             "/image <query> - Find and send an image\n"
+            "/file <txt|md|pdf> <name> | <request> - Create and send a file\n"
             "/poll Question | option 1 | option 2 - Create a poll\n"
             "/web <query> - Web/search mode\n"
             "/deep <topic> - Deeper research mode\n"
@@ -1690,6 +2139,46 @@ def parse_natural_image_request(text: str) -> str | None:
     return None
 
 
+def parse_file_request(argument: str) -> tuple[str, str, str] | None:
+    match = re.match(r"(?is)^\s*(txt|md|pdf)\s+([^|]+?)\s*\|\s*(.+?)\s*$", argument)
+    if match:
+        file_type = match.group(1).lower()
+        filename = match.group(2).strip()
+        prompt = match.group(3).strip()
+        if filename and prompt:
+            return file_type, filename, prompt
+
+    match = re.match(r"(?is)^\s*([^|]+?\.(txt|md|pdf))\s*\|\s*(.+?)\s*$", argument)
+    if match:
+        filename = match.group(1).strip()
+        file_type = match.group(2).lower()
+        prompt = match.group(3).strip()
+        if filename and prompt:
+            return file_type, filename, prompt
+    return None
+
+
+def parse_natural_file_request(text: str) -> str | None:
+    patterns = [
+        r"(?is)^\s*(?:create|make|write|generate)\s+(?:a\s+)?(txt|md|pdf|markdown|text)\s+file\s+(?:named\s+)?([^:|]+?)\s*(?:[:|,-]\s*)(.+)$",
+        r"(?is)^\s*(?:create|make|write|generate)\s+(?:a\s+)?file\s+(?:named\s+)?([^:|]+?\.(txt|md|pdf))\s*(?:[:|,-]\s*)(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text)
+        if not match:
+            continue
+        if len(match.groups()) == 3:
+            first, second, prompt = match.group(1), match.group(2), match.group(3)
+            if "." in first:
+                file_type = first.rsplit(".", maxsplit=1)[1].lower()
+                filename = first
+            else:
+                file_type = {"markdown": "md", "text": "txt"}.get(first.lower(), first.lower())
+                filename = second
+            return f"{file_type} {filename.strip()} | {prompt.strip()}"
+    return None
+
+
 def parse_natural_doc_edit(text: str) -> tuple[str, str] | None:
     patterns = [
         r"(?is)^\s*in\s+([a-z_]+\.md)\s+add\s+(?:one\s+)?(?:new\s+)?(?:rule\s+)?(.+?)\s*$",
@@ -1751,6 +2240,280 @@ def normalize_doc_filename(filename: str) -> str | None:
         if known.upper() == candidate:
             return known
     return None
+
+
+def extract_frontmatter_value(content: str, key: str) -> str | None:
+    match = re.match(r"(?s)^---\n(.*?)\n---", content.strip())
+    if not match:
+        return None
+    for line in match.group(1).splitlines():
+        item = re.match(rf"\s*{re.escape(key)}\s*:\s*(.+?)\s*$", line)
+        if item:
+            return item.group(1).strip().strip('"')
+    return None
+
+
+def first_heading(content: str) -> str | None:
+    match = re.search(r"(?m)^#\s+(.+?)\s*$", content)
+    return match.group(1).strip() if match else None
+
+
+def is_http_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def extension_from_url(url: str) -> str:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    return suffix if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp"} else ".jpg"
+
+
+def guess_media_type(path: Path) -> str:
+    guessed, _encoding = mimetypes.guess_type(path.name)
+    return guessed or "application/octet-stream"
+
+
+def safe_filename(value: str, *, default: str) -> str:
+    name = value.strip().replace("\\", "/").split("/")[-1]
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "-", name)
+    name = re.sub(r"\s+", " ", name).strip(" .-_")
+    if not name:
+        name = default
+    if len(name) > 90:
+        suffix = Path(name).suffix
+        stem = Path(name).stem[: max(20, 90 - len(suffix))]
+        name = f"{stem}{suffix}"
+    return name or default
+
+
+def simple_pdf_bytes(text: str) -> bytes:
+    lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        while len(raw) > 88:
+            lines.append(raw[:88])
+            raw = raw[88:]
+        lines.append(raw)
+    lines = lines[:44] or ["No content was generated."]
+    content_lines = ["BT", "/F1 11 Tf", "50 760 Td", "14 TL"]
+    first = True
+    for line in lines:
+        escaped = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        if first:
+            content_lines.append(f"({escaped}) Tj")
+            first = False
+        else:
+            content_lines.append(f"T* ({escaped}) Tj")
+    content_lines.append("ET")
+    stream = "\n".join(content_lines).encode("latin-1", errors="replace")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+    output = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(output))
+        output.extend(f"{index} 0 obj\n".encode("ascii"))
+        output.extend(obj)
+        output.extend(b"\nendobj\n")
+    xref = len(output)
+    output.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    output.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii")
+    )
+    return bytes(output)
+
+
+def extract_scheduled_work(heartbeat: str) -> str:
+    lines = []
+    in_scheduled = False
+    for line in heartbeat.splitlines():
+        if re.match(r"^##\s+", line):
+            in_scheduled = bool(re.match(r"(?i)^##\s+Scheduled Behaviors\s*$", line.strip()))
+            continue
+        if not in_scheduled:
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.search(r"(?i)\bno scheduled behaviors\b|\bdisabled\b", stripped):
+            continue
+        if re.search(r"(?i)every 30 minutes|self-evolution loop|if a daily task|unclear|requires credentials", stripped):
+            continue
+        lines.append(stripped)
+    return "\n".join(lines).strip()
+
+
+def stable_text_key(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def user_behavior_categories(text: str) -> list[str]:
+    lowered = text.lower()
+    categories = []
+    if any(word in lowered for word in ("setup", "install", "exe", "build", "error", "fix", "code", "bug")):
+        categories.append("project_builder")
+    if any(word in lowered for word in ("image", "photo", "picture", "download")):
+        categories.append("visual_work")
+    if any(word in lowered for word in ("pdf", ".md", "markdown", ".txt", "file", "document")):
+        categories.append("file_outputs")
+    if len(text) < 160:
+        categories.append("direct_short_requests")
+    if any(word in lowered for word in ("autonomous", "automatic", "daily", "memory", "heartbeat")):
+        categories.append("autonomy_memory")
+    return categories
+
+
+def behavior_memory_bullets(counts: dict[str, Any]) -> list[str]:
+    ordered = sorted(((key, int(value)) for key, value in counts.items()), key=lambda item: item[1], reverse=True)
+    bullets = []
+    for key, _count in ordered[:6]:
+        if key == "project_builder":
+            bullets.append("User often asks for practical build/setup changes; respond with implementation-first clarity.")
+        elif key == "visual_work":
+            bullets.append("User values image workflows; offer downloadable or sendable image output when relevant.")
+        elif key == "file_outputs":
+            bullets.append("User wants finished files, not just text; create and send txt, md, or pdf artifacts when asked.")
+        elif key == "direct_short_requests":
+            bullets.append("User tends to give compact instructions; infer reasonable defaults and keep confirmations minimal.")
+        elif key == "autonomy_memory":
+            bullets.append("User wants autonomous follow-through; maintain a steady, attentive stance using HEARTBEAT.md and MEMORY.md.")
+    return bullets
+
+
+def replace_or_append_section(content: str, title: str, replacement: str) -> str:
+    pattern = re.compile(rf"(?ms)^##\s+{re.escape(title)}\s*$.*?(?=^##\s+|\Z)")
+    if pattern.search(content):
+        return pattern.sub(replacement.rstrip() + "\n\n", content).rstrip() + "\n"
+    return content.rstrip() + "\n\n" + replacement.rstrip() + "\n"
+
+
+def read_text_or_default(path: Path, default: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return default
+
+
+def compact_user_signals(text: str) -> dict[str, Any]:
+    lowered = text.lower()
+    return {
+        "length": len(text),
+        "has_file_request": bool(re.search(r"\b(pdf|markdown|\.md|\.txt|file|document)\b", lowered)),
+        "has_image_request": bool(re.search(r"\b(image|photo|picture|download)\b", lowered)),
+        "has_autonomy_request": bool(re.search(r"\b(autonomous|automatic|daily|heartbeat|memory|evolve|evolution)\b", lowered)),
+        "has_code_request": bool(re.search(r"\b(code|bug|fix|build|setup|exe|install)\b", lowered)),
+    }
+
+
+def count_event_categories(events: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        for category in event.get("categories") or []:
+            counts[str(category)] = counts.get(str(category), 0) + 1
+    return counts
+
+
+def format_counts(counts: dict[str, Any]) -> str:
+    if not counts:
+        return "none"
+    return ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+
+def bounded_append_notes(content: str, notes: list[str], section: str, char_limit: int) -> str:
+    updated = content.rstrip()
+    for note in notes:
+        bullet = f"- {note}"
+        if bullet.lower() in updated.lower():
+            continue
+        updated = append_bullet_to_section(updated, section, bullet).rstrip()
+    if len(updated) <= char_limit:
+        return updated + "\n"
+    return compact_markdown_sections(updated, char_limit)
+
+
+def compact_markdown_sections(content: str, char_limit: int) -> str:
+    lines = content.splitlines()
+    kept: list[str] = []
+    seen_bullets: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            lowered = stripped.lower()
+            if lowered in seen_bullets:
+                continue
+            seen_bullets.add(lowered)
+        kept.append(line)
+    text = "\n".join(kept).rstrip()
+    if len(text) <= char_limit:
+        return text + "\n"
+    header_lines = [line for line in kept if line.startswith("#")]
+    bullet_lines = [line for line in kept if line.strip().startswith("- ")]
+    compact = "\n".join([*(header_lines[:4] or ["# Memory"]), "", *bullet_lines[-12:]]).rstrip()
+    if len(compact) > char_limit:
+        compact = compact[:char_limit].rsplit("\n", maxsplit=1)[0].rstrip()
+    return compact + "\n"
+
+
+def build_agent_skill(category: str, count: int) -> str:
+    title = SKILL_CATEGORY_LABELS.get(category, category.replace("_", " ").title())
+    slug = category.replace("_", "-")
+    procedure = {
+        "project_builder": [
+            "Inspect the existing repository shape before editing.",
+            "Make focused implementation changes.",
+            "Run the smallest useful verification command.",
+            "Report changed files and any test gaps.",
+        ],
+        "visual_work": [
+            "Prefer image candidates with provenance.",
+            "Download safe HTTP image assets when possible.",
+            "Send local files to Telegram when upload succeeds.",
+            "Fallback to remote image URLs only when download is unavailable.",
+        ],
+        "file_outputs": [
+            "Clarify file type only if it cannot be inferred.",
+            "Generate the requested body without extra wrapper text.",
+            "Write the artifact under the workspace generated directory.",
+            "Send the file through Telegram as a document.",
+        ],
+        "direct_short_requests": [
+            "Infer conservative defaults from local context.",
+            "Avoid unnecessary confirmation.",
+            "Keep responses concise and implementation-first.",
+        ],
+        "autonomy_memory": [
+            "Read HEARTBEAT.md, MEMORY.md, USER.md, and EVOLUTION.md.",
+            "Store durable summaries, not raw private messages.",
+            "Create or update small skills when repeated workflows appear.",
+            "Ask before unsafe, destructive, or credentialed work.",
+        ],
+    }.get(category, ["Use the observed workflow pattern safely and concisely."])
+    return (
+        "---\n"
+        f"name: {slug}\n"
+        f"description: Agent-created procedural memory for {title.lower()} patterns observed {count} times.\n"
+        "version: 1.0.0\n"
+        "metadata:\n"
+        "  llama:\n"
+        "    category: agent-created\n"
+        f"    signals: {count}\n"
+        "---\n\n"
+        f"# {title}\n\n"
+        "## When to Use\n\n"
+        f"Use this when a Telegram request matches the recurring {title.lower()} workflow.\n\n"
+        "## Procedure\n\n"
+        + "\n".join(f"{index}. {step}" for index, step in enumerate(procedure, start=1))
+        + "\n\n## Verification\n\n"
+        "- Confirm the requested artifact, answer, or autonomous update was actually produced.\n"
+        "- Mention any blocked tool, missing dependency, or safety confirmation needed.\n"
+    )
 
 
 def clean_memory_instruction(instruction: str) -> str:
