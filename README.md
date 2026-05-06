@@ -347,7 +347,9 @@ environment, it falls back to `irm https://downloads.poolside.ai/pool/install.ps
 It follows the same provider/model pattern as the other llama CLI launchers. When
 configured for the local llama bridge, it starts the bridge if needed, uses
 `server.auth_token` as the Poolside API key, writes Poolside `settings.yaml`,
-keeps the Poolside shell tool enabled, and wires in the bridge MCP tools.
+keeps the Poolside shell tool enabled, wires in the bridge MCP tools, installs a
+global Poolside skill named `llama-bridge-tools`, and routes Poolside through a
+small ACP proxy that advertises llama bridge slash commands in the `/` menu.
 You can configure it in
 `env.yml`:
 
@@ -372,6 +374,11 @@ For the local llama bridge URL, `llama poolside` exports `server.auth_token` as
 
 Use `llama poolside --provider <name> --model <model>` to override the saved
 provider or model for one launch.
+
+The managed Poolside ACP proxy advertises bridge shortcuts such as `/serp`,
+`/serpapi`, `/tavily`, `/web`, `/image`, `/image_search`, `/wiki`, `/wikipedia`,
+`/deep`, and `/deep_research` to the slash-command menu. The MCP adapter also
+advertises matching prompt aliases for compatible clients.
 
 Pass Copilot CLI arguments after `--`:
 

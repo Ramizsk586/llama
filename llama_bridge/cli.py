@@ -11,6 +11,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from dataclasses import dataclass, replace
@@ -59,6 +60,7 @@ from .tools import ToolRegistry, classify_query_intent, select_relevant_tools
 
 
 PYTHON_REQUIREMENTS = {
+    "claude_agent_sdk": "claude-agent-sdk>=0.1.74",
     "fastapi": "fastapi>=0.115.0",
     "httpx": "httpx>=0.27.0",
     "yaml": "pyyaml>=6.0.2",
@@ -631,6 +633,9 @@ def main() -> None:
                 install_poolside=not args.no_install_poolside,
             )
             return
+        if args.command == "poolside-acp-proxy":
+            _cmd_poolside_acp_proxy(args.poolside_acp_args)
+            return
         if args.command == "cli":
             config_path = _arg_path(args.config)
             _cmd_cli(
@@ -1019,6 +1024,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "poolside_args",
         nargs=argparse.REMAINDER,
         help="extra arguments passed to pool",
+    )
+
+    poolside_acp_proxy_cmd = subparsers.add_parser(
+        "poolside-acp-proxy",
+        help=argparse.SUPPRESS,
+    )
+    poolside_acp_proxy_cmd.add_argument(
+        "poolside_acp_args",
+        nargs=argparse.REMAINDER,
+        help=argparse.SUPPRESS,
     )
 
     cli_cmd = subparsers.add_parser(
@@ -3118,9 +3133,16 @@ server must be running for tool calls to succeed.
 
 
 def _mcp_server_command() -> tuple[str, list[str]]:
+    command, args = _llama_self_command()
     if getattr(sys, "frozen", False):
-        return sys.executable, ["mcp-tools"]
-    return sys.executable, ["-m", "llama_bridge.mcp_tools"]
+        return command, ["mcp-tools"]
+    return command, [*args[:-1], "llama_bridge.mcp_tools"]
+
+
+def _llama_self_command() -> tuple[str, list[str]]:
+    if getattr(sys, "frozen", False):
+        return sys.executable, []
+    return sys.executable, ["-m", "llama_bridge.cli"]
 
 
 def _write_claude_bridge_commands(commands_dir: Path) -> None:
@@ -3183,17 +3205,10 @@ def _claude_bridge_commands() -> dict[str, tuple[str, str, str]]:
     )
     return {
         "deep.md": deep,
-        "deep_research.md": deep,
-        "deep-research.md": deep,
         "serp.md": serp,
-        "serp_search.md": serp,
-        "serp-sarch.md": serp,
         "web.md": web,
-        "web_search.md": web,
         "fetch.md": fetch,
         "image.md": image,
-        "image_search.md": image,
-        "image-sarch.md": image,
     }
 
 
@@ -3727,7 +3742,9 @@ def _cmd_poolside(
         install_command=config.poolside.install_command,
         windows_install_command=config.poolside.windows_install_command,
     )
+    poolside_agent_config_path = _write_poolside_agent_config()
     poolside_settings_path = _write_poolside_config(config)
+    poolside_skill_path = _write_poolside_bridge_skill(config)
 
     _title("llama poolside")
     _print_state("ok", "Poolside environment is ready", "32")
@@ -3737,7 +3754,9 @@ def _cmd_poolside(
             ("model", model),
             ("api url", poolside_api_url or standalone_base_url or "poolside default"),
             ("auth", "configured" if poolside_api_key else "stored login or interactive setup"),
+            ("agent config", str(poolside_agent_config_path)),
             ("config", str(poolside_settings_path)),
+            ("skill", str(poolside_skill_path)),
             ("command", poolside_executable),
         ]
     )
@@ -3773,6 +3792,302 @@ def _cmd_poolside(
     if idle_after_file is not None:
         idle_after_file.write_text("closed\n", encoding="utf-8")
     raise SystemExit(return_code)
+
+
+def _cmd_poolside_acp_proxy(poolside_acp_args: list[str]) -> None:
+    _configure_proxy_stdio()
+    poolside_executable = _find_poolside_executable()
+    if not poolside_executable:
+        raise SystemExit("Poolside CLI was not found. Install Poolside and try again.")
+    passthrough_args = poolside_acp_args
+    if passthrough_args and passthrough_args[0] == "--":
+        passthrough_args = passthrough_args[1:]
+    command = [poolside_executable, "acp", *passthrough_args]
+    env = _poolside_acp_proxy_env()
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+        raise SystemExit("Could not start Poolside ACP proxy.")
+
+    pending_session_requests: set[Any] = set()
+    pending_lock = threading.Lock()
+
+    def forward_stderr() -> None:
+        for line in proc.stderr or []:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+    def forward_client_to_agent() -> None:
+        try:
+            for line in sys.stdin:
+                message = _json_line(line)
+                if isinstance(message, dict) and message.get("method") in {"session/new", "session/load"}:
+                    message_id = message.get("id")
+                    if message_id is not None:
+                        with pending_lock:
+                            pending_session_requests.add(message_id)
+                if isinstance(message, dict):
+                    message = _with_poolside_deep_research_prompt(message)
+                    line = json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n"
+                proc.stdin.write(line)
+                proc.stdin.flush()
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    def forward_agent_to_client() -> None:
+        for line in proc.stdout or []:
+            message = _json_line(line)
+            if isinstance(message, dict):
+                message = _with_poolside_bridge_commands(message)
+                line = json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n"
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if not isinstance(message, dict):
+                continue
+            message_id = message.get("id")
+            with pending_lock:
+                is_session_response = message_id in pending_session_requests
+                if is_session_response:
+                    pending_session_requests.discard(message_id)
+            if not is_session_response:
+                continue
+            result = message.get("result")
+            session_id = result.get("sessionId") if isinstance(result, dict) else None
+            if isinstance(session_id, str) and session_id:
+                update = _poolside_available_commands_update(session_id)
+                sys.stdout.write(json.dumps(update, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+
+    stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
+    stdin_thread = threading.Thread(target=forward_client_to_agent, daemon=True)
+    stderr_thread.start()
+    stdin_thread.start()
+    try:
+        forward_agent_to_client()
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    raise SystemExit(proc.wait())
+
+
+def _configure_proxy_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _poolside_acp_proxy_env() -> dict[str, str]:
+    env = os.environ.copy()
+    try:
+        config_path = DEFAULT_CONFIG_PATH
+        if config_path.exists():
+            config = load_config(config_path)
+            poolside_api_url = _poolside_api_url(config)
+            standalone_base_url = _poolside_standalone_base_url(config, poolside_api_url)
+            poolside_api_key = _poolside_auth_token(config, poolside_api_url)
+            if poolside_api_url and "POOLSIDE_API_URL" not in env:
+                env["POOLSIDE_API_URL"] = poolside_api_url
+            if poolside_api_key and "POOLSIDE_API_KEY" not in env:
+                env["POOLSIDE_API_KEY"] = poolside_api_key
+            if config.poolside.token and not str(config.poolside.token).startswith("${") and "POOLSIDE_TOKEN" not in env:
+                env["POOLSIDE_TOKEN"] = str(config.poolside.token)
+            if "LLAMA_BRIDGE_API_KEY" not in env:
+                env["LLAMA_BRIDGE_API_KEY"] = config.server.auth_token
+            if poolside_api_url and _is_llama_bridge_poolside_url(config, poolside_api_url) and standalone_base_url:
+                env.setdefault("POOLSIDE_STANDALONE_BASE_URL", standalone_base_url)
+                env.setdefault("OPENAI_API_KEY", "ollama")
+                env.setdefault("OPENAI_BASE_URL", standalone_base_url)
+    except Exception:
+        pass
+    return env
+
+
+def _json_line(line: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _poolside_available_commands_update(session_id: str) -> dict[str, Any]:
+    available_commands = _poolside_bridge_available_commands()
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": available_commands,
+            },
+        },
+    }
+
+
+def _poolside_bridge_available_commands() -> list[dict[str, Any]]:
+    commands = [
+        ("model", "Open the agent/model selector.", "model name"),
+        ("mode", "List or switch session mode.", "mode name"),
+        ("plan", "Switch to plan mode.", None),
+        ("clear", "Clear conversation history and free context.", None),
+        ("rewind", "Roll back to a previous turn.", None),
+        ("share", "Get a trajectory sharing link.", None),
+        ("skills", "Refresh and list available skills.", None),
+        ("usage", "Show token usage for the current session.", None),
+        ("serp", "Search the web with SerpAPI through llama bridge.", "search query"),
+        ("tavily", "Search the web with Tavily through llama bridge.", "search query"),
+        ("web", "Search the web through llama bridge.", "search query"),
+        ("image", "Find sourced image candidates through llama bridge.", "image query"),
+        ("wiki", "Search Wikipedia through llama bridge.", "Wikipedia query"),
+        ("deep", "Auto-plan deep research, run many searches, verify sources, and write report.md.", "research topic"),
+    ]
+    available_commands = []
+    for name, description, hint in commands:
+        command: dict[str, Any] = {"name": name, "description": description}
+        if hint:
+            command["input"] = {"hint": hint}
+        available_commands.append(command)
+    return available_commands
+
+
+def _with_poolside_bridge_commands(message: dict[str, Any]) -> dict[str, Any]:
+    if message.get("method") != "session/update":
+        return message
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return message
+    update = params.get("update")
+    if not isinstance(update, dict) or update.get("sessionUpdate") != "available_commands_update":
+        return message
+    commands = update.get("availableCommands")
+    if not isinstance(commands, list):
+        return message
+
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for command in [*commands, *_poolside_bridge_available_commands()]:
+        if not isinstance(command, dict):
+            continue
+        name = command.get("name")
+        if not isinstance(name, str) or not name or name in seen:
+            continue
+        seen.add(name)
+        merged.append(command)
+
+    return {
+        **message,
+        "params": {
+            **params,
+            "update": {
+                **update,
+                "availableCommands": merged,
+            },
+        },
+    }
+
+
+def _with_poolside_deep_research_prompt(message: dict[str, Any]) -> dict[str, Any]:
+    if message.get("method") != "session/prompt":
+        return message
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return message
+    prompt_key = "prompt" if "prompt" in params else "Prompt" if "Prompt" in params else None
+    prompt = params.get(prompt_key) if prompt_key else None
+    if not isinstance(prompt, list):
+        return message
+
+    rewritten_prompt: list[Any] = []
+    changed = False
+    for block in prompt:
+        if not isinstance(block, dict):
+            rewritten_prompt.append(block)
+            continue
+        text_key = "text" if "text" in block else "Text" if "Text" in block else None
+        text_value = block.get(text_key) if text_key else None
+        if not isinstance(text_value, str):
+            rewritten_prompt.append(block)
+            continue
+        rewritten = _poolside_deep_research_prompt(text_value)
+        if rewritten == text_value:
+            rewritten_prompt.append(block)
+            continue
+        changed = True
+        rewritten_prompt.append({**block, text_key: rewritten})
+
+    if not changed:
+        return message
+    return {**message, "params": {**params, prompt_key: rewritten_prompt}}
+
+
+def _poolside_deep_research_prompt(text: str) -> str:
+    stripped = text.strip()
+    lowered = stripped.lower()
+    prefixes = ("/deep ",)
+    if lowered == "/deep":
+        topic = "the requested research topic"
+    else:
+        matched = next((prefix for prefix in prefixes if lowered.startswith(prefix)), None)
+        if not matched:
+            return text
+        topic = stripped[len(matched) :].strip() or "the requested research topic"
+
+    return f"""AUTO PLAN MODE: run this as a deep research workflow for: {topic}
+
+The main brain controls the workflow. Delegate evidence collection to specialist sub-agent tools so raw search dumps do not fill the main context. Required todos:
+1. Call llama_bridge_tools__deep first to get the workflow.
+2. Prefer llama_bridge_tools__deep_claude_agent. It uses Claude Agent SDK with real specialist subagents and returns a compact handoff.
+3. If Claude SDK is unavailable, call llama_bridge_tools__deep_tavily_agent, llama_bridge_tools__deep_serp_agent, and llama_bridge_tools__deep_wiki_agent separately.
+4. Select at least 4 strong URLs from the sub-agent briefs and call llama_bridge_tools__deep_verify_agent.
+5. Write a compact checkpoint to report.md or deep_research_checkpoint.md before synthesis: completed todos, sub-agent briefs, selected URLs, verification verdicts, and remaining tasks.
+6. Create the final report.md in the current working directory with the write tool, using path=report.md and the tool's required content/contents field for the full markdown.
+7. Mark every todo complete before the final answer.
+
+If context compacts or feels full, continue from the checkpoint and remaining todos automatically; do not ask the user to restart manually. Do not use one long llama_bridge_tools__source_research call in Poolside deep mode. Do not finish with only an inline answer; report.md is required."""
+
+
+def _write_poolside_agent_config() -> Path:
+    config_path = Path(os.path.expanduser("~/.config/poolside/pool.json"))
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    except json.JSONDecodeError:
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    servers_value = existing.get("agent_servers")
+    servers = dict(servers_value) if isinstance(servers_value, dict) else {}
+    direct = servers.get("llama_bridge_poolside_direct")
+    if not isinstance(direct, dict):
+        direct = {"command": "{{SELF}}", "args": ["acp"]}
+    servers["llama_bridge_poolside_direct"] = direct
+    command, args = _llama_self_command()
+    servers["default"] = {
+        "command": command,
+        "args": [*args, "poolside-acp-proxy"],
+    }
+    existing["agent_servers"] = servers
+    _write_json(config_path, existing)
+    return config_path
 
 
 def _write_poolside_config(config) -> Path:
@@ -3834,6 +4149,70 @@ def _write_poolside_config(config) -> Path:
             "33",
         )
     return settings_path
+
+
+def _write_poolside_bridge_skill(config) -> Path:
+    skills_dir = _resolved_poolside_settings_path(config).parent / "skills" / "llama-bridge-tools"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = skills_dir / "SKILL.md"
+    try:
+        skill_path.write_text(_poolside_bridge_tools_skill(), encoding="utf-8")
+    except PermissionError:
+        _print_state(
+            "warn",
+            f"Could not update Poolside skill at {skill_path}; MCP tools remain configured",
+            "33",
+        )
+    return skill_path
+
+
+def _poolside_bridge_tools_skill() -> str:
+    return """---
+name: llama-bridge-tools
+description: Use when Poolside needs llama bridge MCP tools, current web search, SerpAPI, Tavily, source research, deep research, image search, Wikipedia, weather, or date/time lookups. Use when the user types shortcut-style prompts such as /serp, /tavily, /web, /image, /wiki, or /deep.
+---
+
+# Llama Bridge Tools
+
+Use the `llama_bridge_tools` MCP server when a task needs current information,
+source verification, image candidates, weather, Wikipedia, or local date/time
+lookups.
+
+Poolside exposes custom workflows through `/skills`. If the user types a
+shortcut-like prompt directly, treat it as an instruction to use the matching
+MCP tool:
+
+- `/serp`: use `serpapi_search`.
+- `/tavily`: use `tavily_search`.
+- `/web`: use the best available bridge web search tool.
+- `/image`: use `image_research`.
+- `/wiki`: use `wikipedia_search`; follow with `wikipedia_page` when a
+  specific page is needed.
+- `/deep`: auto-switch to Plan behavior or create a todo list first. The main
+  brain must control the workflow. Prefer `deep_claude_agent`, which uses
+  Claude Agent SDK with real specialist subagents. If it is unavailable,
+  delegate evidence collection to compact fallback sub-agent tools:
+  `deep_tavily_agent`, `deep_serp_agent`, `deep_wiki_agent`, and
+  `deep_verify_agent`. These sub-agents return compact briefs only, so raw
+  search dumps do not fill the main context. Write a compact checkpoint before
+  synthesis, continue from that checkpoint after context compaction, create a
+  full sourced `report.md` in the current working directory, mark every todo
+  complete, then give the final answer. Avoid putting the whole workflow into
+  one `source_research` call in Poolside because long MCP calls can hit ACP
+  timeouts.
+
+Prefer the highest-level bridge tool that fits the task:
+
+- `source_research` for cited factual research and evidence gathering.
+- `image_research` for compact sourced image candidates.
+- `tavily_search` or `serpapi_search` for current web results.
+- `wikipedia_search` and `wikipedia_page` for encyclopedia context.
+- `weather_current` for live weather.
+- `datetime_now` for current time or timezone questions.
+
+The MCP server calls the local llama bridge HTTP tool endpoints, so the llama
+server must be running for tool calls to succeed.
+"""
 
 
 def _poolside_api_url(config) -> str | None:
@@ -4702,15 +5081,6 @@ export default function (pi: ExtensionAPI) {{
       return {{ text: formatSearchResults(details.results || []) || pretty(details), details }};
     }},
   }});
-  registerToolCommand("web_search", "Run llama bridge web_search", {{
-    title: "Web search query",
-    placeholder: "Search query",
-    emptyMessage: "Web search cancelled: no query entered.",
-    execute: async (input, signal) => {{
-      const details = await postJson("/api/web_search", {{ query: input, max_results: 5 }}, signal);
-      return {{ text: formatSearchResults(details.results || []) || pretty(details), details }};
-    }},
-  }});
   registerToolCommand("fetch", "Fetch a URL through llama bridge web_fetch", {{
     title: "URL to fetch",
     placeholder: "https://example.com/page",
@@ -4722,26 +5092,6 @@ export default function (pi: ExtensionAPI) {{
     }},
   }});
   registerToolCommand("serp", "Run SerpAPI search through llama bridge", {{
-    title: "SerpAPI search query",
-    placeholder: "Search query",
-    emptyMessage: "SerpAPI search cancelled: no query entered.",
-    execute: async (input, signal) => {{
-      const details = await callBridgeTool("serpapi_search", {{ query: input, num: 5 }}, signal);
-      const errorText = toolErrorText("serpapi_search", details);
-      return {{ text: errorText || formatSearchResults(details.organic_results || details.results || []) || pretty(details), details }};
-    }},
-  }});
-  registerToolCommand("serp_search", "Run SerpAPI search through llama bridge", {{
-    title: "SerpAPI search query",
-    placeholder: "Search query",
-    emptyMessage: "SerpAPI search cancelled: no query entered.",
-    execute: async (input, signal) => {{
-      const details = await callBridgeTool("serpapi_search", {{ query: input, num: 5 }}, signal);
-      const errorText = toolErrorText("serpapi_search", details);
-      return {{ text: errorText || formatSearchResults(details.organic_results || details.results || []) || pretty(details), details }};
-    }},
-  }});
-  registerToolCommand("serp-sarch", "Alias for /serp_search", {{
     title: "SerpAPI search query",
     placeholder: "Search query",
     emptyMessage: "SerpAPI search cancelled: no query entered.",
@@ -4772,26 +5122,6 @@ export default function (pi: ExtensionAPI) {{
       return {{ text: errorText || formatImageResults(details) || pretty(details), details }};
     }},
   }});
-  registerToolCommand("image_search", "Run image_research through llama bridge", {{
-    title: "Image research query",
-    placeholder: "Image search query",
-    emptyMessage: "Image research cancelled: no query entered.",
-    execute: async (input, signal) => {{
-      const details = await callBridgeTool("image_research", {{ query: input, max_results: 3 }}, signal);
-      const errorText = toolErrorText("image_research", details);
-      return {{ text: errorText || formatImageResults(details) || pretty(details), details }};
-    }},
-  }});
-  registerToolCommand("image-sarch", "Alias for /image_search", {{
-    title: "Image research query",
-    placeholder: "Image search query",
-    emptyMessage: "Image research cancelled: no query entered.",
-    execute: async (input, signal) => {{
-      const details = await callBridgeTool("image_research", {{ query: input, max_results: 3 }}, signal);
-      const errorText = toolErrorText("image_research", details);
-      return {{ text: errorText || formatImageResults(details) || pretty(details), details }};
-    }},
-  }});
   registerToolCommand("wiki", "Search Wikipedia through llama bridge", {{
     title: "Wikipedia search query",
     placeholder: "Topic or title",
@@ -4800,17 +5130,6 @@ export default function (pi: ExtensionAPI) {{
       const details = await callBridgeTool("wikipedia_search", {{ query: input, limit: 5, language: "en" }}, signal);
       const errorText = toolErrorText("wikipedia_search", details);
       return {{ text: errorText || formatSearchResults(details.results || []) || pretty(details), details }};
-    }},
-  }});
-  registerToolCommand("wiki_page", "Fetch a Wikipedia page through llama bridge", {{
-    title: "Wikipedia page title",
-    placeholder: "Exact page title",
-    emptyMessage: "Wikipedia page cancelled: no title entered.",
-    execute: async (input, signal) => {{
-      const details = await callBridgeTool("wikipedia_page", {{ title: input, language: "en" }}, signal);
-      const errorText = toolErrorText("wikipedia_page", details);
-      const text = details.summary ? `${{details.title || input}}\\n${{details.url || ""}}\\n\\n${{details.summary}}` : pretty(details);
-      return {{ text: errorText || text, details }};
     }},
   }});
   registerToolCommand("weather", "Get current weather through llama bridge", {{
@@ -4976,6 +5295,16 @@ async function getJson(path: string, signal: AbortSignal) {{
 async function callBridgeTool(name: string, args: unknown, signal: AbortSignal) {{
   const data = await postJson(`/api/tools/${{name}}`, args, signal);
   return data.data ?? data.result?.data ?? data.result ?? data;
+}}
+
+function pretty(value: unknown) {{
+  return JSON.stringify(value, null, 2);
+}}
+
+function toolErrorText(toolName: string, result: any) {{
+  if (!result || result.ok !== false) return null;
+  const error = result.error?.message ?? result.error ?? "unknown error";
+  return `${{toolName}} failed: ${{String(error)}}\\n\\n${{pretty(result)}}`;
 }}
 
 function asNumber(value: unknown, fallback: number, min: number, max: number) {{
@@ -5515,18 +5844,8 @@ export default function (pi: ExtensionAPI) {{
     }}
   }}
 
-  pi.registerCommand("deep_research", {{
-    description: "Run Pi-only deep research with parallel web/search providers",
-    handler: async (args, ctx) => startDeepResearch(args, ctx),
-  }});
-
   pi.registerCommand("deep", {{
-    description: "Open deep research topic prompt",
-    handler: async (args, ctx) => startDeepResearch(args, ctx),
-  }});
-
-  pi.registerCommand("deep-research", {{
-    description: "Alias for /deep_research",
+    description: "Run Pi-only deep research with parallel web/search providers",
     handler: async (args, ctx) => startDeepResearch(args, ctx),
   }});
 }}

@@ -12,7 +12,7 @@ from typing import Any
 
 DEFAULT_OPENCLAW_CONFIG_PATH = "~/.openclaw/llama-openclaw.json"
 DEFAULT_OPENCLAW_WORKSPACE = "~/.openclaw/llama-workspace"
-DEFAULT_OPENCLAW_MODEL = "qwen3.5:cloud"
+DEFAULT_OPENCLAW_MODEL = "gemma4:31b"
 DEFAULT_OPENCLAW_INSTALL_PACKAGE = "openclaw"
 
 

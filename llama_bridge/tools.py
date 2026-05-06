@@ -655,6 +655,25 @@ class ToolRegistry:
                             "description": "Also collect image candidates with source/provenance metadata.",
                             "default": False,
                         },
+                        "skip_master_review": {
+                            "type": "boolean",
+                            "description": "Skip the optional master-review pass for latency-sensitive clients.",
+                            "default": False,
+                        },
+                        "max_verify_urls": {
+                            "type": "integer",
+                            "description": "Maximum discovered URLs to fetch during verification.",
+                            "default": 10,
+                            "minimum": 1,
+                            "maximum": 10,
+                        },
+                        "verify_timeout_seconds": {
+                            "type": "integer",
+                            "description": "Per-source fetch timeout during verification.",
+                            "default": 20,
+                            "minimum": 3,
+                            "maximum": 20,
+                        },
                         "include_domains": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -991,6 +1010,13 @@ class ToolRegistry:
         )
         include_images = bool(arguments.get("include_images", False))
         image_limit = min(max_results, 3)
+        max_verify_urls = _bounded_int(arguments.get("max_verify_urls"), default=10, minimum=1, maximum=10)
+        verify_timeout_seconds = _bounded_int(
+            arguments.get("verify_timeout_seconds"),
+            default=20,
+            minimum=3,
+            maximum=20,
+        )
 
         search_tasks = []
         if self.config.tools.tavily.enabled:
@@ -1032,6 +1058,8 @@ class ToolRegistry:
             [result["url"] for result in unique_results if result.get("url")],
             claim=query,
             required_sources=required_sources,
+            max_urls=max_verify_urls,
+            timeout_seconds=verify_timeout_seconds,
         )
         fallback_verified = _verified_from_search_excerpts(
             unique_results,
@@ -1096,6 +1124,8 @@ class ToolRegistry:
             ],
             "search_errors": search_errors,
         }
+        if bool(arguments.get("skip_master_review", False)):
+            return result
         return await self._attach_master_review(result)
 
     async def _attach_master_review(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -1354,11 +1384,13 @@ class ToolRegistry:
         *,
         claim: str,
         required_sources: int,
+        max_urls: int = 10,
+        timeout_seconds: float = 20.0,
     ) -> dict[str, Any]:
         unique_urls = _dedupe_urls(urls)
         tasks = [
-            self._verify_one_source(index + 1, url, claim)
-            for index, url in enumerate(unique_urls[:10])
+            self._verify_one_source(index + 1, url, claim, timeout_seconds=timeout_seconds)
+            for index, url in enumerate(unique_urls[:max_urls])
         ]
         results = await asyncio.gather(*tasks)
         verified = [
@@ -1381,7 +1413,14 @@ class ToolRegistry:
             ),
         }
 
-    async def _verify_one_source(self, agent_id: int, url: str, claim: str) -> dict[str, Any]:
+    async def _verify_one_source(
+        self,
+        agent_id: int,
+        url: str,
+        claim: str,
+        *,
+        timeout_seconds: float = 20.0,
+    ) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         try:
             _validate_public_http_url(url)
@@ -1390,7 +1429,7 @@ class ToolRegistry:
                 url,
                 headers={"User-Agent": WIKIMEDIA_USER_AGENT},
                 follow_redirects=True,
-                timeout=20.0,
+                timeout=timeout_seconds,
             )
             _validate_public_http_url(str(response.url))
             html = response.text[:200_000]
@@ -2418,7 +2457,18 @@ def _forced_tool_names(query: str, default_search_provider: str = "tavily") -> s
     if any(word in query_lower for word in ("latest", "news", "current", "recent", "price", "web")):
         preferred = f"{default_search_provider}_search"
         return {preferred, "source_research"}
-    if any(phrase in query_lower for phrase in ("deep research", "source research", "research report", "source verification")):
+    if any(
+        phrase in query_lower
+        for phrase in (
+            "deep research",
+            "deep_research",
+            "deep-research",
+            "/deep",
+            "source research",
+            "research report",
+            "source verification",
+        )
+    ):
         return {"source_research", "verify_sources"}
     if any(
         phrase in query_lower
