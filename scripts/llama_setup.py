@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 
@@ -21,6 +23,7 @@ BUILD_MODULES = (
     "uvicorn",
     "yaml",
 )
+SPINNER_FRAMES = ("|", "/", "-", "\\")
 
 
 def main() -> int:
@@ -34,6 +37,7 @@ def main() -> int:
     _banner()
     temp_root: Path | None = None
     try:
+        _cleanup_stale_temp_dirs()
         git = _ensure_git()
         python = _ensure_python()
         install_dir = args.install_dir.expanduser().resolve()
@@ -192,12 +196,6 @@ def _venv_python(venv_dir: Path) -> Path:
 
 
 def _prepare_build_python(python: str, source_dir: Path, venv_dir: Path) -> str:
-    missing = _missing_python_modules(python, BUILD_MODULES)
-    if not missing:
-        print("> Python dependencies already installed; skipping pip install")
-        return python
-
-    print(f"> Missing Python modules: {', '.join(missing)}")
     _run([python, "-m", "venv", str(venv_dir)], "Creating build environment")
     venv_python = str(_venv_python(venv_dir))
     _run(
@@ -211,10 +209,28 @@ def _prepare_build_python(python: str, source_dir: Path, venv_dir: Path) -> str:
             "setuptools",
             "wheel",
             "pyinstaller",
+            "fastapi",
+            "httpx",
+            "pydantic",
+            "uvicorn",
+            "pyyaml",
         ],
-        "Installing build tools",
+        "Installing build tools and dependencies",
     )
     _run([venv_python, "-m", "pip", "install", "-e", str(source_dir)], "Downloading llama dependencies")
+    missing = _missing_python_modules(venv_python, BUILD_MODULES)
+    if missing:
+        package_map = {
+            "PyInstaller": "pyinstaller",
+            "fastapi": "fastapi",
+            "httpx": "httpx",
+            "pydantic": "pydantic",
+            "uvicorn": "uvicorn",
+            "yaml": "pyyaml",
+        }
+        packages = [package_map[name] for name in missing if name in package_map]
+        if packages:
+            _run([venv_python, "-m", "pip", "install", *packages], f"Installing missing modules: {', '.join(missing)}")
     return venv_python
 
 
@@ -355,13 +371,64 @@ def _set_user_env(name: str, value: str) -> None:
 
 
 def _run(command: list[str], label: str, cwd: Path | None = None) -> None:
-    print(f"> {label}")
+    spinner = _Spinner(label)
+    spinner.start()
     try:
-        subprocess.run(command, cwd=cwd, check=True)
+        process = subprocess.Popen(command, cwd=cwd)
+        while True:
+            exit_code = process.poll()
+            if exit_code is not None:
+                if exit_code != 0:
+                    raise subprocess.CalledProcessError(exit_code, command)
+                break
+            time.sleep(0.1)
     except FileNotFoundError as exc:
+        spinner.fail("command not found")
         raise RuntimeError(f"Command not found: {command[0]}") from exc
     except subprocess.CalledProcessError as exc:
+        spinner.fail(f"failed ({exc.returncode})")
         raise RuntimeError(f"{label} failed with exit code {exc.returncode}") from exc
+    else:
+        spinner.succeed()
+
+
+def _cleanup_stale_temp_dirs() -> None:
+    temp_base = Path(tempfile.gettempdir())
+    for path in temp_base.glob("llama-setup-*"):
+        if not path.is_dir():
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+
+
+class _Spinner:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._index = 0
+
+    def start(self) -> None:
+        print(f"[ ] {self.label}", flush=True)
+        self._thread.start()
+
+    def succeed(self) -> None:
+        self._finish("[ok]")
+
+    def fail(self, detail: str) -> None:
+        self._finish(f"[x] {detail}")
+
+    def _finish(self, suffix: str) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+        print(f"\r{suffix} {self.label}{' ' * 20}")
+
+    def _animate(self) -> None:
+        while not self._stop.is_set():
+            frame = SPINNER_FRAMES[self._index % len(SPINNER_FRAMES)]
+            self._index += 1
+            print(f"\r[{frame}] {self.label}", end="", flush=True)
+            time.sleep(0.12)
 
 
 def _launched_by_double_click() -> bool:

@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -214,6 +213,26 @@ def create_app(
             },
         )
         if bool(body.get("stream")):
+            if _should_buffer_streaming_tool_request(body, payload):
+                try:
+                    data = await _chat_completion_with_bridge_tools(app, provider, payload, config)
+                except httpx.HTTPStatusError as exc:
+                    _write_dev_log(
+                        config,
+                        "openai_chat_response_error",
+                        {
+                            "status_code": exc.response.status_code,
+                            "body": _safe_response_text(exc.response),
+                        },
+                    )
+                    return _upstream_error(exc.response)
+                except httpx.RequestError as exc:
+                    _write_dev_log(config, "openai_chat_response_error", {"message": str(exc)})
+                    return _request_error(exc)
+                return StreamingResponse(
+                    _safe_stream(_stream_buffered_openai_completion(data)),
+                    media_type="text/event-stream",
+                )
             _log_streaming_tool_policy(config, "openai_chat", payload)
             return StreamingResponse(
                 _safe_stream(_stream_openai_response(provider, payload, config)),
@@ -1668,6 +1687,27 @@ def _log_streaming_tool_policy(config: BridgeConfig, route: str, payload: dict[s
             "exposed_tools": bridge_tools,
         },
     )
+
+
+def _should_buffer_streaming_tool_request(body: dict[str, Any], payload: dict[str, Any]) -> bool:
+    if not payload.get("tools"):
+        return False
+    text = _latest_user_text(body.get("messages", [])).lower()
+    markers = (
+        "/deep",
+        "deep research",
+        "deep resarch",
+        "deep_research",
+        "deep research tool",
+        "auto plan mode",
+        "report.md",
+        "temp/ad.md",
+        "deep_plan_agent",
+        "deep_collect_agent",
+        "deep_review_agent",
+        "llama_bridge_tools__deep",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _request_tool_profile(
@@ -3479,6 +3519,45 @@ async def _stream_openai_response(
         _write_dev_log(config, "pi_response_error", {"message": str(exc)})
         yield f"data: {json.dumps({'error': {'message': str(exc)}}, ensure_ascii=True)}\n\n"
         return
+
+
+async def _stream_buffered_openai_completion(data: dict[str, Any]) -> AsyncIterator[str]:
+    message = ((data.get("choices") or [{}])[0].get("message") or {})
+    content = _chat_completion_text(data)
+    chunk_id = str(data.get("id") or f"chatcmpl-{uuid.uuid4().hex}")
+    created = int(data.get("created") or time.time())
+    model = str(data.get("model") or "")
+    first_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }
+    yield f"data: {json.dumps(first_chunk, ensure_ascii=True)}\n\n"
+    if content:
+        content_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(content_chunk, ensure_ascii=True)}\n\n"
+    finish_reason = ((data.get("choices") or [{}])[0].get("finish_reason") or "stop")
+    final_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+    if data.get("usage") is not None:
+        final_chunk["usage"] = data.get("usage")
+    if isinstance(message, dict) and message.get("tool_calls"):
+        final_chunk["choices"][0]["delta"]["tool_calls"] = message.get("tool_calls")
+    yield f"data: {json.dumps(final_chunk, ensure_ascii=True)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 def _normalize_streaming_tool_delta(

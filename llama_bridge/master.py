@@ -5,7 +5,7 @@ import json
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse

@@ -1,17 +1,125 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
+import time
+import uuid
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .config import DEFAULT_CONFIG_PATH, load_config
 from .tools import render_manim_video
 
 
 PROTOCOL_VERSION = "2025-06-18"
+
+
+class SubagentManager:
+    def __init__(self) -> None:
+        self._sessions: dict[str, dict[str, Any]] = {}
+
+    def spawn(self, topic: str, agent_names: list[str]) -> dict[str, Any]:
+        session_id = f"sa_{uuid.uuid4().hex[:12]}"
+        assignments = self._select_assignments(agent_names)
+        session = {
+            "session_id": session_id,
+            "topic": topic,
+            "status": "active",
+            "created_at": int(time.time()),
+            "updated_at": int(time.time()),
+            "agent_count": len(agent_names),
+            "agents": assignments,
+            "selection_strategy": "dynamic_limit_aware_from_env_yml",
+        }
+        self._sessions[session_id] = session
+        return dict(session)
+
+    def mark(self, session_id: str, *, status: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Unknown subagent session: {session_id}")
+        session["status"] = status
+        session["updated_at"] = int(time.time())
+        if extra:
+            session.update(extra)
+        return dict(session)
+
+    def kill(self, session_id: str) -> dict[str, Any]:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Unknown subagent session: {session_id}")
+        session["status"] = "killed"
+        session["updated_at"] = int(time.time())
+        return dict(session)
+
+    def status(self, session_id: str | None = None) -> dict[str, Any]:
+        if session_id:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Unknown subagent session: {session_id}")
+            return {"sessions": [dict(session)]}
+        sessions = sorted(self._sessions.values(), key=lambda item: int(item.get("created_at", 0)), reverse=True)
+        return {"sessions": [dict(item) for item in sessions]}
+
+    def get(self, session_id: str) -> dict[str, Any]:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Unknown subagent session: {session_id}")
+        return dict(session)
+
+    def _select_assignments(self, agent_names: list[str]) -> list[dict[str, Any]]:
+        try:
+            config = load_config(DEFAULT_CONFIG_PATH)
+        except Exception as exc:  # noqa: BLE001
+            return [
+                {
+                    "agent": name,
+                    "provider": None,
+                    "model": None,
+                    "alias": None,
+                    "endpoint": None,
+                    "status": f"env.yml unavailable: {exc}",
+                }
+                for name in agent_names
+            ]
+
+        pool = _provider_model_pool(config)
+        if not pool:
+            return [
+                {
+                    "agent": name,
+                    "provider": None,
+                    "model": None,
+                    "alias": None,
+                    "endpoint": None,
+                    "status": "no eligible provider/model entries found in env.yml",
+                }
+                for name in agent_names
+            ]
+
+        used_counts: dict[str, int] = {}
+        assignments: list[dict[str, Any]] = []
+        for name in agent_names:
+            role = _subagent_role(name)
+            candidates = _rank_provider_candidates(pool, role=role, used_counts=used_counts)
+            selected = dict(candidates[0] if candidates else pool[0])
+            key = f"{selected.get('provider')}::{selected.get('model')}"
+            used_counts[key] = used_counts.get(key, 0) + 1
+            selected.update(
+                {
+                    "agent": name,
+                    "role": role,
+                    "endpoint": selected.get("base_url"),
+                    "selection_strategy": "dynamic_limit_aware_from_env_yml",
+                }
+            )
+            assignments.append(selected)
+        return assignments
+
+
+_SUBAGENT_MANAGER = SubagentManager()
 
 
 def main() -> None:
@@ -132,8 +240,20 @@ class BridgeMcpServer:
             return _deep_research_handoff(arguments)
         if name == "manim_render":
             return _call_manim_render(self, arguments)
-        if name == "deep_claude_agent":
-            return _call_claude_deep_agent(self.base_url, self.api_key, arguments)
+        if name == "subagent_spawn":
+            return _call_subagent_spawn(arguments)
+        if name == "subagent_kill":
+            return _call_subagent_kill(arguments)
+        if name == "subagent_status":
+            return _call_subagent_status(arguments)
+        if name == "deep_lead_agent":
+            return _call_deep_lead_agent(self, arguments)
+        if name == "deep_plan_agent":
+            return _call_deep_plan_agent(arguments)
+        if name == "deep_collect_agent":
+            return _call_deep_collect_agent(self, arguments)
+        if name == "deep_review_agent":
+            return _call_deep_review_agent(self, arguments)
         if name in {"deep_tavily_agent", "deep_serp_agent", "deep_wiki_agent", "deep_verify_agent"}:
             return self._call_deep_agent(name, arguments)
         name, arguments = _normalize_tool_call(name, arguments)
@@ -285,18 +405,116 @@ def _virtual_tools() -> list[dict[str, Any]]:
             "inputSchema": deep_schema,
         },
         {
-            "name": "deep_claude_agent",
+            "name": "subagent_spawn",
+            "description": "Spawn a managed llama-bridge subagent session with automatic provider/model selection from env.yml.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["topic"],
+                "properties": {
+                    "topic": {"type": "string", "description": "Research topic or task for the subagent team."},
+                    "agent_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional explicit agent names. Defaults to the standard deep research team.",
+                    },
+                },
+            },
+        },
+        {
+            "name": "subagent_kill",
+            "description": "Kill a managed llama-bridge subagent session.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["session_id"],
+                "properties": {
+                    "session_id": {"type": "string", "description": "Subagent session id to terminate."},
+                },
+            },
+        },
+        {
+            "name": "subagent_status",
+            "description": "Get status for one managed subagent session or list all sessions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Optional subagent session id."},
+                },
+            },
+        },
+        {
+            "name": "deep_lead_agent",
             "description": (
-                "Use Claude Agent SDK subagents for /deep research. A lead Claude agent delegates to "
-                "specialized Tavily, SerpAPI, Wikipedia, and verification subagents and returns a compact handoff."
+                "Native llama-bridge lead research controller for /deep. By default it returns a staged plan. "
+                "Prefer plan -> collect -> review to avoid one long timeout-prone call."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string", "description": "Main research topic."},
                     "query": {"type": "string", "description": "Alias for topic."},
-                    "max_turns": {"type": "integer", "default": 12, "minimum": 4, "maximum": 24},
+                    "stage": {
+                        "type": "string",
+                        "enum": ["plan", "collect", "review", "full"],
+                        "default": "plan",
+                        "description": "Deep workflow stage. Use full only for the legacy one-shot run.",
+                    },
+                    "session_id": {"type": "string", "description": "Existing deep research session id."},
+                    "required_verified_sources": {"type": "integer", "default": 4, "minimum": 1, "maximum": 6},
+                    "include_images": {"type": "boolean", "default": False},
+                    "query_count": {"type": "integer", "default": 5, "minimum": 2, "maximum": 6},
+                    "include_official_hunt": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Run an extra official-source pass inside the lead agent.",
+                    },
                 },
+            },
+        },
+        {
+            "name": "deep_plan_agent",
+            "description": "Stage 1 for /deep: create a session, assign the fixed team, and return the small-step workflow with temp/ad.md checkpoint instructions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "Main research topic."},
+                    "query": {"type": "string", "description": "Alias for topic."},
+                    "required_verified_sources": {"type": "integer", "default": 4, "minimum": 1, "maximum": 6},
+                    "include_images": {"type": "boolean", "default": False},
+                    "query_count": {"type": "integer", "default": 4, "minimum": 2, "maximum": 6},
+                    "include_official_hunt": {"type": "boolean", "default": True},
+                },
+            },
+        },
+        {
+            "name": "deep_collect_agent",
+            "description": "Stage 2 for /deep: run exactly 2 Tavily, 2 SerpAPI, and 3 Wikipedia collection agents, then return markdown for temp/ad.md.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "Main research topic."},
+                    "query": {"type": "string", "description": "Alias for topic."},
+                    "session_id": {"type": "string", "description": "Existing deep research session id from deep_plan_agent."},
+                    "query_count": {"type": "integer", "default": 4, "minimum": 2, "maximum": 6},
+                    "include_official_hunt": {"type": "boolean", "default": True},
+                },
+                "required": ["topic"],
+            },
+        },
+        {
+            "name": "deep_review_agent",
+            "description": "Stage 3 for /deep: continue from the collected session data, verify the strongest URLs, update temp/ad.md markdown, and return the final handoff for the main AI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "Main research topic."},
+                    "query": {"type": "string", "description": "Alias for topic."},
+                    "session_id": {"type": "string", "description": "Existing deep research session id from deep_plan_agent/deep_collect_agent."},
+                    "required_verified_sources": {"type": "integer", "default": 4, "minimum": 1, "maximum": 6},
+                    "include_images": {"type": "boolean", "default": False},
+                    "selected_urls": {"type": "array", "items": {"type": "string"}, "description": "Optional explicit URL shortlist to review first."},
+                    "verify_timeout_seconds": {"type": "integer", "default": 8, "minimum": 4, "maximum": 20},
+                },
+                "required": ["topic"],
             },
         },
         {
@@ -347,6 +565,7 @@ def _virtual_tools() -> list[dict[str, Any]]:
                     "claim": {"type": "string", "description": "Claim or topic to verify against the URLs."},
                     "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs selected by search sub-agents."},
                     "required_verified_sources": {"type": "integer", "default": 3, "minimum": 1, "maximum": 6},
+                    "verify_timeout_seconds": {"type": "integer", "default": 8, "minimum": 4, "maximum": 20},
                 },
                 "required": ["urls"],
             },
@@ -399,37 +618,6 @@ def _poolside_source_research_arguments(arguments: dict[str, Any]) -> dict[str, 
     return normalized
 
 
-def _call_claude_deep_agent(base_url: str, api_key: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    topic = str(arguments.get("topic") or arguments.get("query") or "").strip() or "the research topic"
-    max_turns = min(max(_int_argument(arguments.get("max_turns"), 12), 4), 24)
-    try:
-        text = asyncio.run(_run_claude_deep_agent(base_url, api_key, topic=topic, max_turns=max_turns))
-    except ImportError:
-        text = json.dumps(
-            {
-                "ok": False,
-                "agent": "deep_claude_agent",
-                "error": "claude-agent-sdk is not installed. Install with: pip install claude-agent-sdk",
-                "fallback": "Use deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent.",
-            },
-            indent=2,
-        )
-        return {"content": [{"type": "text", "text": text}], "isError": False}
-    except Exception as exc:  # noqa: BLE001 - report SDK failures as fallback instructions.
-        text = json.dumps(
-            {
-                "ok": False,
-                "agent": "deep_claude_agent",
-                "error": str(exc),
-                "fallback": "Use deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent.",
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        return {"content": [{"type": "text", "text": text}], "isError": False}
-    return {"content": [{"type": "text", "text": text}], "isError": False}
-
-
 def _call_manim_render(server: BridgeMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         data = server._request("POST", "/api/tools/manim_render", arguments)
@@ -441,127 +629,1225 @@ def _call_manim_render(server: BridgeMcpServer, arguments: dict[str, Any]) -> di
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
-async def _run_claude_deep_agent(base_url: str, api_key: str, *, topic: str, max_turns: int) -> str:
+def _default_subagent_names() -> list[str]:
+    return [
+        "web-realtime-1",
+        "web-realtime-2",
+        "web-realtime-3",
+        "wiki-context-1",
+        "wiki-context-2",
+        "wiki-context-3",
+        "verify-pass-1",
+        "verify-pass-2",
+        "verify-pass-3",
+        "final-fixer",
+    ]
+
+
+def _call_subagent_spawn(arguments: dict[str, Any]) -> dict[str, Any]:
+    topic = str(arguments.get("topic") or arguments.get("query") or "").strip() or "the research topic"
+    agent_names = arguments.get("agent_names")
+    if not isinstance(agent_names, list) or not agent_names:
+        agent_names = _default_subagent_names()
+    else:
+        agent_names = [str(item).strip() for item in agent_names if str(item).strip()]
+    result = _SUBAGENT_MANAGER.spawn(topic, agent_names)
+    return {"content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False, default=str)}], "isError": False}
+
+
+def _call_subagent_kill(arguments: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(arguments.get("session_id") or "").strip()
+    if not session_id:
+        raise ValueError("session_id is required")
+    result = _SUBAGENT_MANAGER.kill(session_id)
+    return {"content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False, default=str)}], "isError": False}
+
+
+def _call_subagent_status(arguments: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(arguments.get("session_id") or "").strip() or None
+    result = _SUBAGENT_MANAGER.status(session_id)
+    return {"content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False, default=str)}], "isError": False}
+
+
+def _call_deep_lead_agent(server: BridgeMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
+    stage = str(arguments.get("stage") or "plan").strip().lower()
+    if stage == "plan":
+        return _call_deep_plan_agent(arguments)
+    if stage == "collect":
+        return _call_deep_collect_agent(server, arguments)
+    if stage == "review":
+        return _call_deep_review_agent(server, arguments)
+    topic = str(arguments.get("topic") or arguments.get("query") or "").strip() or "the research topic"
+    query_count = min(max(_int_argument(arguments.get("query_count"), 5), 2), 6)
+    required_verified_sources = min(max(_int_argument(arguments.get("required_verified_sources"), 4), 1), 6)
+    include_images = bool(arguments.get("include_images"))
+    include_official_hunt = bool(arguments.get("include_official_hunt", True))
     try:
-        import claude_agent_sdk
-        from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, query
-    except ImportError:
-        raise
-
-    mcp_servers = {
-        "llama_bridge_tools": {
-            "command": sys.executable,
-            "args": ["-m", "llama_bridge.mcp_tools"],
-            "env": {
-                "LLAMA_BRIDGE_BASE_URL": base_url,
-                "LLAMA_BRIDGE_API_KEY": api_key,
-            },
-        }
-    }
-    agents = {
-        "tavily-researcher": AgentDefinition(
-            description="Tavily current-web research specialist. Use for current news, current web evidence, and source discovery.",
-            prompt=(
-                "You are the Tavily research subagent. Run focused Tavily searches through the llama bridge MCP tool. "
-                "Return only a compact brief: 5-8 claims, best URLs, source quality, conflicts, and what still needs verification. "
-                "Do not write files. Do not include raw search dumps."
-            ),
-            tools=["mcp__llama_bridge_tools__tavily_search", "WebFetch"],
-            model="sonnet",
-        ),
-        "serpapi-researcher": AgentDefinition(
-            description="SerpAPI search specialist. Use for broad Google-style result discovery, official pages, and source diversity.",
-            prompt=(
-                "You are the SerpAPI research subagent. Run focused SerpAPI searches through the llama bridge MCP tool. "
-                "Return only compact evidence: claims, best URLs, source quality, conflicts, and verification priorities. "
-                "Do not write files. Do not include raw search dumps."
-            ),
-            tools=["mcp__llama_bridge_tools__serpapi_search", "WebFetch"],
-            model="sonnet",
-        ),
-        "wiki-backgrounder": AgentDefinition(
-            description="Wikipedia/background specialist. Use for entity background, historical context, terminology, and timelines.",
-            prompt=(
-                "You are the Wikipedia/background subagent. Use Wikipedia search/page tools for context only. "
-                "Return compact background notes, entity names, dates, and caveats. Do not treat Wikipedia as final proof."
-            ),
-            tools=[
-                "mcp__llama_bridge_tools__wikipedia_search",
-                "mcp__llama_bridge_tools__wikipedia_page",
-                "WebFetch",
-            ],
-            model="haiku",
-        ),
-        "source-verifier": AgentDefinition(
-            description="Source verification specialist. Use after candidate URLs are selected to verify claims and citation quality.",
-            prompt=(
-                "You are the verification subagent. Use verify_sources and WebFetch to test whether selected URLs support the claim. "
-                "Return a compact verdict with verified URLs, rejected/weak URLs, and citation warnings."
-            ),
-            tools=["mcp__llama_bridge_tools__verify_sources", "WebFetch"],
-            model="sonnet",
-        ),
-    }
-    prompt = f"""
-Use Claude Agent SDK subagents for deep research on: {topic}
-
-You are the lead research controller. Explicitly use these subagents:
-- tavily-researcher for current web/Tavily evidence.
-- serpapi-researcher for SerpAPI/source-diversity evidence.
-- wiki-backgrounder for background context.
-- source-verifier after selecting the strongest URLs.
-
-Keep the parent context small. Do not paste raw search dumps. Ask each subagent for compact claims, URLs, source quality, conflicts, and caveats only.
-
-Final output must be JSON with:
-- ok
-- topic
-- subagents_used
-- compact_claims
-- verified_sources
-- rejected_or_uncertain_sources
-- suggested_report_outline
-- checkpoint_markdown
-- remaining_tasks
-"""
-    chunks: list[str] = []
-    stderr_lines: list[str] = []
-    options = ClaudeAgentOptions(
-        allowed_tools=["Agent", "WebSearch", "WebFetch"],
-        agents=agents,
-        mcp_servers=mcp_servers,
-        max_turns=max_turns,
-        cli_path=_claude_sdk_cli_path(claude_agent_sdk),
-        stderr=lambda line: stderr_lines.append(str(line).strip()),
-    )
-    try:
-        async for message in query(prompt=prompt, options=options):
-            result = getattr(message, "result", None)
-            if isinstance(result, str) and result.strip():
-                chunks.append(result.strip())
-    except Exception as exc:
-        detail = "\n".join(line for line in stderr_lines if line)[-2000:]
-        raise RuntimeError(f"{exc}\n{detail}" if detail else str(exc)) from exc
-    if chunks:
-        return chunks[-1]
-    return json.dumps(
-        {
+        result = _run_native_deep_lead_agent(
+            server,
+            topic=topic,
+            query_count=query_count,
+            required_verified_sources=required_verified_sources,
+            include_images=include_images,
+            include_official_hunt=include_official_hunt,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result = {
             "ok": False,
-            "agent": "deep_claude_agent",
+            "agent": "deep_lead_agent",
             "topic": topic,
-            "error": "Claude Agent SDK completed without a result message.",
-            "fallback": "Use deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent.",
+            "error": str(exc),
+            "remaining_tasks": [
+                "Make sure the llama bridge server is running and reachable.",
+                "Retry deep_lead_agent or fall back to the compact specialist tools.",
+            ],
+        }
+    return {"content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False, default=str)}], "isError": False}
+
+
+def _call_deep_plan_agent(arguments: dict[str, Any]) -> dict[str, Any]:
+    topic = str(arguments.get("topic") or arguments.get("query") or "").strip() or "the research topic"
+    query_count = min(max(_int_argument(arguments.get("query_count"), 4), 2), 6)
+    required_verified_sources = min(max(_int_argument(arguments.get("required_verified_sources"), 4), 1), 6)
+    include_images = bool(arguments.get("include_images"))
+    include_official_hunt = bool(arguments.get("include_official_hunt", True))
+    session = _SUBAGENT_MANAGER.spawn(
+        topic,
+        [
+            "tavily-realtime-1",
+            "tavily-realtime-2",
+            "serp-realtime-1",
+            "serp-realtime-2",
+            "wiki-context-1",
+            "wiki-context-2",
+            "review-verifier",
+            "markdown-reviewer",
+            "final-handoff",
+        ],
+    )
+    plan = _native_query_plan(topic)
+    _SUBAGENT_MANAGER.mark(
+        str(session.get("session_id")),
+        status="planned",
+        extra={
+            "topic": topic,
+            "plan": plan,
+            "query_count": query_count,
+            "required_verified_sources": required_verified_sources,
+            "include_images": include_images,
+            "include_official_hunt": include_official_hunt,
+            "temp_markdown_path": "temp/ad.md",
+            "final_markdown_path": "report.md",
         },
-        indent=2,
+    )
+    result = {
+        "ok": True,
+        "agent": "deep_plan_agent",
+        "topic": topic,
+        "session_id": session.get("session_id"),
+        "session_status": "planned",
+        "query_plan": plan,
+        "team_layout": {
+            "tavily_agents": 2,
+            "serpapi_agents": 2,
+            "wikipedia_agents": 3,
+            "review_agents": 2,
+            "final_handoff_agents": 1,
+        },
+        "brain_assignments": session.get("agents", []),
+        "paths": {
+            "temp_markdown_path": "temp/ad.md",
+            "final_markdown_path": "report.md",
+        },
+        "next_steps": [
+            "Call deep_collect_agent with the same topic and this session_id.",
+            "Write the returned collect_markdown to temp/ad.md.",
+            "Call deep_review_agent with the same session_id.",
+            "Overwrite temp/ad.md with the returned reviewed_markdown, then write report.md from the final handoff.",
+        ],
+    }
+    return {"content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False, default=str)}], "isError": False}
+
+
+def _call_deep_collect_agent(server: BridgeMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
+    topic = str(arguments.get("topic") or arguments.get("query") or "").strip() or "the research topic"
+    session_id = _deep_session_id(arguments, topic)
+    query_count = min(max(_int_argument(arguments.get("query_count"), 4), 2), 6)
+    include_official_hunt = bool(arguments.get("include_official_hunt", True))
+    try:
+        result = _run_native_deep_collect_agent(
+            server,
+            session_id=session_id,
+            topic=topic,
+            query_count=query_count,
+            include_official_hunt=include_official_hunt,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "ok": False,
+            "agent": "deep_collect_agent",
+            "topic": topic,
+            "session_id": session_id,
+            "error": str(exc),
+            "next_steps": [
+                "Retry deep_collect_agent for the same session.",
+                "If one provider is flaky, continue with the successful briefs and move to deep_review_agent.",
+            ],
+        }
+    return {"content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False, default=str)}], "isError": False}
+
+
+def _call_deep_review_agent(server: BridgeMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
+    topic = str(arguments.get("topic") or arguments.get("query") or "").strip() or "the research topic"
+    session_id = _deep_session_id(arguments, topic)
+    required_verified_sources = min(max(_int_argument(arguments.get("required_verified_sources"), 4), 1), 6)
+    include_images = bool(arguments.get("include_images"))
+    verify_timeout_seconds = min(max(_int_argument(arguments.get("verify_timeout_seconds"), 8), 4), 20)
+    selected_urls = arguments.get("selected_urls")
+    if not isinstance(selected_urls, list):
+        selected_urls = []
+    selected_urls = [str(url).strip() for url in selected_urls if str(url).strip()]
+    try:
+        result = _run_native_deep_review_agent(
+            server,
+            session_id=session_id,
+            topic=topic,
+            required_verified_sources=required_verified_sources,
+            include_images=include_images,
+            selected_urls=selected_urls,
+            verify_timeout_seconds=verify_timeout_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "ok": False,
+            "agent": "deep_review_agent",
+            "topic": topic,
+            "session_id": session_id,
+            "error": str(exc),
+            "next_steps": [
+                "Retry deep_review_agent with a smaller selected_urls list.",
+                "Lower required_verified_sources if the topic has weak coverage.",
+            ],
+        }
+    return {"content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False, default=str)}], "isError": False}
+
+
+def _run_native_deep_lead_agent(
+    server: BridgeMcpServer,
+    *,
+    topic: str,
+    query_count: int,
+    required_verified_sources: int,
+    include_images: bool,
+    include_official_hunt: bool,
+) -> dict[str, Any]:
+    plan = _native_query_plan(topic)
+    session = _SUBAGENT_MANAGER.spawn(topic, _default_subagent_names())
+    brain_assignments = list(session.get("agents", []))
+    web_agents = [
+        {
+            "name": "web-realtime-1",
+            "tool": "deep_tavily_agent",
+            "arguments": {"topic": topic, "focus": "latest developments, breaking updates, current status", "query_count": query_count},
+        },
+        {
+            "name": "web-realtime-2",
+            "tool": "deep_serp_agent",
+            "arguments": {"topic": topic, "focus": "official sources, current coverage, top-tier reporting", "query_count": query_count},
+        },
+        {
+            "name": "web-realtime-3",
+            "tool": "deep_tavily_agent",
+            "arguments": {"topic": topic, "focus": "conflicts, controversies, alternative current coverage", "query_count": query_count},
+        },
+    ]
+    wiki_agents = [
+        {
+            "name": "wiki-context-1",
+            "tool": "deep_wiki_agent",
+            "arguments": {"topic": topic, "focus": "background, definitions, overview", "query_count": min(query_count, 4)},
+        },
+        {
+            "name": "wiki-context-2",
+            "tool": "deep_wiki_agent",
+            "arguments": {"topic": topic, "focus": "history, timeline anchors, prior developments", "query_count": min(query_count, 4)},
+        },
+        {
+            "name": "wiki-context-3",
+            "tool": "deep_wiki_agent",
+            "arguments": {"topic": topic, "focus": "key entities, institutions, terminology", "query_count": min(query_count, 4)},
+        },
+    ]
+    web_briefs = [
+        {"name": agent["name"], "brief": _run_deep_agent_brief(server, str(agent["tool"]), dict(agent["arguments"]))}
+        for agent in web_agents
+    ]
+    wiki_briefs = [
+        {"name": agent["name"], "brief": _run_deep_agent_brief(server, str(agent["tool"]), dict(agent["arguments"]))}
+        for agent in wiki_agents
+    ]
+
+    official = (
+        _build_official_source_brief(
+            topic,
+            *[item["brief"] for item in web_briefs],
+            *[item["brief"] for item in wiki_briefs],
+        )
+        if include_official_hunt
+        else {"official_sources": [], "warnings": []}
+    )
+
+    all_sources = _merge_candidate_sources(
+        *[item["brief"] for item in web_briefs],
+        *[item["brief"] for item in wiki_briefs],
+    )
+    selected_urls = _pick_best_urls(all_sources, target=max(required_verified_sources + 2, 4))
+    verification_agents = _build_verification_agents(topic, selected_urls, required_verified_sources)
+    verification_briefs = [
+        {"name": agent["name"], "brief": _run_verify_or_stub(server, agent["arguments"])}
+        for agent in verification_agents
+    ]
+    combined_verify = _combine_verification_briefs(verification_briefs)
+    source_review = _build_source_quality_review(all_sources, combined_verify, official)
+    audit = _audit_native_research(plan, all_sources, combined_verify, official)
+    fixer = _apply_final_fixer(
+        topic=topic,
+        plan=plan,
+        claims=_build_compact_claims(*[item["brief"] for item in web_briefs], *[item["brief"] for item in wiki_briefs], combined_verify),
+        verify=combined_verify,
+        audit=audit,
+    )
+    images = _run_image_brief(server, topic) if include_images else None
+    subagent_errors = {
+        "web": {item["name"]: item["brief"].get("errors", []) for item in web_briefs},
+        "wiki": {item["name"]: item["brief"].get("errors", []) for item in wiki_briefs},
+        "verify": {item["name"]: [] if item["brief"].get("ok", True) else [item["brief"].get("notes") or item["brief"].get("verdict")] for item in verification_briefs},
+    }
+
+    final_payload = {
+        "ok": bool(fixer.get("safe_to_write_final_report")),
+        "agent": "deep_lead_agent",
+        "session_id": session.get("session_id"),
+        "session_status": "completed" if fixer.get("safe_to_write_final_report") else "needs_revision",
+        "topic": topic,
+        "public_reasoning_summary": _build_public_reasoning_summary(plan),
+        "subagents_used": [
+            "web-realtime-1",
+            "web-realtime-2",
+            "web-realtime-3",
+            "wiki-context-1",
+            "wiki-context-2",
+            "wiki-context-3",
+            "verify-pass-1",
+            "verify-pass-2",
+            "verify-pass-3",
+            "final-fixer",
+        ] + (["image-media-researcher"] if include_images else []),
+        "brain_assignments": brain_assignments,
+        "team_layout": {
+            "web_scraping_agents": 3,
+            "wiki_scraping_agents": 3,
+            "verification_agents": 3,
+            "final_fixer_agents": 1,
+        },
+        "compact_claims": fixer.get("compact_claims", []),
+        "verified_sources": combined_verify.get("verified_sources", []),
+        "rejected_or_uncertain_sources": combined_verify.get("rejected_sources", []),
+        "source_quality_review": source_review,
+        "suggested_report_outline": _suggested_report_outline(plan),
+        "checkpoint_markdown": _build_checkpoint_markdown(
+            topic=topic,
+            plan=plan,
+            web_briefs=web_briefs,
+            wiki_briefs=wiki_briefs,
+            verification_briefs=verification_briefs,
+            official=official,
+            verify=combined_verify,
+            audit=fixer,
+            images=images,
+        ),
+        "remaining_tasks": fixer.get("remaining_tasks", []),
+        "query_plan": plan,
+        "official_sources": official.get("official_sources", []),
+        "background_notes": _combine_background_notes(wiki_briefs),
+        "audit": fixer,
+        "images": images,
+        "subagent_errors": subagent_errors,
+        "web_briefs": web_briefs,
+        "wiki_briefs": wiki_briefs,
+        "verification_briefs": verification_briefs,
+        "final_fixer": fixer,
+    }
+    _SUBAGENT_MANAGER.mark(
+        str(session.get("session_id")),
+        status=str(final_payload.get("session_status")),
+        extra={
+            "topic": topic,
+            "final_confidence": fixer.get("final_confidence"),
+            "remaining_tasks": fixer.get("remaining_tasks", []),
+        },
+    )
+    return final_payload
+
+
+def _run_native_deep_collect_agent(
+    server: BridgeMcpServer,
+    *,
+    session_id: str,
+    topic: str,
+    query_count: int,
+    include_official_hunt: bool,
+) -> dict[str, Any]:
+    session = _SUBAGENT_MANAGER.get(session_id)
+    plan = session.get("plan") if isinstance(session.get("plan"), dict) else _native_query_plan(topic)
+    search_agents = [
+        {
+            "name": "tavily-realtime-1",
+            "tool": "deep_tavily_agent",
+            "arguments": {"topic": topic, "focus": "latest developments, breaking updates, current status", "query_count": query_count},
+        },
+        {
+            "name": "tavily-realtime-2",
+            "tool": "deep_tavily_agent",
+            "arguments": {"topic": topic, "focus": "official schedule, current data, established reporting", "query_count": query_count},
+        },
+        {
+            "name": "serp-realtime-1",
+            "tool": "deep_serp_agent",
+            "arguments": {"topic": topic, "focus": "official sources, current coverage, top-tier reporting", "query_count": query_count},
+        },
+        {
+            "name": "serp-realtime-2",
+            "tool": "deep_serp_agent",
+            "arguments": {"topic": topic, "focus": "alternative coverage, disputed claims, conflicting summaries", "query_count": query_count},
+        },
+    ]
+    wiki_agents = [
+        {
+            "name": "wiki-context-1",
+            "tool": "deep_wiki_agent",
+            "arguments": {"topic": topic, "focus": "background, definitions, overview", "query_count": min(query_count, 4)},
+        },
+        {
+            "name": "wiki-context-2",
+            "tool": "deep_wiki_agent",
+            "arguments": {"topic": topic, "focus": "history, timeline anchors, key entities", "query_count": min(query_count, 4)},
+        },
+        {
+            "name": "wiki-context-3",
+            "tool": "deep_wiki_agent",
+            "arguments": {"topic": topic, "focus": "institutions, terminology, key people", "query_count": min(query_count, 4)},
+        },
+    ]
+    search_briefs = [
+        {"name": agent["name"], "brief": _run_deep_agent_brief(server, str(agent["tool"]), dict(agent["arguments"]))}
+        for agent in search_agents
+    ]
+    wiki_briefs = [
+        {"name": agent["name"], "brief": _run_deep_agent_brief(server, str(agent["tool"]), dict(agent["arguments"]))}
+        for agent in wiki_agents
+    ]
+    official = (
+        _build_official_source_brief(
+            topic,
+            *[item["brief"] for item in search_briefs],
+            *[item["brief"] for item in wiki_briefs],
+        )
+        if include_official_hunt
+        else {"official_sources": [], "warnings": []}
+    )
+    all_sources = _merge_candidate_sources(
+        *[item["brief"] for item in search_briefs],
+        *[item["brief"] for item in wiki_briefs],
+    )
+    selected_urls = _pick_best_urls(all_sources, target=6)
+    collect_markdown = _build_collection_markdown(
+        topic=topic,
+        plan=plan,
+        search_briefs=search_briefs,
+        wiki_briefs=wiki_briefs,
+        official=official,
+        selected_urls=selected_urls,
+    )
+    _SUBAGENT_MANAGER.mark(
+        session_id,
+        status="collected",
+        extra={
+            "topic": topic,
+            "plan": plan,
+            "search_briefs": search_briefs,
+            "wiki_briefs": wiki_briefs,
+            "official": official,
+            "all_sources": all_sources,
+            "selected_urls": selected_urls,
+            "collect_markdown": collect_markdown,
+            "temp_markdown_path": "temp/ad.md",
+        },
+    )
+    return {
+        "ok": True,
+        "agent": "deep_collect_agent",
+        "topic": topic,
+        "session_id": session_id,
+        "session_status": "collected",
+        "team_layout": {"tavily_agents": 2, "serpapi_agents": 2, "wikipedia_agents": 3},
+        "selected_urls": selected_urls,
+        "official_sources": official.get("official_sources", []),
+        "search_briefs": search_briefs,
+        "wiki_briefs": wiki_briefs,
+        "collect_markdown": collect_markdown,
+        "temp_markdown_path": "temp/ad.md",
+        "next_steps": [
+            "Write collect_markdown to temp/ad.md.",
+            "Call deep_review_agent with the same session_id.",
+        ],
+    }
+
+
+def _run_native_deep_review_agent(
+    server: BridgeMcpServer,
+    *,
+    session_id: str,
+    topic: str,
+    required_verified_sources: int,
+    include_images: bool,
+    selected_urls: list[str],
+    verify_timeout_seconds: int,
+) -> dict[str, Any]:
+    session = _SUBAGENT_MANAGER.get(session_id)
+    plan = session.get("plan") if isinstance(session.get("plan"), dict) else _native_query_plan(topic)
+    search_briefs = session.get("search_briefs") if isinstance(session.get("search_briefs"), list) else []
+    wiki_briefs = session.get("wiki_briefs") if isinstance(session.get("wiki_briefs"), list) else []
+    official = session.get("official") if isinstance(session.get("official"), dict) else {"official_sources": [], "warnings": []}
+    all_sources = session.get("all_sources") if isinstance(session.get("all_sources"), list) else []
+    if not all_sources:
+        all_sources = _merge_candidate_sources(
+            *[item.get("brief", {}) for item in search_briefs if isinstance(item, dict)],
+            *[item.get("brief", {}) for item in wiki_briefs if isinstance(item, dict)],
+        )
+    shortlisted_urls = selected_urls or session.get("selected_urls") or _pick_best_urls(all_sources, target=max(required_verified_sources + 1, 4))
+    shortlisted_urls = [str(url).strip() for url in shortlisted_urls if str(url).strip()][:6]
+    verification_agents = _build_verification_agents(
+        topic,
+        shortlisted_urls,
+        required_verified_sources,
+        verify_timeout_seconds=verify_timeout_seconds,
+    )
+    verification_briefs = [
+        {"name": agent["name"], "brief": _run_verify_or_stub(server, agent["arguments"])}
+        for agent in verification_agents
+    ]
+    combined_verify = _combine_verification_briefs(verification_briefs)
+    source_review = _build_source_quality_review(all_sources, combined_verify, official)
+    audit = _audit_native_research(plan, all_sources, combined_verify, official)
+    fixer = _apply_final_fixer(
+        topic=topic,
+        plan=plan,
+        claims=_build_compact_claims(
+            *[item.get("brief", {}) for item in search_briefs if isinstance(item, dict)],
+            *[item.get("brief", {}) for item in wiki_briefs if isinstance(item, dict)],
+            combined_verify,
+        ),
+        verify=combined_verify,
+        audit=audit,
+    )
+    images = _run_image_brief(server, topic) if include_images else None
+    reviewed_markdown = _build_checkpoint_markdown(
+        topic=topic,
+        plan=plan,
+        web_briefs=search_briefs,
+        wiki_briefs=wiki_briefs,
+        verification_briefs=verification_briefs,
+        official=official,
+        verify=combined_verify,
+        audit=fixer,
+        images=images,
+    )
+    final_handoff = _build_final_handoff(topic, fixer, combined_verify, source_review)
+    session_status = "completed" if fixer.get("safe_to_write_final_report") else "needs_revision"
+    _SUBAGENT_MANAGER.mark(
+        session_id,
+        status=session_status,
+        extra={
+            "verified_sources": combined_verify.get("verified_sources", []),
+            "rejected_or_uncertain_sources": combined_verify.get("rejected_sources", []),
+            "reviewed_markdown": reviewed_markdown,
+            "final_handoff": final_handoff,
+            "final_confidence": fixer.get("final_confidence"),
+            "remaining_tasks": fixer.get("remaining_tasks", []),
+        },
+    )
+    return {
+        "ok": bool(fixer.get("safe_to_write_final_report")),
+        "agent": "deep_review_agent",
+        "topic": topic,
+        "session_id": session_id,
+        "session_status": session_status,
+        "verified_sources": combined_verify.get("verified_sources", []),
+        "rejected_or_uncertain_sources": combined_verify.get("rejected_sources", []),
+        "source_quality_review": source_review,
+        "compact_claims": fixer.get("compact_claims", []),
+        "reviewed_markdown": reviewed_markdown,
+        "temp_markdown_path": "temp/ad.md",
+        "final_handoff": final_handoff,
+        "remaining_tasks": fixer.get("remaining_tasks", []),
+        "images": images,
+        "verification_briefs": verification_briefs,
+    }
+
+
+def _run_deep_agent_brief(server: BridgeMcpServer, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if name == "deep_verify_agent":
+        data = server._request("POST", "/api/tools/verify_sources", _deep_verify_arguments(arguments))
+        return _compact_verify_agent_result(data)
+
+    topic = str(arguments.get("topic") or arguments.get("query") or "").strip() or "the research topic"
+    focus = str(arguments.get("focus") or "").strip()
+    count = min(max(_int_argument(arguments.get("query_count"), 4), 1), 6)
+    queries = _deep_agent_queries(topic, focus, count=count, agent=name)
+    provider = {
+        "deep_tavily_agent": "tavily_search",
+        "deep_serp_agent": "serpapi_search",
+        "deep_wiki_agent": "wikipedia_search",
+    }[name]
+    collected: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for query in queries:
+        try:
+            payload = _deep_agent_payload(provider, query)
+            data = server._request("POST", f"/api/tools/{provider}", payload)
+            if data.get("ok") is False:
+                errors.append(f"{query}: {data.get('error') or data}")
+                continue
+            collected.extend(_compact_search_sources(provider, query, data))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{query}: {exc}")
+    return _compact_deep_agent_result(
+        agent=name,
+        provider=provider,
+        topic=topic,
+        focus=focus,
+        queries=queries,
+        sources=collected,
+        errors=errors,
     )
 
 
-def _claude_sdk_cli_path(sdk_module: Any) -> str | None:
-    package_file = getattr(sdk_module, "__file__", None)
-    if not package_file:
-        return None
-    bundled = os.path.join(os.path.dirname(str(package_file)), "_bundled", "claude.exe")
-    return bundled if os.path.exists(bundled) else None
+def _run_verify_brief(server: BridgeMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
+    data = server._request("POST", "/api/tools/verify_sources", _deep_verify_arguments(arguments))
+    return _compact_verify_agent_result(data)
+
+
+def _run_verify_or_stub(server: BridgeMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
+    urls = arguments.get("urls") or []
+    if not isinstance(urls, list) or not urls:
+        return {
+            "ok": False,
+            "agent": "deep_verify_agent",
+            "verdict": "not verified",
+            "verified_sources": [],
+            "rejected_sources": [],
+            "notes": "No URLs were assigned to this verification pass.",
+        }
+    return _run_verify_brief(server, arguments)
+
+
+def _build_verification_agents(
+    topic: str,
+    urls: list[str],
+    required_verified_sources: int,
+    *,
+    verify_timeout_seconds: int = 8,
+) -> list[dict[str, Any]]:
+    batches = _split_urls_for_review(urls, 3)
+    focuses = [
+        "strongest official and top-tier URLs",
+        "cross-check URLs for conflicting summaries",
+        "remaining URLs for weak evidence or stale claims",
+    ]
+    agents: list[dict[str, Any]] = []
+    for index in range(3):
+        agents.append(
+            {
+                "name": f"verify-pass-{index + 1}",
+                "arguments": {
+                    "claim": f"{topic} ({focuses[index]})",
+                    "urls": batches[index],
+                    "required_verified_sources": max(1, min(required_verified_sources, len(batches[index]) or 1)),
+                    "verify_timeout_seconds": verify_timeout_seconds,
+                },
+            }
+        )
+    return agents
+
+
+def _split_urls_for_review(urls: list[str], groups: int) -> list[list[str]]:
+    buckets: list[list[str]] = [[] for _ in range(groups)]
+    for index, url in enumerate(urls):
+        buckets[index % groups].append(url)
+    return buckets
+
+
+def _combine_verification_briefs(briefs: list[dict[str, Any]]) -> dict[str, Any]:
+    verified: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    notes: list[str] = []
+    seen_verified: set[str] = set()
+    seen_rejected: set[str] = set()
+    for item in briefs:
+        brief = item.get("brief", {})
+        for source in brief.get("verified_sources", []):
+            url = str(source.get("url") or "").strip()
+            if url and url not in seen_verified:
+                seen_verified.add(url)
+                verified.append(source)
+        for source in brief.get("rejected_sources", []):
+            url = str(source.get("url") or "").strip()
+            key = url or str(source)
+            if key not in seen_rejected:
+                seen_rejected.add(key)
+                rejected.append(source)
+        note = str(brief.get("notes") or brief.get("verdict") or "").strip()
+        if note:
+            notes.append(f"{item.get('name')}: {note}")
+    return {
+        "ok": bool(verified),
+        "agent": "deep_verify_agent",
+        "verdict": "verified" if verified else "not verified",
+        "verified_sources": verified,
+        "rejected_sources": rejected,
+        "notes": " | ".join(notes[:6]),
+    }
+
+
+def _combine_background_notes(wiki_briefs: list[dict[str, Any]]) -> list[str]:
+    notes: list[str] = []
+    seen: set[str] = set()
+    for item in wiki_briefs:
+        for note in _background_notes_from_brief(item.get("brief", {})):
+            key = note.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            notes.append(note)
+            if len(notes) >= 9:
+                return notes
+    return notes
+
+
+def _apply_final_fixer(
+    *,
+    topic: str,
+    plan: dict[str, Any],
+    claims: list[dict[str, Any]],
+    verify: dict[str, Any],
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    verified_urls = {str(item.get("url") or "").strip() for item in verify.get("verified_sources", [])}
+    fixed_claims = [
+        claim
+        for claim in claims
+        if str(claim.get("supporting_url") or "").strip() in verified_urls or not verified_urls
+    ]
+    final_confidence = "High" if audit.get("safe_to_write_final_report") else ("Medium" if verify.get("verified_sources") else "Low")
+    return {
+        "audit_result": audit.get("audit_result"),
+        "issues_found": audit.get("issues_found", []),
+        "safe_to_write_final_report": audit.get("safe_to_write_final_report", False),
+        "remaining_tasks": audit.get("remaining_tasks", []),
+        "topic_type": plan.get("topic_type"),
+        "final_confidence": final_confidence,
+        "compact_claims": fixed_claims,
+        "fixer_note": f"Final fixer reviewed 3 verification passes and removed unsupported or weakly backed claims for {topic}.",
+    }
+
+
+def _run_image_brief(server: BridgeMcpServer, topic: str) -> dict[str, Any] | None:
+    try:
+        data = server._request("POST", "/api/tools/image_research", {"query": topic, "max_results": 3})
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    payload = _unwrap_tool_payload(data)
+    results = payload.get("results") if isinstance(payload.get("results"), list) else payload.get("images")
+    if not isinstance(results, list):
+        results = []
+    images: list[dict[str, Any]] = []
+    for item in results[:3]:
+        if not isinstance(item, dict):
+            continue
+        images.append(
+            {
+                "title": _compact_text(item.get("title") or item.get("caption") or "image", 120),
+                "url": str(item.get("url") or item.get("image_url") or ""),
+                "source": _compact_text(item.get("source") or item.get("domain") or "", 80),
+            }
+        )
+    return {"results": images}
+
+
+def _native_query_plan(topic: str) -> dict[str, Any]:
+    lowered = topic.lower()
+    topic_type = "general background topic"
+    if any(word in lowered for word in ("election", "vote", "party", "assembly", "minister", "parliament")):
+        topic_type = "political/election topic"
+    elif any(word in lowered for word in ("law", "court", "regulation", "policy", "bill", "legal")):
+        topic_type = "legal/regulatory topic"
+    elif any(word in lowered for word in ("market", "stock", "revenue", "profit", "economy", "financial")):
+        topic_type = "financial/economic topic"
+    elif any(word in lowered for word in ("battery", "ai", "model", "software", "technical", "science")):
+        topic_type = "technical/scientific topic"
+    elif any(word in lowered for word in ("health", "medical", "coffee", "disease", "drug")):
+        topic_type = "health/medical topic"
+    freshness = (
+        ["latest status", "recent changes", "current official numbers"]
+        if any(word in lowered for word in ("latest", "current", "today", "2025", "2026", "recent", "now"))
+        or topic_type in {"political/election topic", "financial/economic topic"}
+        else []
+    )
+    return {
+        "topic": topic,
+        "topic_type": topic_type,
+        "main_questions": [
+            f"What are the key verified facts about {topic}?",
+            f"What official or primary sources exist for {topic}?",
+            f"What current developments or disputed points matter for {topic}?",
+        ],
+        "official_source_targets": [
+            "government or regulator pages",
+            "primary organization announcements or filings",
+            "official datasets, papers, or dashboards",
+        ],
+        "freshness_needs": freshness,
+        "data_needs": ["exact figures", "dates", "units", "final vs provisional status"],
+        "background_terms": [topic, f"{topic} background", f"{topic} timeline"],
+        "possible_conflicts": [
+            "secondary sources may summarize numbers differently from official pages",
+            "background pages may lag current developments",
+        ],
+        "verification_questions": [
+            "Does the cited page directly support the claim?",
+            "Is the source official, primary, or top-tier?",
+            "Is the information current enough for the topic?",
+        ],
+    }
+
+
+def _merge_candidate_sources(*briefs: dict[str, Any]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for brief in briefs:
+        for source in brief.get("candidate_sources", []):
+            if not isinstance(source, dict):
+                continue
+            key = str(source.get("url") or source.get("title") or "").lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(source)
+    merged.sort(key=lambda item: _source_quality_rank(str(item.get("source_quality") or "")))
+    return merged
+
+
+def _pick_best_urls(sources: list[dict[str, Any]], *, target: int) -> list[str]:
+    urls: list[str] = []
+    for quality in ("primary/official", "scholarly/domain-authority", "top-tier-news", "needs-review"):
+        for source in sources:
+            if str(source.get("source_quality") or "") != quality:
+                continue
+            url = str(source.get("url") or "").strip()
+            if url and url not in urls:
+                urls.append(url)
+            if len(urls) >= target:
+                return urls
+    return urls
+
+
+def _build_official_source_brief(topic: str, *briefs: dict[str, Any]) -> dict[str, Any]:
+    official_sources: list[dict[str, Any]] = []
+    for source in _merge_candidate_sources(*briefs):
+        if str(source.get("source_quality") or "") != "primary/official":
+            continue
+        official_sources.append(
+            {
+                "title": source.get("title"),
+                "url": source.get("url"),
+                "what_it_proves": _compact_text(source.get("evidence"), 180),
+                "date_checked": "current session",
+                "source_strength": "Strong",
+            }
+        )
+    return {
+        "official_sources": official_sources[:6],
+        "missing_official_sources": [] if official_sources else [f"No clear official source found yet for {topic}"],
+        "warnings": [] if official_sources else ["Core claims may rely on top-tier secondary reporting until official pages are found."],
+    }
+
+
+def _build_source_quality_review(
+    sources: list[dict[str, Any]],
+    verify: dict[str, Any],
+    official: dict[str, Any],
+) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    for source in sources:
+        quality = str(source.get("source_quality") or "needs-review")
+        counts[quality] = counts.get(quality, 0) + 1
+    return {
+        "counts": counts,
+        "official_source_count": len(official.get("official_sources", [])),
+        "verified_source_count": len(verify.get("verified_sources", [])),
+        "rejected_source_count": len(verify.get("rejected_sources", [])),
+    }
+
+
+def _audit_native_research(
+    plan: dict[str, Any],
+    sources: list[dict[str, Any]],
+    verify: dict[str, Any],
+    official: dict[str, Any],
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    if not official.get("official_sources"):
+        issues.append(
+            {
+                "issue": "No official or primary source identified for the strongest claims.",
+                "severity": "High",
+                "fix": "Run another official-source hunt or lower confidence in the final report.",
+            }
+        )
+    if len(verify.get("verified_sources", [])) < 2:
+        issues.append(
+            {
+                "issue": "Too few verified sources for a strong final report.",
+                "severity": "High",
+                "fix": "Select more strong URLs and verify them before synthesis.",
+            }
+        )
+    if not sources:
+        issues.append(
+            {
+                "issue": "No candidate sources were collected.",
+                "severity": "High",
+                "fix": "Re-run the search subagents with broader queries.",
+            }
+        )
+    return {
+        "audit_result": "Pass" if not issues else "Needs revision",
+        "issues_found": issues,
+        "safe_to_write_final_report": not issues,
+        "remaining_tasks": [item["fix"] for item in issues],
+        "topic_type": plan.get("topic_type"),
+    }
+
+
+def _build_public_reasoning_summary(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan": [
+            "Classify the topic and identify freshness risk.",
+            "Search official or primary sources first.",
+            "Compare reputable secondary sources.",
+            "Verify key URLs, then audit contradictions.",
+        ],
+        "evidence_standard": [
+            "Official or primary sources for key facts whenever available.",
+            "Top-tier news for developments and reactions.",
+            "Background sources for context only.",
+        ],
+        "verification_result": {
+            "topic_type": plan.get("topic_type"),
+            "freshness_needs": plan.get("freshness_needs", []),
+        },
+    }
+
+
+def _subagent_brain_assignments(agent_names: list[str]) -> list[dict[str, Any]]:
+    return _SUBAGENT_MANAGER._select_assignments(agent_names)
+
+
+def _subagent_role(agent_name: str) -> str:
+    lowered = agent_name.lower()
+    if lowered.startswith("web-"):
+        return "web"
+    if lowered.startswith("wiki-"):
+        return "wiki"
+    if lowered.startswith("verify-"):
+        return "verify"
+    if "fixer" in lowered:
+        return "fixer"
+    return "general"
+
+
+def _provider_model_pool(config: Any) -> list[dict[str, Any]]:
+    pool: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for alias_name, alias in config.anthropic_models.items():
+        provider = config.providers.get(alias.provider)
+        if provider is None:
+            continue
+        model = alias.model or provider.default_model or ""
+        if not _provider_is_usable(provider, model):
+            continue
+        key = (provider.name, model, alias_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        pool.append(_provider_pool_entry(provider, model, alias_name))
+    for provider in config.providers.values():
+        model = provider.default_model or ""
+        if not _provider_is_usable(provider, model):
+            continue
+        key = (provider.name, model, None)
+        if key in seen:
+            continue
+        seen.add(key)
+        pool.append(_provider_pool_entry(provider, model, None))
+    return pool
+
+
+def _provider_is_usable(provider: Any, model: str) -> bool:
+    if not model:
+        return False
+    api_key = str(getattr(provider, "api_key", "") or "")
+    is_local = str(getattr(provider, "base_url", "") or "").startswith("http://127.0.0.1") or str(getattr(provider, "base_url", "") or "").startswith("http://localhost")
+    if api_key and api_key.startswith("${"):
+        return False
+    if not api_key and not is_local:
+        return False
+    return _provider_limit_headroom(provider) > 0.0
+
+
+def _provider_limit_headroom(provider: Any) -> float:
+    limits = getattr(provider, "usage_limits", {}) or {}
+    scores: list[float] = []
+    for entry in limits.values():
+        if not isinstance(entry, dict):
+            continue
+        limit = entry.get("limit")
+        used = entry.get("used", 0)
+        try:
+            limit_value = float(limit)
+            used_value = float(used)
+        except (TypeError, ValueError):
+            continue
+        if limit_value <= 0:
+            continue
+        scores.append(max(0.0, (limit_value - used_value) / limit_value))
+    return min(scores) if scores else 1.0
+
+
+def _provider_pool_entry(provider: Any, model: str, alias_name: str | None) -> dict[str, Any]:
+    return {
+        "provider": provider.name,
+        "model": model,
+        "alias": alias_name,
+        "provider_type": provider.type,
+        "base_url": provider.base_url,
+        "supports_tools": bool(getattr(provider, "supports_tools", True)),
+        "headroom": _provider_limit_headroom(provider),
+        "local": str(provider.base_url).startswith("http://127.0.0.1") or str(provider.base_url).startswith("http://localhost"),
+    }
+
+
+def _rank_provider_candidates(pool: list[dict[str, Any]], *, role: str, used_counts: dict[str, int]) -> list[dict[str, Any]]:
+    preferences = {
+        "web": {"haiku", "small_fast", "sonnet"},
+        "wiki": {"haiku", "small_fast", "sonnet"},
+        "verify": {"sonnet", "opus", "haiku"},
+        "fixer": {"opus", "sonnet", "haiku"},
+        "general": {"sonnet", "haiku", "opus"},
+    }
+    preferred_aliases = preferences.get(role, preferences["general"])
+
+    def rank(item: dict[str, Any]) -> tuple[int, float, int, int]:
+        alias = str(item.get("alias") or "")
+        alias_penalty = 0 if alias in preferred_aliases else 1
+        key = f"{item.get('provider')}::{item.get('model')}"
+        used_penalty = used_counts.get(key, 0)
+        headroom_score = -float(item.get("headroom") or 0.0)
+        local_penalty = 0 if item.get("local") else 1
+        return (alias_penalty, headroom_score, used_penalty, local_penalty)
+
+    return sorted(pool, key=rank)
+
+
+def _build_compact_claims(*briefs: dict[str, Any]) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for brief in briefs:
+        for item in brief.get("compact_claims", []):
+            if not isinstance(item, dict):
+                continue
+            claim = _compact_text(item.get("claim"), 220)
+            if not claim or claim.lower() in seen:
+                continue
+            seen.add(claim.lower())
+            claims.append(
+                {
+                    "claim": claim,
+                    "supporting_url": item.get("supporting_url"),
+                    "source": item.get("source"),
+                }
+            )
+            if len(claims) >= 12:
+                return claims
+    return claims
+
+
+def _background_notes_from_brief(brief: dict[str, Any]) -> list[str]:
+    notes: list[str] = []
+    for item in brief.get("compact_claims", []):
+        if not isinstance(item, dict):
+            continue
+        claim = _compact_text(item.get("claim"), 220)
+        if claim:
+            notes.append(claim)
+        if len(notes) >= 6:
+            break
+    return notes
+
+
+def _suggested_report_outline(plan: dict[str, Any]) -> list[str]:
+    return [
+        "Information Last Checked",
+        "Executive Summary",
+        "Background",
+        "Key Verified Facts",
+        "Data and Statistics",
+        "Detailed Analysis",
+        "Stakeholders",
+        "Timeline",
+        "Controversies and Uncertainties",
+        "Source Quality Review",
+        "Conclusion",
+        f"Confidence Rating ({plan.get('topic_type', 'general topic')})",
+    ]
+
+
+def _build_checkpoint_markdown(
+    *,
+    topic: str,
+    plan: dict[str, Any],
+    web_briefs: list[dict[str, Any]],
+    wiki_briefs: list[dict[str, Any]],
+    verification_briefs: list[dict[str, Any]],
+    official: dict[str, Any],
+    verify: dict[str, Any],
+    audit: dict[str, Any],
+    images: dict[str, Any] | None,
+) -> str:
+    lines = [
+        f"# Deep Research Checkpoint: {topic}",
+        "",
+        "## Completed",
+        "- Query plan created",
+        "- 3 web scraping briefs collected",
+        "- 3 wiki scraping briefs collected",
+        "- 3 verification passes completed",
+        "- Final fixer pass completed",
+        "",
+        "## Web Subagents",
+    ]
+    for item in web_briefs:
+        lines.append(f"- {item.get('name')}: {len((item.get('brief') or {}).get('compact_claims', []))} claims")
+    lines.extend([
+        "",
+        "## Wiki Subagents",
+    ])
+    for item in wiki_briefs:
+        lines.append(f"- {item.get('name')}: {len((item.get('brief') or {}).get('compact_claims', []))} notes")
+    lines.extend([
+        "",
+        "## Verification Subagents",
+    ])
+    for item in verification_briefs:
+        brief = item.get("brief") or {}
+        lines.append(f"- {item.get('name')}: {brief.get('verdict')}")
+    lines.extend([
+        "",
+        "## Selected URLs",
+    ])
+    for item in verify.get("verified_sources", [])[:6]:
+        lines.append(f"- {item.get('url')}")
+    lines.extend(["", "## Official Sources"])
+    for item in official.get("official_sources", [])[:5]:
+        lines.append(f"- {item.get('title')}: {item.get('url')}")
+    lines.extend(["", "## Remaining Tasks"])
+    tasks = audit.get("remaining_tasks", [])
+    if tasks:
+        lines.extend([f"- {task}" for task in tasks])
+    else:
+        lines.append("- None")
+    if images and images.get("results"):
+        lines.extend(["", "## Image Candidates"])
+        for item in images.get("results", []):
+            lines.append(f"- {item.get('title')}: {item.get('url')}")
+    return "\n".join(lines)
+
+
+def _build_collection_markdown(
+    *,
+    topic: str,
+    plan: dict[str, Any],
+    search_briefs: list[dict[str, Any]],
+    wiki_briefs: list[dict[str, Any]],
+    official: dict[str, Any],
+    selected_urls: list[str],
+) -> str:
+    lines = [
+        f"# Ad Draft: {topic}",
+        "",
+        "## Status",
+        "- Collection complete",
+        "- Review pending",
+        "",
+        "## Main Questions",
+    ]
+    lines.extend(f"- {item}" for item in plan.get("main_questions", []))
+    lines.extend(["", "## Search Subagents"])
+    for item in search_briefs:
+        brief = item.get("brief") or {}
+        lines.append(f"- {item.get('name')}: {len(brief.get('compact_claims', []))} compact claims")
+    lines.extend(["", "## Wiki Subagents"])
+    for item in wiki_briefs:
+        brief = item.get("brief") or {}
+        lines.append(f"- {item.get('name')}: {len(brief.get('compact_claims', []))} background notes")
+    lines.extend(["", "## Official Sources"])
+    official_sources = official.get("official_sources", [])
+    if official_sources:
+        for source in official_sources[:5]:
+            lines.append(f"- {source.get('title')}: {source.get('url')}")
+    else:
+        lines.append("- None clearly identified yet")
+    lines.extend(["", "## Review Shortlist"])
+    for url in selected_urls[:6]:
+        lines.append(f"- {url}")
+    lines.extend([
+        "",
+        "## Next Step",
+        "- Run deep_review_agent, then replace this file with the reviewed markdown.",
+    ])
+    return "\n".join(lines)
+
+
+def _build_final_handoff(
+    topic: str,
+    fixer: dict[str, Any],
+    verify: dict[str, Any],
+    source_review: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "topic": topic,
+        "ready_for_main_ai": bool(fixer.get("safe_to_write_final_report")),
+        "final_confidence": fixer.get("final_confidence"),
+        "compact_claims": fixer.get("compact_claims", []),
+        "verified_sources": verify.get("verified_sources", []),
+        "source_quality_review": source_review,
+        "remaining_tasks": fixer.get("remaining_tasks", []),
+        "instruction": (
+            "Use the reviewed markdown and verified sources to write the final report.md. "
+            "Clearly label uncertain claims and keep citations close to the claim they support."
+        ),
+    }
 
 
 def _deep_agent_queries(topic: str, focus: str, *, count: int, agent: str) -> list[str]:
@@ -576,20 +1862,20 @@ def _deep_agent_queries(topic: str, focus: str, *, count: int, agent: str) -> li
     elif agent == "deep_serp_agent":
         candidates = [
             f"{topic}{focus_text}",
-            f"{topic} official results schedule data",
-            f"{topic} latest news controversy analysis",
-            f"{topic} key actors candidates parties",
-            f"{topic} forecasts polling predictions",
+            f"{topic} official primary source results schedule data",
+            f"{topic} Reuters AP BBC Bloomberg latest news analysis",
+            f"{topic} major news channel newspaper key actors candidates parties",
+            f"{topic} forecasts polling predictions official source top news",
             f"{topic} source verification primary sources",
         ]
     else:
         candidates = [
             f"{topic}{focus_text}",
-            f"{topic} latest current landscape",
-            f"{topic} key candidates parties issues",
-            f"{topic} polling predictions forecasts",
-            f"{topic} official schedule election commission",
-            f"{topic} analysis background context",
+            f"{topic} latest current landscape Reuters AP BBC top news",
+            f"{topic} key candidates parties issues major news official",
+            f"{topic} polling predictions forecasts official primary source",
+            f"{topic} official schedule election commission government source",
+            f"{topic} analysis background context established news",
         ]
     queries: list[str] = []
     seen: set[str] = set()
@@ -620,15 +1906,35 @@ def _deep_verify_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         "urls": [str(url) for url in urls[:8] if str(url).strip()],
         "claim": str(arguments.get("claim") or arguments.get("topic") or "the researched claim"),
         "required_verified_sources": min(max(_int_argument(arguments.get("required_verified_sources"), 3), 1), 6),
+        "verify_timeout_seconds": min(max(_int_argument(arguments.get("verify_timeout_seconds"), 8), 4), 20),
     }
+
+
+def _deep_session_id(arguments: dict[str, Any], topic: str) -> str:
+    session_id = str(arguments.get("session_id") or "").strip()
+    if session_id:
+        return session_id
+    session = _SUBAGENT_MANAGER.spawn(
+        topic,
+        [
+            "tavily-realtime-1",
+            "tavily-realtime-2",
+            "serp-realtime-1",
+            "serp-realtime-2",
+            "wiki-context-1",
+            "wiki-context-2",
+            "review-verifier",
+            "markdown-reviewer",
+            "final-handoff",
+        ],
+    )
+    return str(session.get("session_id"))
 
 
 def _compact_search_sources(provider: str, query: str, data: dict[str, Any]) -> list[dict[str, Any]]:
     payload = _unwrap_tool_payload(data)
     if provider == "serpapi_search":
         items = payload.get("organic_results") or payload.get("results") or []
-    elif provider == "wikipedia_search":
-        items = payload.get("results") or []
     else:
         items = payload.get("results") or []
     if not isinstance(items, list):
@@ -689,8 +1995,8 @@ def _compact_deep_agent_result(
             continue
         seen.add(key)
         deduped.append(source)
-        if len(deduped) >= 12:
-            break
+    deduped.sort(key=lambda source: _source_quality_rank(str(source.get("source_quality") or "")))
+    deduped = deduped[:12]
     claims = [
         {
             "claim": _compact_text(source.get("evidence"), 260),
@@ -766,13 +2072,106 @@ def _compact_text(value: Any, max_length: int) -> str:
 
 def _source_quality(url: str) -> str:
     lowered = url.lower()
-    if any(domain in lowered for domain in ("eci.gov.in", "pib.gov.in", ".gov", "parliament", "data.gov")):
+    official_markers = (
+        ".gov",
+        ".gov.",
+        ".edu",
+        ".ac.",
+        ".mil",
+        ".int",
+        "eci.gov.in",
+        "pib.gov.in",
+        "parliament",
+        "data.gov",
+        "who.int",
+        "un.org",
+        "worldbank.org",
+        "imf.org",
+        "oecd.org",
+        "sec.gov",
+        "rbi.org.in",
+        "isro.gov.in",
+        "nasa.gov",
+    )
+    top_news_markers = (
+        "reuters.com",
+        "apnews.com",
+        "bbc.",
+        "bloomberg.com",
+        "ft.com",
+        "financialtimes.com",
+        "wsj.com",
+        "nytimes.com",
+        "washingtonpost.com",
+        "theguardian.com",
+        "cnn.com",
+        "cnbc.com",
+        "aljazeera.com",
+        "economist.com",
+        "npr.org",
+        "pbs.org",
+        "abcnews.go.com",
+        "cbsnews.com",
+        "nbcnews.com",
+        "thehindu.com",
+        "indianexpress.com",
+        "hindustantimes.com",
+        "livemint.com",
+        "frontline.thehindu.com",
+        "ndtv.com",
+        "thewire.in",
+    )
+    scholarly_markers = (
+        "nature.com",
+        "science.org",
+        "nejm.org",
+        "thelancet.com",
+        "pubmed.ncbi.nlm.nih.gov",
+        "ncbi.nlm.nih.gov",
+        "arxiv.org",
+        "doi.org",
+        "jstor.org",
+        "ieee.org",
+        "acm.org",
+        "springer.com",
+        "wiley.com",
+        "sciencedirect.com",
+    )
+    weak_markers = (
+        "blogspot.",
+        "medium.com",
+        "substack.com",
+        "wordpress.",
+        "quora.com",
+        "reddit.com",
+        "pinterest.",
+        "fandom.com",
+    )
+    if any(domain in lowered for domain in official_markers):
         return "primary/official"
-    if any(domain in lowered for domain in ("reuters", "apnews", "bbc", "thehindu", "indianexpress", "theguardian", "frontline")):
-        return "established-news"
+    if any(domain in lowered for domain in scholarly_markers):
+        return "scholarly/domain-authority"
+    if any(domain in lowered for domain in top_news_markers):
+        return "top-tier-news"
     if "wikipedia.org" in lowered:
         return "encyclopedia-background"
+    if any(domain in lowered for domain in weak_markers):
+        return "weak-lead/random-web"
     return "needs-review"
+
+
+def _source_quality_rank(source_quality: str) -> int:
+    order = {
+        "primary/official": 0,
+        "scholarly/domain-authority": 1,
+        "top-tier-news": 2,
+        "established-news": 3,
+        "encyclopedia-background": 4,
+        "provider-summary": 5,
+        "needs-review": 6,
+        "weak-lead/random-web": 7,
+    }
+    return order.get(source_quality, 6)
 
 
 def _int_argument(value: Any, default: int) -> int:
@@ -798,14 +2197,13 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
             },
             "minimum_work": {
                 "subagent_calls": [
-                    "deep_claude_agent",
-                    "deep_tavily_agent",
-                    "deep_serp_agent",
-                    "deep_wiki_agent",
-                    "deep_verify_agent",
+                    "deep_plan_agent",
+                    "deep_collect_agent",
+                    "deep_review_agent",
                 ],
-                "tavily_queries_inside_subagent": 5,
-                "serpapi_queries_inside_subagent": 5,
+                "tavily_collection_agents": 2,
+                "serpapi_collection_agents": 2,
+                "wikipedia_collection_agents": 3,
                 "verified_urls": 4,
                 "required_file": "report.md",
                 "rule": "Do not paste raw search result dumps into the main context. Use compact sub-agent briefs and write checkpoints before synthesis.",
@@ -813,41 +2211,35 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
             "steps": [
                 {
                     "name": "plan",
-                    "action": "Create todos for: try Claude Agent SDK lead/subagents, fall back to compact Tavily/SerpAPI/Wikipedia sub-agent tools if needed, verify selected URLs, write checkpoint, synthesize report.md, mark all complete.",
+                    "action": "Create todos for: run deep_plan_agent, run deep_collect_agent with exactly 2 Tavily + 2 SerpAPI + 3 Wikipedia collection agents, write temp/ad.md, run deep_review_agent, update temp/ad.md, then write report.md.",
                 },
                 {
-                    "name": "claude_agent_sdk_lead",
-                    "tool": "llama_bridge_tools__deep_claude_agent",
-                    "arguments": {"topic": query, "max_turns": 12},
-                    "returns": "Compact handoff from a Claude Agent SDK lead agent that delegates to specialist subagents. Use this when ANTHROPIC_API_KEY and claude-agent-sdk are configured.",
-                    "fallback": "If unavailable, call the compact provider-specific sub-agent tools below.",
-                },
-                {
-                    "name": "tavily_specialist",
-                    "tool": "llama_bridge_tools__deep_tavily_agent",
-                    "arguments": {"topic": query, "focus": "latest news, current landscape, predictions, official schedule", "query_count": 5},
-                    "returns": "Compact sources, claims, URLs, and caveats only.",
-                },
-                {
-                    "name": "serpapi_specialist",
-                    "tool": "llama_bridge_tools__deep_serp_agent",
-                    "arguments": {"topic": query, "focus": "official results, major news, controversies, source diversity", "query_count": 5},
-                    "returns": "Compact sources, claims, URLs, and caveats only.",
-                },
-                {
-                    "name": "wiki_specialist",
-                    "tool": "llama_bridge_tools__deep_wiki_agent",
-                    "arguments": {"topic": query, "focus": "background, historical context, key entities", "query_count": 3},
-                    "returns": "Compact encyclopedia context only.",
-                },
-                {
-                    "name": "verify_batch",
-                    "tool": "llama_bridge_tools__deep_verify_agent",
-                    "arguments_template": {
-                        "urls": "Pick at least 4 strongest URLs from the compact sub-agent briefs.",
-                        "claim": query,
+                    "name": "native_plan_controller",
+                    "tool": "llama_bridge_tools__deep_plan_agent",
+                    "arguments": {
+                        "topic": query,
+                        "query_count": 4,
                         "required_verified_sources": 4,
+                        "include_official_hunt": True,
                     },
+                    "returns": "Session id, fixed team layout, and staged next steps.",
+                },
+                {
+                    "name": "collection_stage",
+                    "tool": "llama_bridge_tools__deep_collect_agent",
+                    "arguments": {"topic": query, "query_count": 4, "include_official_hunt": True},
+                    "returns": "Compact collected evidence plus collect_markdown for temp/ad.md.",
+                },
+                {
+                    "name": "review_stage",
+                    "tool": "llama_bridge_tools__deep_review_agent",
+                    "arguments_template": {
+                        "session_id": "Use the session_id from deep_plan_agent/deep_collect_agent.",
+                        "topic": query,
+                        "required_verified_sources": 4,
+                        "verify_timeout_seconds": 8,
+                    },
+                    "returns": "Reviewed markdown for temp/ad.md plus final handoff for the main AI.",
                 },
                 {
                     "name": "optional_images",
@@ -878,8 +2270,11 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
             ],
             "instructions": [
                 "Use planning mode or todos first and keep them updated.",
-                "Prefer llama_bridge_tools__deep_claude_agent so Claude Agent SDK handles delegation with real subagents.",
-                "If the Claude SDK tool is unavailable, the main brain must delegate evidence collection to specialist sub-agent tools instead of running raw provider searches itself.",
+                "Use llama_bridge_tools__deep_plan_agent first in Poolside deep mode.",
+                "Run llama_bridge_tools__deep_collect_agent next, and keep that collection stage fixed at 2 Tavily agents, 2 SerpAPI agents, and 3 Wikipedia agents.",
+                "Write temp/ad.md after collection, then continue with llama_bridge_tools__deep_review_agent instead of restarting the whole deep flow.",
+                "Assign subagent brains systematically from the provider/model entries saved in env.yml, rotating through available aliases and provider defaults in round-robin order.",
+                "Use the compact specialist sub-agent tools to extend or cross-check the staged outputs instead of running raw provider searches directly.",
                 "Sub-agents return compact evidence briefs; the main brain should keep only claims, URLs, source quality, and caveats.",
                 "Avoid llama_bridge_tools__source_research for Poolside deep mode because it can exceed ACP tool timeouts.",
                 "Create a checkpoint before synthesis so work can continue automatically after context compaction.",
@@ -971,9 +2366,9 @@ def _prompt_response(name: str, params: dict[str, Any]) -> dict[str, Any]:
         ),
         "deep": (
             "Auto-switch to Plan behavior and create todos first. Then run deep research in small "
-            "steps: call tavily_search at least 5 times with varied query angles, call "
-            "serpapi_search at least 5 times with varied query angles, choose at least 4 strong "
-            "URLs, verify them with verify_sources, optionally call image_research, write "
+            "steps: call deep_plan_agent first, then deep_collect_agent, then write temp/ad.md, then call deep_review_agent, then overwrite temp/ad.md with the reviewed markdown; "
+            "use deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent only when you need to extend "
+            "or cross-check those staged outputs; choose at least 4 strong URLs from the briefs, optionally call image_research, write "
             "report.md in the current working directory, mark all todos complete, and only then "
             f"give the final response. Avoid one long source_research call in Poolside. Topic: {text}"
         ),

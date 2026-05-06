@@ -1,6 +1,6 @@
 ---
 name: llama-bridge-tools
-description: Use when Claude Code needs current web search, source research, image research, weather, Wikipedia, or date/time lookups through the local llama bridge MCP tools.
+description: Use when Claude Code needs llama bridge MCP tools for staged deep research, current web search, source verification, image research, weather, Wikipedia, or date/time lookups.
 ---
 
 # Llama Bridge Tools
@@ -11,6 +11,10 @@ lookups.
 
 Prefer the highest-level bridge tool that fits the task:
 
+- For deep research, use the staged flow: `deep_plan_agent`, then
+  `deep_collect_agent`, then save `temp/ad.md`, then `deep_review_agent`,
+  then write the final `report.md`.
+  Keep the collection stage fixed at 2 Tavily agents, 2 SerpAPI agents, and 3 Wikipedia agents.
 - `source_research` for cited factual research and evidence gathering.
 - `image_research` for compact sourced image candidates.
 - `tavily_search` or `serpapi_search` for current web results.

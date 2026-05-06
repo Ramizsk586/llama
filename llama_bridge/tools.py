@@ -105,7 +105,6 @@ class ToolDefinition:
 
 def _extract_first_sentence(text: str) -> str:
     """Extract the first sentence from a tool description."""
-    import re
     # Look for "USE WHEN:" section and extract text before it
     use_when_match = re.search(r"USE WHEN:", text, re.IGNORECASE)
     if use_when_match:
@@ -123,7 +122,6 @@ def _extract_first_sentence(text: str) -> str:
 
 def _extract_use_when(description: str) -> list[str]:
     """Extract USE WHEN keywords from tool description."""
-    import re
     match = re.search(r"USE WHEN:\s*(.+?)(?:\n|$)", description, re.IGNORECASE)
     if not match:
         return []
@@ -743,10 +741,10 @@ class ToolRegistry:
             ToolDefinition(
                 name="image_research",
                 description=(
-                    "Find images for markdown/report generation using Tavily image results and SerpAPI image search.\n"
-                    "USE WHEN: The model needs image URLs with provenance for a .md file, article, report, product/place/person page, or visual comparison.\n"
+                    "Find images for markdown/report generation using Wikipedia/Wikimedia, Tavily image results, and SerpAPI image search.\n"
+                    "USE WHEN: The model needs image URLs or local downloadable Wikipedia images with provenance for a .md file, article, report, product/place/person page, or visual comparison.\n"
                     "GUARDRAILS: Do not invent image URLs. Use returned image_url/thumbnail/source_url only. Prefer images with a source page and cite that page near the image in markdown.\n"
-                    "RESULT FORMAT: Image candidates with title, image URL, thumbnail, source page, provider, and markdown embed examples."
+                    "RESULT FORMAT: Image candidates with title, image URL, optional local_path for downloaded Wikipedia images, thumbnail, source page, provider, and markdown embed examples."
                 ),
                 parameters={
                     "type": "object",
@@ -966,6 +964,8 @@ class ToolRegistry:
             "extract": data.get("extract"),
             "url": (data.get("content_urls") or {}).get("desktop", {}).get("page"),
             "language": language,
+            "image_url": (data.get("originalimage") or {}).get("source"),
+            "thumbnail": (data.get("thumbnail") or {}).get("source"),
         }
 
     async def _weather_current(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1224,6 +1224,22 @@ class ToolRegistry:
         max_results = _bounded_int(arguments.get("max_results"), default=3, minimum=1, maximum=3)
         gathered: list[dict[str, Any] | Exception] = []
         fallback_used = False
+        wikipedia_used = False
+        if self.config.tools.wikipedia.enabled:
+            wiki_result = await asyncio.gather(
+                self._research_wikipedia_images(query, max_results),
+                return_exceptions=True,
+            )
+            gathered.extend(wiki_result)
+            wiki_images = _dedupe_images(
+                [
+                    image
+                    for item in wiki_result
+                    if isinstance(item, dict)
+                    for image in item.get("images", [])
+                ]
+            )
+            wikipedia_used = bool(wiki_images)
         if self.config.tools.tavily.enabled:
             tavily_result = await asyncio.gather(
                 self._research_tavily(
@@ -1244,7 +1260,7 @@ class ToolRegistry:
                     for image in item.get("images", [])
                 ]
             )
-            fallback_used = not tavily_images
+            fallback_used = not tavily_images and not wikipedia_used
 
         if self.config.tools.serpapi.enabled:
             if fallback_used or not self.config.tools.tavily.enabled:
@@ -1275,6 +1291,7 @@ class ToolRegistry:
             "guardrails": [
                 "Do not invent image URLs.",
                 "Use image_url or thumbnail exactly as returned.",
+                "When a Wikipedia image has local_path, prefer that local file in markdown embeds.",
                 "Prefer candidates with source_url, and cite source_url near the image in markdown.",
                 "If no image has a source_url, say image provenance is weak.",
                 "Use only 2-3 compact images in markdown reports.",
@@ -1284,9 +1301,10 @@ class ToolRegistry:
                 "Use SerpAPI image search as a fallback when the preferred image provider fails or returns no images.",
             ],
             "provider_policy": {
-                "preferred": "tavily_images" if self.config.tools.tavily.enabled else "serpapi_images",
+                "preferred": "wikipedia_images" if wikipedia_used else ("tavily_images" if self.config.tools.tavily.enabled else "serpapi_images"),
                 "fallback": "serpapi_images",
                 "fallback_used": fallback_used,
+                "wikipedia_used": wikipedia_used,
             },
             "markdown_css": _compact_image_markdown_css(),
             "images": images,
@@ -1301,6 +1319,93 @@ class ToolRegistry:
             ],
             "errors": errors,
         }
+
+    async def _research_wikipedia_images(self, query: str, max_results: int) -> dict[str, Any]:
+        provider = self.config.tools.wikipedia
+        language = str(provider.defaults.get("language") or "en").lower()
+        response = await self._request_with_retries(
+            "GET",
+            f"https://{language}.wikipedia.org/w/api.php",
+            headers=_wikipedia_headers(provider),
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": max(max_results * 2, 5),
+                "format": "json",
+                "utf8": 1,
+            },
+        )
+        data = response.json()
+        titles = [
+            str(item.get("title") or "").strip()
+            for item in data.get("query", {}).get("search", [])
+            if str(item.get("title") or "").strip()
+        ][: max(max_results * 2, 5)]
+        summaries = await asyncio.gather(
+            *(self._wikipedia_page({"title": title, "language": language}) for title in titles),
+            return_exceptions=True,
+        )
+        images: list[dict[str, Any]] = []
+        for summary in summaries:
+            if not isinstance(summary, dict):
+                continue
+            image_url = str(summary.get("image_url") or "").strip()
+            if not image_url:
+                continue
+            local_path = await self._download_wikipedia_image(
+                title=str(summary.get("title") or query),
+                image_url=image_url,
+            )
+            images.append(
+                {
+                    "provider": "wikipedia",
+                    "title": summary.get("title"),
+                    "image_url": image_url,
+                    "thumbnail": summary.get("thumbnail"),
+                    "source_url": summary.get("url"),
+                    "source_name": "Wikipedia",
+                    "local_path": local_path,
+                }
+            )
+            if len(images) >= max_results:
+                break
+        return {"provider": "wikipedia", "results": [], "images": images}
+
+    async def _download_wikipedia_image(self, *, title: str, image_url: str) -> str | None:
+        try:
+            _validate_public_http_url(image_url)
+            response = await self._request_with_retries(
+                "GET",
+                image_url,
+                headers={"User-Agent": WIKIMEDIA_USER_AGENT},
+                follow_redirects=True,
+            )
+        except Exception:
+            return None
+        suffix = Path(urlparse(str(response.url)).path).suffix.lower()
+        if not suffix or len(suffix) > 6:
+            content_type = response.headers.get("content-type", "").lower()
+            if "png" in content_type:
+                suffix = ".png"
+            elif "jpeg" in content_type or "jpg" in content_type:
+                suffix = ".jpg"
+            elif "webp" in content_type:
+                suffix = ".webp"
+            elif "gif" in content_type:
+                suffix = ".gif"
+            else:
+                suffix = ".img"
+        image_dir = Path.cwd() / "wiki_images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        slug = _slugify_filename(title)[:80] or "wikipedia-image"
+        file_path = image_dir / f"{slug}{suffix}"
+        counter = 2
+        while file_path.exists():
+            file_path = image_dir / f"{slug[:76]}-{counter}{suffix}"
+            counter += 1
+        file_path.write_bytes(response.content)
+        return file_path.relative_to(Path.cwd()).as_posix()
 
     async def _verify_sources(self, arguments: dict[str, Any]) -> dict[str, Any]:
         urls = arguments.get("urls")
@@ -1959,6 +2064,7 @@ def _image_candidate(provider: str, item: Any, *, title: str | None = None) -> d
         "thumbnail": thumbnail,
         "source_url": source_url,
         "source_name": item.get("source_name") or item.get("source"),
+        "local_path": item.get("local_path"),
     }
 
 
@@ -1996,7 +2102,7 @@ def _compact_image_markdown_css() -> str:
 
 
 def _compact_image_markdown(image: dict[str, Any]) -> str:
-    url = image.get("image_url") or image.get("thumbnail")
+    url = image.get("local_path") or image.get("image_url") or image.get("thumbnail")
     alt = _markdown_alt(image)
     source_url = image.get("source_url")
     source = f'<a href="{source_url}">source</a>' if source_url else "source unavailable"
@@ -2006,6 +2112,11 @@ def _compact_image_markdown(image: dict[str, Any]) -> str:
         f"  <figcaption>{alt} - {source}</figcaption>\n"
         "</figure>"
     )
+
+
+def _slugify_filename(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+    return text.strip(".-").lower()
 
 
 def _html_title(html: str) -> str | None:

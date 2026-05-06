@@ -34,13 +34,11 @@ from .config import (
     load_config,
     codex_model_error,
     copilot_cli_model_error,
-    openai_model_error,
     openclaw_model_error,
     opencode_model_error,
     pi_model_error,
     resolve_codex_model,
     resolve_copilot_cli_model,
-    resolve_openai_model,
     resolve_openclaw_model,
     resolve_opencode_model,
     resolve_pi_model,
@@ -60,7 +58,6 @@ from .tools import ToolRegistry, classify_query_intent, select_relevant_tools
 
 
 PYTHON_REQUIREMENTS = {
-    "claude_agent_sdk": "claude-agent-sdk>=0.1.74",
     "fastapi": "fastapi>=0.115.0",
     "httpx": "httpx>=0.27.0",
     "yaml": "pyyaml>=6.0.2",
@@ -1785,20 +1782,6 @@ def _llama_root_config_candidates() -> list[Path]:
     return candidates
 
 
-def _llama_root_config_path() -> Path | None:
-    candidates = _llama_root_config_candidates()
-
-    seen: set[Path] = set()
-    for candidate in candidates:
-        resolved = candidate.expanduser().resolve()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if resolved.exists():
-            return resolved
-    return None
-
-
 def _cmd_stop(pid_path: Path) -> None:
     pid = _read_pid(pid_path)
     if pid is None:
@@ -2925,10 +2908,7 @@ def _ensure_copilot_tool_extension(config) -> Path:
     data["mcpServers"] = servers
     _write_json(config_path, data)
     _print_state("ok", f"Copilot CLI MCP tools config: {config_path}", "32")
-    
-    # Verify MCP server is reachable
     _verify_mcp_server_tools(config)
-    
     return config_path
 
 
@@ -3025,8 +3005,9 @@ def _mcp_json_config(config) -> dict:
 
 
 def _mcp_server_env(config) -> dict[str, str]:
+    server_url = _server_url(config.server.host, config.server.port)
     return {
-        "LLAMA_BRIDGE_BASE_URL": _server_url(config.server.host, config.server.port),
+        "LLAMA_BRIDGE_BASE_URL": server_url,
         "LLAMA_BRIDGE_API_KEY": config.server.auth_token,
     }
 
@@ -3035,8 +3016,6 @@ def _verify_mcp_server_tools(config) -> None:
     """Verify MCP server is reachable and return discovered tool names."""
     import json
     import subprocess
-    import sys
-    from pathlib import Path
 
     command, args = _mcp_server_command()
     proc = None
@@ -3049,7 +3028,6 @@ def _verify_mcp_server_tools(config) -> None:
             text=True,
         )
 
-        # Send initialize request
         init_msg = json.dumps({
             "jsonrpc": "2.0",
             "id": 1,
@@ -3063,17 +3041,14 @@ def _verify_mcp_server_tools(config) -> None:
         proc.stdin.write(init_msg)
         proc.stdin.flush()
 
-        # Read initialize response (and possibly notification)
-        init_response = proc.stdout.readline()
-        # Try to read notification if present
+        proc.stdout.readline()
         import select
         try:
             if select.select([proc.stdout], [], [], 1.0)[0]:
-                notification = proc.stdout.readline()
+                proc.stdout.readline()
         except Exception:
             pass
 
-        # Send tools/list request
         list_msg = json.dumps({
             "jsonrpc": "2.0",
             "id": 2,
@@ -3082,7 +3057,6 @@ def _verify_mcp_server_tools(config) -> None:
         proc.stdin.write(list_msg)
         proc.stdin.flush()
 
-        # Read tools/list response
         response_line = proc.stdout.readline()
         if response_line:
             data = json.loads(response_line)
@@ -3109,7 +3083,7 @@ def _verify_mcp_server_tools(config) -> None:
 def _bridge_tools_skill(host_name: str) -> str:
     return f"""---
 name: llama-bridge-tools
-description: Use when {host_name} needs current web search, source research, image research, weather, Wikipedia, or date/time lookups through the local llama bridge MCP tools.
+description: Use when {host_name} needs llama bridge MCP tools for deep research, current web search, source verification, image research, weather, Wikipedia, or date/time lookups.
 ---
 
 # Llama Bridge Tools
@@ -3120,6 +3094,9 @@ lookups.
 
 Prefer the highest-level bridge tool that fits the task:
 
+- For deep research, use the staged flow: `deep_plan_agent`, then
+  `deep_collect_agent`, then save `temp/ad.md`, then `deep_review_agent`,
+  then write the final `report.md`.
 - `source_research` for cited factual research and evidence gathering.
 - `image_research` for compact sourced image candidates.
 - `tavily_search` or `serpapi_search` for current web results.
@@ -3967,7 +3944,7 @@ def _poolside_bridge_available_commands() -> list[dict[str, Any]]:
         ("web", "Search the web through llama bridge.", "search query"),
         ("image", "Find sourced image candidates through llama bridge.", "image query"),
         ("wiki", "Search Wikipedia through llama bridge.", "Wikipedia query"),
-        ("deep", "Auto-plan deep research, run many searches, verify sources, and write report.md.", "research topic"),
+        ("deep", "Research the topic with web/wiki/image tools, verify sources, and write report.md.", "research topic"),
         ("manim", "Generate a short Manim animation video from text.", "animation prompt"),
     ]
     available_commands = []
@@ -4061,18 +4038,16 @@ def _poolside_deep_research_prompt(text: str) -> str:
             return text
         topic = stripped[len(matched) :].strip() or "the requested research topic"
 
-    return f"""AUTO PLAN MODE: run this as a deep research workflow for: {topic}
+    return f"""Run research for: {topic}
 
-The main brain controls the workflow. Delegate evidence collection to specialist sub-agent tools so raw search dumps do not fill the main context. Required todos:
-1. Call llama_bridge_tools__deep first to get the workflow.
-2. Prefer llama_bridge_tools__deep_claude_agent. It uses Claude Agent SDK with real specialist subagents and returns a compact handoff.
-3. If Claude SDK is unavailable, call llama_bridge_tools__deep_tavily_agent, llama_bridge_tools__deep_serp_agent, and llama_bridge_tools__deep_wiki_agent separately.
-4. Select at least 4 strong URLs from the sub-agent briefs and call llama_bridge_tools__deep_verify_agent.
-5. Write a compact checkpoint to report.md or deep_research_checkpoint.md before synthesis: completed todos, sub-agent briefs, selected URLs, verification verdicts, and remaining tasks.
-6. Create the final report.md in the current working directory with the write tool, using path=report.md and the tool's required content/contents field for the full markdown.
-7. Mark every todo complete before the final answer.
+Use llama bridge MCP tools directly for this workflow:
+1. Run 4 web searches total using the available web search tools such as `tavily_search`, `serpapi_search`, or the best matching bridge web search tool.
+2. Run 3 Wikipedia searches total using `wikipedia_search`. Use `wikipedia_page` only when a specific page is clearly useful.
+3. Run `image_research` for relevant sourced images if visuals help the report.
+4. Verify important claims and source quality before writing.
+5. Create a proper `report.md` in the current working directory with the write tool.
 
-If context compacts or feels full, continue from the checkpoint and remaining todos automatically; do not ask the user to restart manually. Do not use one long llama_bridge_tools__source_research call in Poolside deep mode. Do not finish with only an inline answer; report.md is required."""
+Keep the report sourced and clear. Do not use staged deep research agents for Poolside `/deep`. Do not finish with only an inline answer; `report.md` is required."""
 
 
 def _write_poolside_agent_config() -> Path:
@@ -4112,7 +4087,6 @@ def _write_poolside_config(config) -> Path:
     poolside_api_url = _poolside_api_url(config)
     pool_section_value = existing.get("pool")
     pool_section = dict(pool_section_value) if isinstance(pool_section_value, dict) else {}
-    # Poolside validates settings.yaml strictly; auth must come from env, not pool.api_key.
     pool_section.pop("api_key", None)
     pool_section.pop("token", None)
     if poolside_api_url and not _is_llama_bridge_poolside_url(config, poolside_api_url):
@@ -4179,7 +4153,7 @@ def _write_poolside_bridge_skill(config) -> Path:
 def _poolside_bridge_tools_skill() -> str:
     return """---
 name: llama-bridge-tools
-description: Use when Poolside needs llama bridge MCP tools, current web search, SerpAPI, Tavily, source research, deep research, image search, Wikipedia, Manim animation videos, weather, or date/time lookups. Use when the user types shortcut-style prompts such as /serp, /tavily, /web, /image, /wiki, /deep, or /manim.
+description: Use when Poolside needs llama bridge MCP tools for current web search, SerpAPI, Tavily, source verification, image search, Wikipedia, Manim animation videos, weather, or date/time lookups. Use when the user types shortcut-style prompts such as /serp, /tavily, /web, /image, /wiki, /deep, or /manim.
 ---
 
 # Llama Bridge Tools
@@ -4201,18 +4175,10 @@ MCP tool:
 - `/manim`: use `manim_render` to create a short Manim Community animation
   video from the user's text. Return the generated scene path and video path.
   If Manim is missing, show the install guidance returned by the tool.
-- `/deep`: auto-switch to Plan behavior or create a todo list first. The main
-  brain must control the workflow. Prefer `deep_claude_agent`, which uses
-  Claude Agent SDK with real specialist subagents. If it is unavailable,
-  delegate evidence collection to compact fallback sub-agent tools:
-  `deep_tavily_agent`, `deep_serp_agent`, `deep_wiki_agent`, and
-  `deep_verify_agent`. These sub-agents return compact briefs only, so raw
-  search dumps do not fill the main context. Write a compact checkpoint before
-  synthesis, continue from that checkpoint after context compaction, create a
-  full sourced `report.md` in the current working directory, mark every todo
-  complete, then give the final answer. Avoid putting the whole workflow into
-  one `source_research` call in Poolside because long MCP calls can hit ACP
-  timeouts.
+- `/deep`: treat the user input as a report workflow. Run 4 web searches total,
+  run 3 Wikipedia searches total, use `image_research` if visuals help, verify
+  important claims and sources, then write a proper `report.md` in the current
+  working directory. Do not use the staged deep research agents for Poolside.
 
 Prefer the highest-level bridge tool that fits the task:
 
@@ -4262,53 +4228,6 @@ def _poolside_standalone_base_url(config, api_url: str | None) -> str | None:
     if not api_url:
         return None
     return api_url.rstrip("/")
-
-
-def _configure_poolside_standalone_auth(
-    poolside_executable: str,
-    standalone_base_url: str,
-    api_key: str,
-) -> None:
-    if _poolside_credentials_match(standalone_base_url, api_key):
-        return
-    env = os.environ.copy()
-    env["POOLSIDE_STANDALONE_BASE_URL"] = standalone_base_url
-    process = subprocess.run(
-        [poolside_executable, "setup", "--api-key", api_key],
-        check=False,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    if process.returncode != 0:
-        detail = process.stderr.strip() or process.stdout.strip() or "unknown error"
-        raise SystemExit(f"Poolside standalone setup failed: {detail}")
-
-
-def _resolved_poolside_credentials_path() -> Path:
-    return Path(os.path.expanduser("~/.config/poolside/credentials.json"))
-
-
-def _poolside_credentials_match(standalone_base_url: str, api_key: str) -> bool:
-    credentials_path = _resolved_poolside_credentials_path()
-    if not credentials_path.exists():
-        return False
-    try:
-        raw = json.loads(credentials_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    entries = raw if isinstance(raw, list) else [raw]
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("serviceMode") or "").lower() != "standalone":
-            continue
-        if str(entry.get("apiUrl") or "").rstrip("/") != standalone_base_url.rstrip("/"):
-            continue
-        if str(entry.get("token") or "") != api_key:
-            continue
-        return True
-    return False
 
 
 def _is_llama_bridge_poolside_url(config, value: Any) -> bool:
@@ -5214,11 +5133,11 @@ const PREFERRED_SOURCE_DOMAINS = [
 
 const DEEP_RESEARCH_REPORT_INSTRUCTIONS = [
   "Deep research reporting workflow:",
-  "- First run deep_research and use its fetched evidence as the base brief.",
-  "- Deep research must use at least 10 SerpAPI search passes when serpapi_search is enabled.",
-  "- Deep research must use at least 5 Tavily search passes when tavily_search is enabled.",
-  "- After the primary deep-search passes finish, run at least 6 web_search verification/recheck passes against important claims, source titles, and conflicting points.",
-  "- After deep_research completes, verify important claims and sources with separate web_search, serpapi_search, and tavily_search calls when those tools are available; compare providers instead of treating one provider as enough.",
+  "- Prefer the staged subagent workflow: call deep_plan_agent first, then deep_collect_agent, then write temp/ad.md, then call deep_review_agent, then update temp/ad.md again before writing the final report.md.",
+  "- The collection stage should stay compact: exactly 2 Tavily agents, 2 SerpAPI agents, and 3 Wikipedia agents.",
+  "- Use the specialist extension tools deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent only when the staged flow needs extra coverage or cross-checking.",
+  "- The legacy deep_research tool can still be used as fallback, but the staged subagent flow is preferred for Pi /deep.",
+  "- After collection/review, verify important claims and sources with separate web_search, serpapi_search, and tavily_search calls when those tools are available; compare providers instead of treating one provider as enough.",
   "- Source quality matters more than search rank. Prefer official/primary sources, international institutions, academic/research sources, reputable fact-checkers, and established news/wire outlets. Use weak sources only as leads, not as main citations.",
   SOLID_SOURCE_GUIDE,
   "- Use image_research after source verification to collect only 2-3 relevant image URLs with source/provenance metadata.",
@@ -5600,7 +5519,7 @@ export default function (pi: ExtensionAPI) {{
   pi.registerTool({{
     name: "deep_research",
     label: "Deep Research",
-    description: "Pi-only research agent: run at least 10 SerpAPI searches, 5 Tavily searches when enabled, then 6 web_search verification passes, fetch top pages, and return a structured evidence brief for report.md.",
+    description: "Legacy Pi research fallback: run many search passes, fetch top pages, and return a structured evidence brief for report.md. Prefer deep_plan_agent -> deep_collect_agent -> deep_review_agent for Pi /deep.",
     parameters: Type.Object({{
       topic: Type.String({{ description: "Research topic, question, or claim to investigate." }}),
       questions: Type.Optional(Type.Array(Type.String({{ description: "Optional sub-questions to investigate in parallel." }}))),
@@ -5838,6 +5757,180 @@ export default function (pi: ExtensionAPI) {{
     }},
   }});
 
+  pi.registerTool({{
+    name: "deep_plan_agent",
+    label: "Deep Plan Agent",
+    description: "Start the staged llama bridge deep research workflow and return a session_id plus next steps.",
+    parameters: Type.Object({{
+      topic: Type.String({{ description: "Main research topic." }}),
+      query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
+      required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 4 }})),
+      include_images: Type.Optional(Type.Boolean({{ description: "Whether images may be useful later.", default: false }})),
+      query_count: Type.Optional(Type.Number({{ description: "Query fanout for the staged collectors.", default: 4 }})),
+      include_official_hunt: Type.Optional(Type.Boolean({{ description: "Whether to run an official-source pass.", default: true }})),
+    }}),
+    async execute(_toolCallId, params, signal) {{
+      const result = await callBridgeTool("deep_plan_agent", {{
+        topic: params.topic,
+        query: params.query,
+        required_verified_sources: params.required_verified_sources ?? 4,
+        include_images: params.include_images ?? false,
+        query_count: params.query_count ?? 4,
+        include_official_hunt: params.include_official_hunt ?? true,
+      }}, signal);
+      return {{
+        content: [{{ type: "text", text: pretty(result) }}],
+        details: result,
+      }};
+    }},
+  }});
+
+  pi.registerTool({{
+    name: "deep_collect_agent",
+    label: "Deep Collect Agent",
+    description: "Stage 2 for staged deep research: collect compact evidence with fixed Tavily/SerpAPI/Wikipedia subagents.",
+    parameters: Type.Object({{
+      topic: Type.String({{ description: "Main research topic." }}),
+      query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
+      session_id: Type.Optional(Type.String({{ description: "Session id from deep_plan_agent." }})),
+      query_count: Type.Optional(Type.Number({{ description: "Query fanout for collection.", default: 4 }})),
+      include_official_hunt: Type.Optional(Type.Boolean({{ description: "Whether to run an official-source pass.", default: true }})),
+    }}),
+    async execute(_toolCallId, params, signal) {{
+      const result = await callBridgeTool("deep_collect_agent", {{
+        topic: params.topic,
+        query: params.query,
+        session_id: params.session_id,
+        query_count: params.query_count ?? 4,
+        include_official_hunt: params.include_official_hunt ?? true,
+      }}, signal);
+      return {{
+        content: [{{ type: "text", text: pretty(result) }}],
+        details: result,
+      }};
+    }},
+  }});
+
+  pi.registerTool({{
+    name: "deep_review_agent",
+    label: "Deep Review Agent",
+    description: "Stage 3 for staged deep research: verify the strongest URLs, update temp/ad.md, and prepare the final handoff for report.md.",
+    parameters: Type.Object({{
+      topic: Type.String({{ description: "Main research topic." }}),
+      query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
+      session_id: Type.Optional(Type.String({{ description: "Session id from deep_plan_agent/deep_collect_agent." }})),
+      required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 4 }})),
+      include_images: Type.Optional(Type.Boolean({{ description: "Whether images may be useful later.", default: false }})),
+      selected_urls: Type.Optional(Type.Array(Type.String({{ description: "Optional URL shortlist to review first." }}))),
+      verify_timeout_seconds: Type.Optional(Type.Number({{ description: "Timeout budget for verification.", default: 8 }})),
+    }}),
+    async execute(_toolCallId, params, signal) {{
+      const result = await callBridgeTool("deep_review_agent", {{
+        topic: params.topic,
+        query: params.query,
+        session_id: params.session_id,
+        required_verified_sources: params.required_verified_sources ?? 4,
+        include_images: params.include_images ?? false,
+        selected_urls: params.selected_urls,
+        verify_timeout_seconds: params.verify_timeout_seconds ?? 8,
+      }}, signal);
+      return {{
+        content: [{{ type: "text", text: pretty(result) }}],
+        details: result,
+      }};
+    }},
+  }});
+
+  pi.registerTool({{
+    name: "deep_tavily_agent",
+    label: "Deep Tavily Agent",
+    description: "Compact Tavily specialist for extending a staged deep research session.",
+    parameters: Type.Object({{
+      topic: Type.String({{ description: "Main research topic." }}),
+      focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
+      query_count: Type.Optional(Type.Number({{ description: "Number of search variants.", default: 4 }})),
+    }}),
+    async execute(_toolCallId, params, signal) {{
+      const result = await callBridgeTool("deep_tavily_agent", {{
+        topic: params.topic,
+        focus: params.focus,
+        query_count: params.query_count ?? 4,
+      }}, signal);
+      return {{
+        content: [{{ type: "text", text: pretty(result) }}],
+        details: result,
+      }};
+    }},
+  }});
+
+  pi.registerTool({{
+    name: "deep_serp_agent",
+    label: "Deep Serp Agent",
+    description: "Compact SerpAPI specialist for extending a staged deep research session.",
+    parameters: Type.Object({{
+      topic: Type.String({{ description: "Main research topic." }}),
+      focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
+      query_count: Type.Optional(Type.Number({{ description: "Number of search variants.", default: 4 }})),
+    }}),
+    async execute(_toolCallId, params, signal) {{
+      const result = await callBridgeTool("deep_serp_agent", {{
+        topic: params.topic,
+        focus: params.focus,
+        query_count: params.query_count ?? 4,
+      }}, signal);
+      return {{
+        content: [{{ type: "text", text: pretty(result) }}],
+        details: result,
+      }};
+    }},
+  }});
+
+  pi.registerTool({{
+    name: "deep_wiki_agent",
+    label: "Deep Wiki Agent",
+    description: "Compact Wikipedia specialist for extending a staged deep research session.",
+    parameters: Type.Object({{
+      topic: Type.String({{ description: "Main research topic." }}),
+      focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
+      query_count: Type.Optional(Type.Number({{ description: "Number of search variants.", default: 3 }})),
+    }}),
+    async execute(_toolCallId, params, signal) {{
+      const result = await callBridgeTool("deep_wiki_agent", {{
+        topic: params.topic,
+        focus: params.focus,
+        query_count: params.query_count ?? 3,
+      }}, signal);
+      return {{
+        content: [{{ type: "text", text: pretty(result) }}],
+        details: result,
+      }};
+    }},
+  }});
+
+  pi.registerTool({{
+    name: "deep_verify_agent",
+    label: "Deep Verify Agent",
+    description: "Verify a shortlist of URLs from the staged deep research flow.",
+    parameters: Type.Object({{
+      claim: Type.String({{ description: "Claim or topic to verify." }}),
+      urls: Type.Array(Type.String({{ description: "URLs to verify." }})),
+      required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 3 }})),
+      verify_timeout_seconds: Type.Optional(Type.Number({{ description: "Timeout budget for verification.", default: 8 }})),
+    }}),
+    async execute(_toolCallId, params, signal) {{
+      const result = await callBridgeTool("deep_verify_agent", {{
+        claim: params.claim,
+        urls: params.urls,
+        required_verified_sources: params.required_verified_sources ?? 3,
+        verify_timeout_seconds: params.verify_timeout_seconds ?? 8,
+      }}, signal);
+      return {{
+        content: [{{ type: "text", text: pretty(result) }}],
+        details: result,
+      }};
+    }},
+  }});
+
   async function startDeepResearch(args: string, ctx: any) {{
     let topic = args.trim();
     if (!topic) {{
@@ -5852,13 +5945,16 @@ export default function (pi: ExtensionAPI) {{
       }}
     }}
     const prompt = [
-      `Run deep research on: ${{topic}}`,
+      `Run staged deep research on: ${{topic}}`,
       "",
-      "Call the deep_research tool first with depth 3 unless the topic is very small.",
-      "After the tool returns, use the report policy and template included in that tool output.",
+      "Call deep_plan_agent first and save the returned session_id.",
+      "Call deep_collect_agent next with the same session_id.",
+      "Write the returned collect_markdown to temp/ad.md.",
+      "Call deep_review_agent with the same session_id and overwrite temp/ad.md with the returned reviewed_markdown.",
+      "Use deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent only if you need to extend or cross-check the staged results.",
       "If images help, call image_research after source verification and include only compact image blocks.",
       "After image_research returns, continue automatically into synthesis and file writing; do not wait for the user to say continue.",
-      "Create report.md only after the sources are verified.",
+      "Create report.md only after the staged review and source verification are complete.",
       "When writing the file, call the write tool with both required fields: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. Never call write with content only.",
     ].join("\\n");
     if (ctx.isIdle()) {{
@@ -5870,7 +5966,7 @@ export default function (pi: ExtensionAPI) {{
   }}
 
   pi.registerCommand("deep", {{
-    description: "Run Pi-only deep research with parallel web/search providers",
+    description: "Run staged deep research with llama bridge subagents",
     handler: async (args, ctx) => startDeepResearch(args, ctx),
   }});
 }}
