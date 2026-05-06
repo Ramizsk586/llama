@@ -222,6 +222,7 @@ tools:
   include:
     - shell.execute
     - datetime_now
+    - manim_render
     - wikipedia_search
     - wikipedia_page
     - weather_current

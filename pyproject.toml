@@ -16,6 +16,11 @@ dependencies = [
   "uvicorn>=0.32.0",
 ]
 
+[project.optional-dependencies]
+video = [
+  "manim>=0.20.0",
+]
+
 [project.scripts]
 llama = "llama_bridge.cli:main"
 
