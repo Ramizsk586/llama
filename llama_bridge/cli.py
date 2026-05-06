@@ -4040,14 +4040,14 @@ def _poolside_deep_research_prompt(text: str) -> str:
 
     return f"""Run research for: {topic}
 
-Use llama bridge MCP tools directly for this workflow:
-1. Run 4 web searches total using the available web search tools such as `tavily_search`, `serpapi_search`, or the best matching bridge web search tool.
-2. Run 3 Wikipedia searches total using `wikipedia_search`. Use `wikipedia_page` only when a specific page is clearly useful.
-3. Run `image_research` for relevant sourced images if visuals help the report.
-4. Verify important claims and source quality before writing.
-5. Create a proper `report.md` in the current working directory with the write tool.
+Keep this simple:
+1. Make a short plan.
+2. Gather the best web and Wikipedia evidence.
+3. Verify the most important claims.
+4. Use images only if they help.
+5. Write a clear `report.md` in the current working directory.
 
-Keep the report sourced and clear. Do not use staged deep research agents for Poolside `/deep`. Do not finish with only an inline answer; `report.md` is required."""
+Prefer the built-in deep research tools when available, but keep the workflow lightweight. Keep the report sourced and clear. Do not finish with only an inline answer; `report.md` is required."""
 
 
 def _write_poolside_agent_config() -> Path:
@@ -4175,10 +4175,10 @@ MCP tool:
 - `/manim`: use `manim_render` to create a short Manim Community animation
   video from the user's text. Return the generated scene path and video path.
   If Manim is missing, show the install guidance returned by the tool.
-- `/deep`: treat the user input as a report workflow. Run 4 web searches total,
-  run 3 Wikipedia searches total, use `image_research` if visuals help, verify
-  important claims and sources, then write a proper `report.md` in the current
-  working directory. Do not use the staged deep research agents for Poolside.
+- `/deep`: treat the user input as a simple research workflow. Make a short
+  plan, gather strong web and Wikipedia evidence, verify the key claims,
+  optionally use `image_research`, and then write a proper `report.md` in the
+  current working directory.
 
 Prefer the highest-level bridge tool that fits the task:
 

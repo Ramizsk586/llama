@@ -1450,7 +1450,7 @@ def _merge_candidate_sources(*briefs: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _pick_best_urls(sources: list[dict[str, Any]], *, target: int) -> list[str]:
     urls: list[str] = []
-    for quality in ("primary/official", "scholarly/domain-authority", "top-tier-news", "needs-review"):
+    for quality in ("primary/official", "scholarly/domain-authority", "top-tier-news", "established-news", "needs-review"):
         for source in sources:
             if str(source.get("source_quality") or "") != quality:
                 continue
@@ -1460,6 +1460,19 @@ def _pick_best_urls(sources: list[dict[str, Any]], *, target: int) -> list[str]:
             if len(urls) >= target:
                 return urls
     return urls
+
+
+def _official_source_expected(plan: dict[str, Any]) -> bool:
+    topic_type = str(plan.get("topic_type") or "")
+    if topic_type in {
+        "political/election topic",
+        "legal/regulatory topic",
+        "financial/economic topic",
+        "health/medical topic",
+    }:
+        return True
+    freshness_needs = plan.get("freshness_needs")
+    return isinstance(freshness_needs, list) and bool(freshness_needs)
 
 
 def _build_official_source_brief(topic: str, *briefs: dict[str, Any]) -> dict[str, Any]:
@@ -1507,12 +1520,22 @@ def _audit_native_research(
     official: dict[str, Any],
 ) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
-    if not official.get("official_sources"):
+    blocking_issues = 0
+    if not official.get("official_sources") and _official_source_expected(plan):
         issues.append(
             {
-                "issue": "No official or primary source identified for the strongest claims.",
+                "issue": "No official or primary source identified for a topic that likely needs one.",
                 "severity": "High",
-                "fix": "Run another official-source hunt or lower confidence in the final report.",
+                "fix": "Run another official-source hunt or clearly lower confidence in the final report.",
+            }
+        )
+        blocking_issues += 1
+    elif not official.get("official_sources"):
+        issues.append(
+            {
+                "issue": "No official or primary source was found, so the report should lean on clearly attributed secondary reporting.",
+                "severity": "Medium",
+                "fix": "Prefer stronger domain-authority or top-tier reporting and label uncertainty where direct primary evidence is unavailable.",
             }
         )
     if len(verify.get("verified_sources", [])) < 2:
@@ -1523,6 +1546,7 @@ def _audit_native_research(
                 "fix": "Select more strong URLs and verify them before synthesis.",
             }
         )
+        blocking_issues += 1
     if not sources:
         issues.append(
             {
@@ -1531,10 +1555,11 @@ def _audit_native_research(
                 "fix": "Re-run the search subagents with broader queries.",
             }
         )
+        blocking_issues += 1
     return {
-        "audit_result": "Pass" if not issues else "Needs revision",
+        "audit_result": "Pass" if blocking_issues == 0 else "Needs revision",
         "issues_found": issues,
-        "safe_to_write_final_report": not issues,
+        "safe_to_write_final_report": blocking_issues == 0,
         "remaining_tasks": [item["fix"] for item in issues],
         "topic_type": plan.get("topic_type"),
     }
@@ -1735,14 +1760,25 @@ def _build_checkpoint_markdown(
     audit: dict[str, Any],
     images: dict[str, Any] | None,
 ) -> str:
+    web_count = len(web_briefs)
+    wiki_count = len(wiki_briefs)
+    verify_count = len(verification_briefs)
+    verified_count = len(verify.get("verified_sources", []))
+    rejected_count = len(verify.get("rejected_sources", []))
+    final_confidence = str(audit.get("final_confidence") or "Unknown")
     lines = [
         f"# Deep Research Checkpoint: {topic}",
         "",
+        "## Status",
+        f"- Final confidence: {final_confidence}",
+        f"- Verified sources: {verified_count}",
+        f"- Rejected or uncertain sources: {rejected_count}",
+        "",
         "## Completed",
         "- Query plan created",
-        "- 3 web scraping briefs collected",
-        "- 3 wiki scraping briefs collected",
-        "- 3 verification passes completed",
+        f"- {web_count} web research briefs collected",
+        f"- {wiki_count} wiki context briefs collected",
+        f"- {verify_count} verification passes completed",
         "- Final fixer pass completed",
         "",
         "## Web Subagents",
@@ -1794,7 +1830,7 @@ def _build_collection_markdown(
     selected_urls: list[str],
 ) -> str:
     lines = [
-        f"# Ad Draft: {topic}",
+        f"# Research Draft: {topic}",
         "",
         "## Status",
         "- Collection complete",
@@ -1803,6 +1839,10 @@ def _build_collection_markdown(
         "## Main Questions",
     ]
     lines.extend(f"- {item}" for item in plan.get("main_questions", []))
+    freshness_needs = plan.get("freshness_needs", [])
+    if freshness_needs:
+        lines.extend(["", "## Freshness Checks"])
+        lines.extend(f"- {item}" for item in freshness_needs)
     lines.extend(["", "## Search Subagents"])
     for item in search_briefs:
         brief = item.get("brief") or {}
@@ -2192,8 +2232,8 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
             "workflow": "lead_agent_with_specialist_research_subagents",
             "topic": query,
             "planning_mode": {
-                "poolside": "Auto-switch to Plan behavior for this request. If Poolside exposes plan mode, stay in it until all research and file-writing todos are complete.",
-                "instruction": "The main brain controls the workflow. Specialist sub-agents collect evidence and return compact summaries only.",
+                "poolside": "Use a short plan for this request and keep the workflow simple.",
+                "instruction": "The main brain should keep the research flow simple and only use extra sub-agents when they clearly help.",
             },
             "minimum_work": {
                 "subagent_calls": [
@@ -2211,7 +2251,7 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
             "steps": [
                 {
                     "name": "plan",
-                    "action": "Create todos for: run deep_plan_agent, run deep_collect_agent with exactly 2 Tavily + 2 SerpAPI + 3 Wikipedia collection agents, write temp/ad.md, run deep_review_agent, update temp/ad.md, then write report.md.",
+                    "action": "Make a short research plan, then use the deep research tools to collect evidence, verify the strongest claims, and write report.md.",
                 },
                 {
                     "name": "native_plan_controller",
@@ -2222,13 +2262,13 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
                         "required_verified_sources": 4,
                         "include_official_hunt": True,
                     },
-                    "returns": "Session id, fixed team layout, and staged next steps.",
+                    "returns": "Session id and a compact research plan.",
                 },
                 {
                     "name": "collection_stage",
                     "tool": "llama_bridge_tools__deep_collect_agent",
                     "arguments": {"topic": query, "query_count": 4, "include_official_hunt": True},
-                    "returns": "Compact collected evidence plus collect_markdown for temp/ad.md.",
+                    "returns": "Compact collected evidence and a draft markdown summary.",
                 },
                 {
                     "name": "review_stage",
@@ -2239,7 +2279,7 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
                         "required_verified_sources": 4,
                         "verify_timeout_seconds": 8,
                     },
-                    "returns": "Reviewed markdown for temp/ad.md plus final handoff for the main AI.",
+                    "returns": "Verified findings and the final handoff for the main AI.",
                 },
                 {
                     "name": "optional_images",
@@ -2252,7 +2292,7 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
                 },
                 {
                     "name": "checkpoint",
-                    "action": "Before synthesis, write a compact checkpoint into report.md or deep_research_checkpoint.md containing only: completed todos, sub-agent briefs, selected URLs, verification verdicts, and remaining tasks. If context compacts or the model pauses, continue from this checkpoint without asking the user.",
+                    "action": "If context gets tight, write a compact checkpoint so the report can be finished smoothly.",
                 },
                 {
                     "name": "write_report",
@@ -2265,22 +2305,18 @@ def _deep_research_handoff(arguments: dict[str, Any]) -> dict[str, Any]:
                 },
                 {
                     "name": "complete_plan",
-                    "action": "Mark every todo complete, including report.md. Do not leave the planning checklist unfinished after the work is done.",
+                    "action": "Finish the report and close out the short plan.",
                 },
             ],
             "instructions": [
-                "Use planning mode or todos first and keep them updated.",
-                "Use llama_bridge_tools__deep_plan_agent first in Poolside deep mode.",
-                "Run llama_bridge_tools__deep_collect_agent next, and keep that collection stage fixed at 2 Tavily agents, 2 SerpAPI agents, and 3 Wikipedia agents.",
-                "Write temp/ad.md after collection, then continue with llama_bridge_tools__deep_review_agent instead of restarting the whole deep flow.",
-                "Assign subagent brains systematically from the provider/model entries saved in env.yml, rotating through available aliases and provider defaults in round-robin order.",
-                "Use the compact specialist sub-agent tools to extend or cross-check the staged outputs instead of running raw provider searches directly.",
-                "Sub-agents return compact evidence briefs; the main brain should keep only claims, URLs, source quality, and caveats.",
-                "Avoid llama_bridge_tools__source_research for Poolside deep mode because it can exceed ACP tool timeouts.",
-                "Create a checkpoint before synthesis so work can continue automatically after context compaction.",
+                "Start with a short plan and keep the workflow simple.",
+                "Use llama_bridge_tools__deep_plan_agent first when the deep tools are available.",
+                "Use llama_bridge_tools__deep_collect_agent to gather compact evidence.",
+                "Use llama_bridge_tools__deep_review_agent to verify the strongest claims before writing.",
+                "Use extra specialist tools only when they clearly improve coverage or verification.",
+                "Keep only compact findings, URLs, source quality, and caveats in the main context.",
                 "Write report.md in the current working directory before producing the final response.",
-                "If context is compacted or nearly full, continue from the checkpoint and remaining todos; do not ask the user to restart manually.",
-                "Do not stop after this router result; continue with the specialist-subagent workflow and complete the plan.",
+                "If context is compacted or nearly full, continue from a checkpoint instead of restarting.",
             ],
         },
         indent=2,
