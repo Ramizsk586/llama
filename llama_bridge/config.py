@@ -44,6 +44,9 @@ DEFAULT_CONFIG_TEMPLATE = """server:
   host: 127.0.0.1
   port: 8089
   auth_token: change-me
+  # Auto-started llama servers stop after this many idle seconds.
+  # Set to 0 to keep them running until `llama stop`.
+  idle_timeout_seconds: 180
 
 providers:
   ollama_local:
@@ -272,6 +275,13 @@ tools:
     enabled: true
     language: en
     base_url: https://en.wikipedia.org
+  deep_research:
+    tool_timeout_seconds: 10
+    search_agent_timeout_seconds: 10
+    verify_agent_timeout_seconds: 10
+    source_research_timeout_seconds: 10
+    image_research_timeout_seconds: 10
+    manim_timeout_seconds: 10
 
 master_review:
   enabled: true
@@ -346,6 +356,7 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8089
     auth_token: str = "change-me"
+    idle_timeout_seconds: int = 180
 
 
 @dataclass(slots=True)
@@ -478,6 +489,16 @@ class ExternalToolProviderConfig:
 
 
 @dataclass(slots=True)
+class DeepResearchToolConfig:
+    tool_timeout_seconds: float = 10.0
+    search_agent_timeout_seconds: float = 10.0
+    verify_agent_timeout_seconds: float = 10.0
+    source_research_timeout_seconds: float = 10.0
+    image_research_timeout_seconds: float = 10.0
+    manim_timeout_seconds: float = 10.0
+
+
+@dataclass(slots=True)
 class ToolConfig:
     enabled: bool = True
     expose_http: bool = True
@@ -488,6 +509,7 @@ class ToolConfig:
     tavily: ExternalToolProviderConfig = field(default_factory=ExternalToolProviderConfig)
     weather: ExternalToolProviderConfig = field(default_factory=ExternalToolProviderConfig)
     wikipedia: ExternalToolProviderConfig = field(default_factory=ExternalToolProviderConfig)
+    deep_research: DeepResearchToolConfig = field(default_factory=DeepResearchToolConfig)
     # Tool selection and filtering options
     max_exposed: int = 8  # Maximum tools to expose in a single request (after filtering)
     relevance_filter: bool = True  # Enable relevance-based tool filtering
@@ -996,6 +1018,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         host=server_raw.get("host", "127.0.0.1"),
         port=int(server_raw.get("port", 8089)),
         auth_token=server_raw.get("auth_token", "change-me"),
+        idle_timeout_seconds=max(0, int(server_raw.get("idle_timeout_seconds", 180))),
     )
     if server.auth_token == "change-me" and server.host not in {"127.0.0.1", "localhost", "::1"}:
         warnings.warn(
@@ -1305,6 +1328,7 @@ def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
         raise ValueError("tools.cache_ttl_seconds must be non-negative")
     serpapi = _external_tool_provider(tools_raw.get("serpapi"), "https://serpapi.com/search")
     tavily = _external_tool_provider(tools_raw.get("tavily"), "https://api.tavily.com/search")
+    deep_research = _deep_research_tool_config(tools_raw.get("deep_research"))
     if default_search_provider == "tavily" and not tavily.enabled and serpapi.enabled:
         default_search_provider = "serpapi"
     elif default_search_provider == "serpapi" and not serpapi.enabled and tavily.enabled:
@@ -1327,6 +1351,7 @@ def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
             "https://en.wikipedia.org",
             enabled=True,
         ),
+        deep_research=deep_research,
         max_exposed=max_exposed,
         relevance_filter=bool(tools_raw.get("relevance_filter", True)),
         force_for_keywords=bool(tools_raw.get("force_for_keywords", True)),
@@ -1351,6 +1376,26 @@ def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
         fallback_to_full_schemas_for_unsupported_clients=bool(
             tools_raw.get("fallback_to_full_schemas_for_unsupported_clients", True)
         ),
+    )
+
+
+def _deep_research_tool_config(value: Any) -> DeepResearchToolConfig:
+    raw = value if isinstance(value, dict) else {}
+
+    def seconds(key: str, default: float = 10.0) -> float:
+        try:
+            result = float(raw.get(key, default))
+        except (TypeError, ValueError):
+            result = default
+        return max(1.0, result)
+
+    return DeepResearchToolConfig(
+        tool_timeout_seconds=seconds("tool_timeout_seconds"),
+        search_agent_timeout_seconds=seconds("search_agent_timeout_seconds"),
+        verify_agent_timeout_seconds=seconds("verify_agent_timeout_seconds"),
+        source_research_timeout_seconds=seconds("source_research_timeout_seconds"),
+        image_research_timeout_seconds=seconds("image_research_timeout_seconds"),
+        manim_timeout_seconds=seconds("manim_timeout_seconds"),
     )
 
 

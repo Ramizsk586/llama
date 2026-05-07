@@ -4,6 +4,7 @@
 
 No persistent memories yet.
 - a new rule alawys ask before using a tool that
+- Image workflows should prefer sendable downloaded assets with source/provenance when available.
 
 ## Rules
 

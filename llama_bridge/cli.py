@@ -104,6 +104,30 @@ class SetupCanceled(SystemExit):
 DEFAULT_START_IDLE_TIMEOUT_SECONDS = 180
 
 
+def _configured_idle_timeout_seconds(config) -> int:
+    server = getattr(config, "server", None)
+    value = getattr(server, "idle_timeout_seconds", DEFAULT_START_IDLE_TIMEOUT_SECONDS)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return DEFAULT_START_IDLE_TIMEOUT_SECONDS
+
+
+def _idle_timeout_note(client_name: str, idle_timeout_seconds: int) -> str:
+    if idle_timeout_seconds <= 0:
+        return f"llama server will stay running after {client_name} closes; run `llama stop` to stop it"
+    duration = _format_idle_duration(idle_timeout_seconds)
+    return f"llama server will stop {duration} after {client_name} closes with no requests"
+
+
+def _format_idle_duration(idle_timeout_seconds: int) -> str:
+    if idle_timeout_seconds % 60 == 0:
+        minutes = idle_timeout_seconds // 60
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"{minutes} {unit}"
+    return f"{idle_timeout_seconds} seconds"
+
+
 ENDPOINT_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
     (
         "Health",
@@ -473,11 +497,12 @@ def main() -> None:
         if args.command == "start":
             config_path = _arg_path(args.config)
             _ensure_setup(config_path)
+            config = load_config(config_path)
             _cmd_start(
                 config_path,
                 _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
                 _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-                0 if args.forever else DEFAULT_START_IDLE_TIMEOUT_SECONDS,
+                0 if args.forever else _configured_idle_timeout_seconds(config),
             )
             return
         if args.command == "stop":
@@ -727,7 +752,7 @@ def _build_parser() -> argparse.ArgumentParser:
     start_cmd.add_argument(
         "--forever",
         action="store_true",
-        help="disable the default 3-minute idle auto-stop",
+        help="disable the configured idle auto-stop",
     )
 
     stop_cmd = subparsers.add_parser("stop", help="stop the background bridge")
@@ -1696,7 +1721,7 @@ def _cmd_start(
         if idle_timeout_seconds == 0:
             _print_note("Server will stay up until you run `llama stop`.")
         else:
-            _print_note(f"Server will stop after {idle_timeout_seconds // 60} minutes of inactivity.")
+            _print_note(f"Server will stop after {_format_idle_duration(idle_timeout_seconds)} of inactivity.")
         return
 
     with log_path.open("a", encoding="utf-8") as handle:
@@ -1722,7 +1747,7 @@ def _cmd_start(
     if idle_timeout_seconds == 0:
         _print_note("Server will stay up until you run `llama stop`.")
     else:
-        _print_note(f"Server will stop after {idle_timeout_seconds // 60} minutes of inactivity.")
+        _print_note(f"Server will stop after {_format_idle_duration(idle_timeout_seconds)} of inactivity.")
 
 
 def _sync_config_clone_from_root(config_path: Path) -> bool:
@@ -2752,17 +2777,18 @@ def _cmd_pi(
         idle_after_file = pid_path.parent / "llama.pi.closed"
         idle_after_file.unlink(missing_ok=True)
         _print_state("start", "llama server is not running, starting it for Pi", "36")
+        idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
             pid_path,
             log_path,
-            idle_timeout_seconds=180,
+            idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note("llama server will stop 3 minutes after Pi closes with no requests")
+        _print_note(_idle_timeout_note("Pi", idle_timeout_seconds))
     else:
         idle_after_file = None
         _print_state("run", "using existing llama server", "32")
@@ -3094,9 +3120,19 @@ lookups.
 
 Prefer the highest-level bridge tool that fits the task:
 
-- For deep research, use the staged flow: `deep_plan_agent`, then
-  `deep_collect_agent`, then save `temp/ad.md`, then `deep_review_agent`,
-  then write the final `report.md`.
+- For `/deep` and deep research, only call tools whose names contain `deep`.
+  Start with `deep` or `deep_plan_agent`; do not use normal search, source,
+  image, Wikipedia, weather, or time tools for `/deep`. Use the staged flow:
+  `deep_plan_agent`, then
+  `deep_collect_agent` for single-agent collection calls, then each listed
+  collection agent separately, then `deep_collect_agent` with
+  `subagent_briefs`, then use the returned `temp_files`, then `deep_review_agent` for
+  single-agent verification calls, then each listed verifier separately, then
+  `deep_review_agent` with `verification_briefs`, then `deep_master_review_agent`
+  to get 8 master-review calls, optionally `deep_image_agent` to download
+  report-ready image files, then each listed `deep_master_*` call separately,
+  then `deep_master_review_agent` with `master_review_briefs`, then write the
+  final `report.md` using any returned image `local_path` values.
 - `source_research` for cited factual research and evidence gathering.
 - `image_research` for compact sourced image candidates.
 - `tavily_search` or `serpapi_search` for current web results.
@@ -3142,9 +3178,11 @@ def _claude_bridge_commands() -> dict[str, tuple[str, str, str]]:
         _bridge_command_body(
             "research topic",
             (
-                "Use `mcp__llama_bridge_tools__source_research` first for the user input, then verify important claims "
-                "with available llama bridge search tools, use `mcp__llama_bridge_tools__image_research` for 2-3 "
-                "useful sourced images, and produce a concise cited research brief."
+                "Start the deep workflow by calling a llama bridge tool whose name contains `deep`, preferably "
+                "`mcp__llama_bridge_tools__deep` or `mcp__llama_bridge_tools__deep_plan_agent`. For `/deep`, you are "
+                "only allowed to call tools with `deep` in the tool name; do not call normal search, source, image, "
+                "Wikipedia, weather, or time tools. Follow the returned staged workflow: plan, collect with deep "
+                "collector tools, review with deep reviewer tools, then produce the final cited brief."
             ),
         ),
     )
@@ -3264,17 +3302,18 @@ def _cmd_claude(
         idle_after_file = pid_path.parent / "llama.claude.closed"
         idle_after_file.unlink(missing_ok=True)
         _print_state("start", "llama server is not running, starting it for Claude Code", "36")
+        idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
             pid_path,
             log_path,
-            idle_timeout_seconds=180,
+            idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note("llama server will stop 3 minutes after Claude Code closes with no requests")
+        _print_note(_idle_timeout_note("Claude Code", idle_timeout_seconds))
     else:
         idle_after_file = None
         _print_state("run", "using existing llama server", "32")
@@ -3316,17 +3355,18 @@ def _cmd_codex(
         idle_after_file = pid_path.parent / "llama.codex.closed"
         idle_after_file.unlink(missing_ok=True)
         _print_state("start", "llama server is not running, starting it for Codex", "36")
+        idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
             pid_path,
             log_path,
-            idle_timeout_seconds=180,
+            idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note("llama server will stop 3 minutes after Codex closes with no requests")
+        _print_note(_idle_timeout_note("Codex", idle_timeout_seconds))
     else:
         idle_after_file = None
         _print_state("run", "using existing llama server", "32")
@@ -3392,17 +3432,18 @@ def _cmd_copilot(
         idle_after_file = pid_path.parent / "llama.copilot.closed"
         idle_after_file.unlink(missing_ok=True)
         _print_state("start", "llama server is not running, starting it for Copilot CLI", "36")
+        idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
             pid_path,
             log_path,
-            idle_timeout_seconds=180,
+            idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note("llama server will stop 3 minutes after Copilot CLI closes with no requests")
+        _print_note(_idle_timeout_note("Copilot CLI", idle_timeout_seconds))
     else:
         idle_after_file = None
         _print_state("run", "using existing llama server", "32")
@@ -3481,17 +3522,18 @@ def _cmd_opencode(
         idle_after_file = pid_path.parent / "llama.opencode.closed"
         idle_after_file.unlink(missing_ok=True)
         _print_state("start", "llama server is not running, starting it for OpenCode", "36")
+        idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
             pid_path,
             log_path,
-            idle_timeout_seconds=180,
+            idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note("llama server will stop 3 minutes after OpenCode closes with no requests")
+        _print_note(_idle_timeout_note("OpenCode", idle_timeout_seconds))
     else:
         idle_after_file = None
         _print_state("run", "using existing llama server", "32")
@@ -3706,17 +3748,18 @@ def _cmd_poolside(
             idle_after_file = pid_path.parent / "llama.poolside.closed"
             idle_after_file.unlink(missing_ok=True)
             _print_state("start", "llama server is not running, starting it for Poolside", "36")
+            idle_timeout_seconds = _configured_idle_timeout_seconds(config)
             _cmd_start(
                 config_path,
                 pid_path,
                 log_path,
-                idle_timeout_seconds=180,
+                idle_timeout_seconds=idle_timeout_seconds,
                 idle_after_file=idle_after_file,
             )
             server_running, _running_url = _server_is_running(config_path, pid_path)
             if not server_running:
                 raise SystemExit(f"llama server failed to start, see log: {log_path}")
-            _print_note("llama server will stop 3 minutes after Poolside closes with no requests")
+            _print_note(_idle_timeout_note("Poolside", idle_timeout_seconds))
         else:
             idle_after_file = None
             _print_state("run", "using existing llama server", "32")
@@ -4038,16 +4081,24 @@ def _poolside_deep_research_prompt(text: str) -> str:
             return text
         topic = stripped[len(matched) :].strip() or "the requested research topic"
 
-    return f"""Run research for: {topic}
+    return f"""Run deep research for: {topic}
 
-Keep this simple:
-1. Make a short plan.
-2. Gather the best web and Wikipedia evidence.
-3. Verify the most important claims.
-4. Use images only if they help.
-5. Write a clear `report.md` in the current working directory.
+Use the llama bridge deep research workflow in normal mode. For `/deep`, only call tools whose names contain `deep`; do not call normal search, source, image, Wikipedia, weather, or time tools.
 
-Prefer the built-in deep research tools when available, but keep the workflow lightweight. Keep the report sourced and clear. Do not finish with only an inline answer; `report.md` is required."""
+Required tool order:
+1. Call `llama_bridge_tools__deep` or `llama_bridge_tools__deep_plan_agent` first.
+2. Call `deep_collect_agent` to get the separate specialist `agent_calls`.
+3. Call each returned `deep_tavily_agent`, `deep_serp_agent`, and `deep_wiki_agent` separately.
+4. Call `deep_collect_agent` again with `subagent_briefs`, then use the returned `temp_files` checkpoints.
+5. Call `deep_review_agent` to get separate verification `agent_calls`.
+6. Call each returned `deep_verify_agent` separately.
+7. Call `deep_review_agent` again with `verification_briefs`.
+8. Call `deep_image_agent` to download report-ready image files when images help.
+9. Call `deep_master_review_agent` to get the 8 master-review `agent_calls`.
+10. Call each returned `deep_master_*` review agent separately.
+11. Call `deep_master_review_agent` again with `master_review_briefs`, then write `report.md`.
+
+If the model thinks a deep tool is unavailable, call `llama_bridge_tools__deep` or `llama_bridge_tools__deep_plan_agent` anyway and report the deep-tool failure instead of switching to normal tools. Do not finish with only an inline answer; `report.md` is required."""
 
 
 def _write_poolside_agent_config() -> Path:
@@ -4175,13 +4226,18 @@ MCP tool:
 - `/manim`: use `manim_render` to create a short Manim Community animation
   video from the user's text. Return the generated scene path and video path.
   If Manim is missing, show the install guidance returned by the tool.
-- `/deep`: treat the user input as a simple research workflow. Make a short
-  plan, gather strong web and Wikipedia evidence, verify the key claims,
-  optionally use `image_research`, and then write a proper `report.md` in the
-  current working directory.
+- `/deep`: use only llama bridge tools whose names contain `deep`.
+  First call `deep` or `deep_plan_agent`; then follow the returned staged
+  workflow with `deep_collect_agent`, the listed deep specialist agents,
+  `deep_review_agent`, the listed deep verification agents, and finally
+  `deep_image_agent` for attachments plus `deep_master_review_agent` and the
+  8 returned `deep_master_*` review agents.
+  Do not call normal search, source, image, Wikipedia, weather, or time tools for `/deep`.
 
-Prefer the highest-level bridge tool that fits the task:
+Prefer the highest-level bridge tool that fits the task. For `/deep`, the
+highest-level tool is `deep`; if `deep` is not selected, use `deep_plan_agent`.
 
+- `deep` or `deep_plan_agent` for `/deep` and deep research workflows.
 - `source_research` for cited factual research and evidence gathering.
 - `image_research` for compact sourced image candidates.
 - `tavily_search` or `serpapi_search` for current web results.
@@ -4584,25 +4640,57 @@ def _ensure_pi_deep_research(config) -> Path | None:
     return extension_path
 
 
+def _deep_research_timeout_seconds(config, key: str = "tool_timeout_seconds") -> float:
+    deep = getattr(getattr(config, "tools", None), "deep_research", None)
+    value = getattr(deep, key, 10.0)
+    try:
+        return max(1.0, float(value))
+    except (TypeError, ValueError):
+        return 10.0
+
+
 def _pi_web_tools_extension(config) -> str:
     bridge_url = _server_url(config.server.host, config.server.port)
     api_key = config.server.auth_token
+    timeout_seconds = _deep_research_timeout_seconds(config)
+    timeout_ms = int(timeout_seconds * 1000)
     return f"""import type {{ ExtensionAPI }} from "@mariozechner/pi-coding-agent";
 import {{ Type }} from "typebox";
 
 const BRIDGE_URL = {json.dumps(bridge_url)};
 const API_KEY = {json.dumps(api_key)};
+const BRIDGE_TOOL_TIMEOUT_MS = {timeout_ms};
+
+function bridgeTimeoutSignal(parentSignal: AbortSignal) {{
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error("llama bridge tool timed out after {timeout_seconds:g} seconds")), BRIDGE_TOOL_TIMEOUT_MS);
+  const abort = () => controller.abort(parentSignal.reason);
+  if (parentSignal.aborted) abort();
+  else parentSignal.addEventListener("abort", abort, {{ once: true }});
+  return {{ signal: controller.signal, cleanup: () => {{
+    clearTimeout(timeout);
+    parentSignal.removeEventListener("abort", abort);
+  }} }};
+}}
 
 async function postJson(path: string, body: unknown, signal: AbortSignal) {{
-  const response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
-    method: "POST",
-    headers: {{
-      "Content-Type": "application/json",
-      "x-api-key": API_KEY,
-    }},
-    body: JSON.stringify(body),
-    signal,
-  }});
+  const timed = bridgeTimeoutSignal(signal);
+  let response: Response;
+  try {{
+    response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
+      method: "POST",
+      headers: {{
+        "Content-Type": "application/json",
+        "x-api-key": API_KEY,
+      }},
+      body: JSON.stringify(body),
+      signal: timed.signal,
+    }});
+  }} catch (error) {{
+    return {{ ok: false, error: String(error), timeout_budget_seconds: {timeout_seconds:g}, path }};
+  }} finally {{
+    timed.cleanup();
+  }}
   const text = await response.text().catch(() => "");
   let data: any = null;
   try {{
@@ -5105,11 +5193,28 @@ export default function (pi: ExtensionAPI) {{
 def _pi_deep_research_extension(config) -> str:
     bridge_url = _server_url(config.server.host, config.server.port)
     api_key = config.server.auth_token
+    timeout_seconds = _deep_research_timeout_seconds(config)
+    timeout_ms = int(timeout_seconds * 1000)
+    search_timeout = _deep_research_timeout_seconds(config, "search_agent_timeout_seconds")
+    verify_timeout = int(_deep_research_timeout_seconds(config, "verify_agent_timeout_seconds"))
     return f"""import type {{ ExtensionAPI }} from "@mariozechner/pi-coding-agent";
 import {{ Type }} from "typebox";
 
 const BRIDGE_URL = {json.dumps(bridge_url)};
 const API_KEY = {json.dumps(api_key)};
+const BRIDGE_TOOL_TIMEOUT_MS = {timeout_ms};
+
+function bridgeTimeoutSignal(parentSignal: AbortSignal) {{
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error("llama bridge tool timed out after {timeout_seconds:g} seconds")), BRIDGE_TOOL_TIMEOUT_MS);
+  const abort = () => controller.abort(parentSignal.reason);
+  if (parentSignal.aborted) abort();
+  else parentSignal.addEventListener("abort", abort, {{ once: true }});
+  return {{ signal: controller.signal, cleanup: () => {{
+    clearTimeout(timeout);
+    parentSignal.removeEventListener("abort", abort);
+  }} }};
+}}
 const SOLID_SOURCE_GUIDE = [
   "Prefer primary/official sources: government departments, election commissions, courts, regulators, police/health/education agencies, company filings, official datasets, parliamentary records, central-bank/statistics offices, and original reports.",
   "Prefer international institutions when relevant: UN agencies, World Bank, IMF, OECD, WHO, WTO, IEA, IPCC, ILO, UNESCO, and recognized regional bodies.",
@@ -5133,16 +5238,15 @@ const PREFERRED_SOURCE_DOMAINS = [
 
 const DEEP_RESEARCH_REPORT_INSTRUCTIONS = [
   "Deep research reporting workflow:",
-  "- Prefer the staged subagent workflow: call deep_plan_agent first, then deep_collect_agent, then write temp/ad.md, then call deep_review_agent, then update temp/ad.md again before writing the final report.md.",
-  "- The collection stage should stay compact: exactly 2 Tavily agents, 2 SerpAPI agents, and 3 Wikipedia agents.",
-  "- Use the specialist extension tools deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent only when the staged flow needs extra coverage or cross-checking.",
+  "- Prefer the staged subagent workflow: call deep_plan_agent first, then deep_collect_agent to get agent_calls, then call each listed collection agent as its own separate MCP call, then call deep_collect_agent again with subagent_briefs, then use returned temp_files, then call deep_review_agent to get verification agent_calls, then call each deep_verify_agent separately, then call deep_review_agent again with verification_briefs, then call deep_image_agent to download image assets when useful, then call deep_master_review_agent to get 8 master-review agent_calls, then call each deep_master_* review agent separately, then call deep_master_review_agent again with master_review_briefs before writing the final report.md.",
+  "- The collection stage must be split into separate MCP calls: exactly 2 Tavily calls, 2 SerpAPI calls, and 3 Wikipedia calls. Do not make deep_collect_agent run the whole collection in one call.",
+  "- Use the specialist extension tools deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent as single-purpose MCP calls; collect their compact JSON results and pass them back as subagent_briefs or verification_briefs.",
   "- The legacy deep_research tool can still be used as fallback, but the staged subagent flow is preferred for Pi /deep.",
   "- After collection/review, verify important claims and sources with separate web_search, serpapi_search, and tavily_search calls when those tools are available; compare providers instead of treating one provider as enough.",
   "- Source quality matters more than search rank. Prefer official/primary sources, international institutions, academic/research sources, reputable fact-checkers, and established news/wire outlets. Use weak sources only as leads, not as main citations.",
   SOLID_SOURCE_GUIDE,
-  "- Use image_research after source verification to collect only 2-3 relevant image URLs with source/provenance metadata.",
-  "- After image_research returns, continue immediately into synthesis and file writing; do not stop and wait for the user to type continue.",
-  "- After all sources and images are collected, create report.md in the current working directory.",
+  "- For /deep, do not call image_research directly; use deep_image_agent so report.md can attach downloaded local image files.",
+  "- After all deep collection, verification, and master-review calls are complete, create report.md in the current working directory.",
   "- When using the write tool, call it with BOTH required fields: path and content. Correct shape: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. Never call write with content only.",
   "- Use a relative path such as report.md unless the user explicitly asks for a different filename.",
   "- Write report.md as a detailed prepared research report, not a short answer or bullet-only summary.",
@@ -5154,9 +5258,9 @@ const DEEP_RESEARCH_REPORT_INSTRUCTIONS = [
   "- Use descriptive link text in References, not raw bare URLs as the visible text. The URL must still be inside the Markdown link target.",
   "- Explicitly call out uncertainty, conflicting figures, missing official datasets, and evidence limitations instead of smoothing them over.",
   "- Write report.md like a normal sourced article: use the search/source data for article text, headings, citations, and claims; use images only as compact supporting visuals near the relevant section.",
-  "- Include the compact image CSS returned by image_research once near the top of report.md, then wrap selected image figures in <div class=\\\"image-grid\\\">...</div>.",
+  "- Include image blocks from deep_image_agent in report.md using downloaded local_path values when present.",
   "- Attach images only if they are clean, clear, readable, well sourced, and help the report: maps, timelines, locations, people, products, charts, event photos, or visual comparisons. Skip blurry thumbnails, low-resolution previews, cropped charts/maps, decorative stock images, or weakly sourced images.",
-  "- Prefer the full image_url from image_research over thumbnails. Do not use an image if the source page is missing unless the report explicitly warns that provenance is weak.",
+  "- Prefer downloaded local_path values from deep_image_agent over remote URLs. Do not use an image if the source page is missing unless the report explicitly warns that provenance is weak.",
   "- For each image, include a short caption and a source link/citation beside or inside the figure caption.",
   "- The report.md file must be detailed, include inline source URLs/citations, embed selected compact images with nearby source links, and clearly separate verified findings from uncertain or conflicting evidence.",
   "- End report.md with this exact warning: Warning: This report only uses available sources and may contain wrong or incomplete information. Do not blindly believe it; verify important claims independently.",
@@ -5168,7 +5272,7 @@ const DEEP_RESEARCH_REPORT_TEMPLATE = [
   "Executive summary",
   "<3-6 dense paragraphs summarizing the answer, the strongest evidence, major caveats, and what could not be verified. Use numbered citations like [1].>",
   "",
-  "<!-- If images are useful, place the compact CSS from image_research here once. -->",
+  "<!-- If images are useful, embed downloaded local_path values returned by deep_image_agent. -->",
   "<!-- Then embed 2-3 clean, readable, sourced figures inside <div class=\\\"image-grid\\\">...</div> near the relevant section. Skip unclear or weakly sourced images. -->",
   "",
   "## 1. Background and context",
@@ -5198,15 +5302,23 @@ const DEEP_RESEARCH_REPORT_TEMPLATE = [
 ].join("\\n");
 
 async function postJson(path: string, body: unknown, signal: AbortSignal) {{
-  const response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
-    method: "POST",
-    headers: {{
-      "Content-Type": "application/json",
-      "x-api-key": API_KEY,
-    }},
-    body: JSON.stringify(body),
-    signal,
-  }});
+  const timed = bridgeTimeoutSignal(signal);
+  let response: Response;
+  try {{
+    response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
+      method: "POST",
+      headers: {{
+        "Content-Type": "application/json",
+        "x-api-key": API_KEY,
+      }},
+      body: JSON.stringify(body),
+      signal: timed.signal,
+    }});
+  }} catch (error) {{
+    return {{ ok: false, error: String(error), timeout_budget_seconds: {timeout_seconds:g}, path }};
+  }} finally {{
+    timed.cleanup();
+  }}
   const text = await response.text().catch(() => "");
   let data: any = null;
   try {{
@@ -5222,13 +5334,21 @@ async function postJson(path: string, body: unknown, signal: AbortSignal) {{
 }}
 
 async function getJson(path: string, signal: AbortSignal) {{
-  const response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
-    method: "GET",
-    headers: {{
-      "x-api-key": API_KEY,
-    }},
-    signal,
-  }});
+  const timed = bridgeTimeoutSignal(signal);
+  let response: Response;
+  try {{
+    response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
+      method: "GET",
+      headers: {{
+        "x-api-key": API_KEY,
+      }},
+      signal: timed.signal,
+    }});
+  }} catch (error) {{
+    return {{ ok: false, error: String(error), timeout_budget_seconds: {timeout_seconds:g}, path }};
+  }} finally {{
+    timed.cleanup();
+  }}
   if (!response.ok) {{
     const text = await response.text().catch(() => "");
     throw new Error(`llama bridge ${{path}} failed (${{response.status}}): ${{text || response.statusText}}`);
@@ -5765,8 +5885,8 @@ export default function (pi: ExtensionAPI) {{
       topic: Type.String({{ description: "Main research topic." }}),
       query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
       required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 4 }})),
-      include_images: Type.Optional(Type.Boolean({{ description: "Whether images may be useful later.", default: false }})),
-      query_count: Type.Optional(Type.Number({{ description: "Query fanout for the staged collectors.", default: 4 }})),
+      include_images: Type.Optional(Type.Boolean({{ description: "Whether images may be useful later.", default: true }})),
+      query_count: Type.Optional(Type.Number({{ description: "Query fanout for the staged collectors. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
       include_official_hunt: Type.Optional(Type.Boolean({{ description: "Whether to run an official-source pass.", default: true }})),
     }}),
     async execute(_toolCallId, params, signal) {{
@@ -5774,8 +5894,8 @@ export default function (pi: ExtensionAPI) {{
         topic: params.topic,
         query: params.query,
         required_verified_sources: params.required_verified_sources ?? 4,
-        include_images: params.include_images ?? false,
-        query_count: params.query_count ?? 4,
+        include_images: params.include_images ?? true,
+        query_count: params.query_count ?? 2,
         include_official_hunt: params.include_official_hunt ?? true,
       }}, signal);
       return {{
@@ -5788,21 +5908,23 @@ export default function (pi: ExtensionAPI) {{
   pi.registerTool({{
     name: "deep_collect_agent",
     label: "Deep Collect Agent",
-    description: "Stage 2 for staged deep research: collect compact evidence with fixed Tavily/SerpAPI/Wikipedia subagents.",
+    description: "Stage 2 for staged deep research: first return single-agent MCP calls, then assemble their returned briefs.",
     parameters: Type.Object({{
       topic: Type.String({{ description: "Main research topic." }}),
       query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
       session_id: Type.Optional(Type.String({{ description: "Session id from deep_plan_agent." }})),
-      query_count: Type.Optional(Type.Number({{ description: "Query fanout for collection.", default: 4 }})),
+      query_count: Type.Optional(Type.Number({{ description: "Query fanout for collection. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
       include_official_hunt: Type.Optional(Type.Boolean({{ description: "Whether to run an official-source pass.", default: true }})),
+      subagent_briefs: Type.Optional(Type.Array(Type.Any({{ description: "Results from the individual collection agent MCP calls." }}))),
     }}),
     async execute(_toolCallId, params, signal) {{
       const result = await callBridgeTool("deep_collect_agent", {{
         topic: params.topic,
         query: params.query,
         session_id: params.session_id,
-        query_count: params.query_count ?? 4,
+        query_count: params.query_count ?? 2,
         include_official_hunt: params.include_official_hunt ?? true,
+        subagent_briefs: params.subagent_briefs,
       }}, signal);
       return {{
         content: [{{ type: "text", text: pretty(result) }}],
@@ -5814,15 +5936,16 @@ export default function (pi: ExtensionAPI) {{
   pi.registerTool({{
     name: "deep_review_agent",
     label: "Deep Review Agent",
-    description: "Stage 3 for staged deep research: verify the strongest URLs, update temp/ad.md, and prepare the final handoff for report.md.",
+    description: "Stage 3 for staged deep research: first return single verify MCP calls, then assemble their returned briefs.",
     parameters: Type.Object({{
       topic: Type.String({{ description: "Main research topic." }}),
       query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
       session_id: Type.Optional(Type.String({{ description: "Session id from deep_plan_agent/deep_collect_agent." }})),
       required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 4 }})),
-      include_images: Type.Optional(Type.Boolean({{ description: "Whether images may be useful later.", default: false }})),
+      include_images: Type.Optional(Type.Boolean({{ description: "Whether images may be useful later.", default: true }})),
       selected_urls: Type.Optional(Type.Array(Type.String({{ description: "Optional URL shortlist to review first." }}))),
-      verify_timeout_seconds: Type.Optional(Type.Number({{ description: "Timeout budget for verification.", default: 8 }})),
+      verification_briefs: Type.Optional(Type.Array(Type.Any({{ description: "Results from individual deep_verify_agent MCP calls." }}))),
+      verify_timeout_seconds: Type.Optional(Type.Number({{ description: "Timeout budget for verification.", default: {verify_timeout} }})),
     }}),
     async execute(_toolCallId, params, signal) {{
       const result = await callBridgeTool("deep_review_agent", {{
@@ -5830,9 +5953,10 @@ export default function (pi: ExtensionAPI) {{
         query: params.query,
         session_id: params.session_id,
         required_verified_sources: params.required_verified_sources ?? 4,
-        include_images: params.include_images ?? false,
+        include_images: params.include_images ?? true,
         selected_urls: params.selected_urls,
-        verify_timeout_seconds: params.verify_timeout_seconds ?? 8,
+        verification_briefs: params.verification_briefs,
+        verify_timeout_seconds: params.verify_timeout_seconds ?? {verify_timeout},
       }}, signal);
       return {{
         content: [{{ type: "text", text: pretty(result) }}],
@@ -5848,13 +5972,15 @@ export default function (pi: ExtensionAPI) {{
     parameters: Type.Object({{
       topic: Type.String({{ description: "Main research topic." }}),
       focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
-      query_count: Type.Optional(Type.Number({{ description: "Number of search variants.", default: 4 }})),
+      agent_name: Type.Optional(Type.String({{ description: "Assigned name from deep_collect_agent agent_calls." }})),
+      query_count: Type.Optional(Type.Number({{ description: "Number of search variants. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
     }}),
     async execute(_toolCallId, params, signal) {{
       const result = await callBridgeTool("deep_tavily_agent", {{
         topic: params.topic,
         focus: params.focus,
-        query_count: params.query_count ?? 4,
+        agent_name: params.agent_name,
+        query_count: params.query_count ?? 2,
       }}, signal);
       return {{
         content: [{{ type: "text", text: pretty(result) }}],
@@ -5870,13 +5996,15 @@ export default function (pi: ExtensionAPI) {{
     parameters: Type.Object({{
       topic: Type.String({{ description: "Main research topic." }}),
       focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
-      query_count: Type.Optional(Type.Number({{ description: "Number of search variants.", default: 4 }})),
+      agent_name: Type.Optional(Type.String({{ description: "Assigned name from deep_collect_agent agent_calls." }})),
+      query_count: Type.Optional(Type.Number({{ description: "Number of search variants. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
     }}),
     async execute(_toolCallId, params, signal) {{
       const result = await callBridgeTool("deep_serp_agent", {{
         topic: params.topic,
         focus: params.focus,
-        query_count: params.query_count ?? 4,
+        agent_name: params.agent_name,
+        query_count: params.query_count ?? 2,
       }}, signal);
       return {{
         content: [{{ type: "text", text: pretty(result) }}],
@@ -5892,13 +6020,15 @@ export default function (pi: ExtensionAPI) {{
     parameters: Type.Object({{
       topic: Type.String({{ description: "Main research topic." }}),
       focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
-      query_count: Type.Optional(Type.Number({{ description: "Number of search variants.", default: 3 }})),
+      agent_name: Type.Optional(Type.String({{ description: "Assigned name from deep_collect_agent agent_calls." }})),
+      query_count: Type.Optional(Type.Number({{ description: "Number of search variants. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
     }}),
     async execute(_toolCallId, params, signal) {{
       const result = await callBridgeTool("deep_wiki_agent", {{
         topic: params.topic,
         focus: params.focus,
-        query_count: params.query_count ?? 3,
+        agent_name: params.agent_name,
+        query_count: params.query_count ?? 2,
       }}, signal);
       return {{
         content: [{{ type: "text", text: pretty(result) }}],
@@ -5914,15 +6044,41 @@ export default function (pi: ExtensionAPI) {{
     parameters: Type.Object({{
       claim: Type.String({{ description: "Claim or topic to verify." }}),
       urls: Type.Array(Type.String({{ description: "URLs to verify." }})),
+      agent_name: Type.Optional(Type.String({{ description: "Assigned name from deep_review_agent agent_calls." }})),
       required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 3 }})),
-      verify_timeout_seconds: Type.Optional(Type.Number({{ description: "Timeout budget for verification.", default: 8 }})),
+      verify_timeout_seconds: Type.Optional(Type.Number({{ description: "Timeout budget for verification.", default: {verify_timeout} }})),
     }}),
     async execute(_toolCallId, params, signal) {{
       const result = await callBridgeTool("deep_verify_agent", {{
         claim: params.claim,
         urls: params.urls,
+        agent_name: params.agent_name,
         required_verified_sources: params.required_verified_sources ?? 3,
-        verify_timeout_seconds: params.verify_timeout_seconds ?? 8,
+        verify_timeout_seconds: params.verify_timeout_seconds ?? {verify_timeout},
+      }}, signal);
+      return {{
+        content: [{{ type: "text", text: pretty(result) }}],
+        details: result,
+      }};
+    }},
+  }});
+
+  pi.registerTool({{
+    name: "deep_image_agent",
+    label: "Deep Image Agent",
+    description: "Find and download sourced image assets for a staged deep research report.",
+    parameters: Type.Object({{
+      topic: Type.String({{ description: "Main research topic." }}),
+      query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
+      max_results: Type.Optional(Type.Number({{ description: "Maximum image assets to collect.", default: 3 }})),
+      output_dir: Type.Optional(Type.String({{ description: "Repo-relative output directory.", default: "report_assets/images" }})),
+    }}),
+    async execute(_toolCallId, params, signal) {{
+      const result = await callBridgeTool("deep_image_agent", {{
+        topic: params.topic,
+        query: params.query,
+        max_results: params.max_results ?? 3,
+        output_dir: params.output_dir ?? "report_assets/images",
       }}, signal);
       return {{
         content: [{{ type: "text", text: pretty(result) }}],
@@ -5945,16 +6101,24 @@ export default function (pi: ExtensionAPI) {{
       }}
     }}
     const prompt = [
-      `Run staged deep research on: ${{topic}}`,
+      `Run deep research in normal mode on: ${{topic}}`,
       "",
+      "Do not switch to Plan mode and do not create todos.",
+      "Every MCP tool call should return within the configured deep research timeout ({timeout_seconds:g}s by default). If a source call times out, keep its compact error and continue with the next small call.",
       "Call deep_plan_agent first and save the returned session_id.",
-      "Call deep_collect_agent next with the same session_id.",
-      "Write the returned collect_markdown to temp/ad.md.",
-      "Call deep_review_agent with the same session_id and overwrite temp/ad.md with the returned reviewed_markdown.",
-      "Use deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent only if you need to extend or cross-check the staged results.",
-      "If images help, call image_research after source verification and include only compact image blocks.",
-      "After image_research returns, continue automatically into synthesis and file writing; do not wait for the user to say continue.",
-      "Create report.md only after the staged review and source verification are complete.",
+      "Call deep_collect_agent next with the same session_id to get agent_calls.",
+      "Call every returned deep_tavily_agent, deep_serp_agent, and deep_wiki_agent entry as its own separate MCP call, one by one.",
+      "Call deep_collect_agent again with the same session_id and subagent_briefs from those individual calls.",
+      "Use the returned temp_files for detailed checkpoints, and keep temp/ad.md only as the legacy compact checkpoint.",
+      "Call deep_review_agent with the same session_id to get verification agent_calls.",
+      "Call every returned deep_verify_agent entry as its own separate MCP call, one by one.",
+      "Call deep_review_agent again with the same session_id and verification_briefs, then overwrite temp/ad.md with the returned reviewed_markdown.",
+      "Call deep_image_agent to download sourced image files into report_assets/images and use the returned local_path values in report.md.",
+      "Call deep_master_review_agent with reviewed_markdown and final_handoff to get 8 master-review agent_calls.",
+      "Call every returned deep_master_* review agent entry as its own separate MCP call, one by one.",
+      "Call deep_master_review_agent again with master_review_briefs and apply final_llm_instructions before writing report.md.",
+      "For /deep, do not call image_research directly; use deep_image_agent for image downloads and report attachments.",
+      "Create report.md only after staged collection, source verification, and the 8-call master review are complete.",
       "When writing the file, call the write tool with both required fields: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. Never call write with content only.",
     ].join("\\n");
     if (ctx.isIdle()) {{
@@ -6608,3 +6772,4 @@ def _start_windows_background(
 
 if __name__ == "__main__":
     main()
+
