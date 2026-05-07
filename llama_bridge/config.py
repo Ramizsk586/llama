@@ -452,6 +452,12 @@ class TelegramBotConfig:
     enabled: bool = False
     bot_token: str | None = None
     allowed_chat_ids: list[str] = field(default_factory=list)
+    owner_chat_ids: list[str] = field(default_factory=list)
+    admin_chat_ids: list[str] = field(default_factory=list)
+    allow_all_chats: bool = False
+    admin_pin_hash: str | None = None
+    core_editing_enabled: bool = False
+    require_owner_approval_for_core_changes: bool = True
     provider: str = "ollama_cloud"
     model: str | None = None
     system_prompt: str = (
@@ -1174,6 +1180,12 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         enabled=bool(telegram_raw.get("enabled", False)),
         bot_token=telegram_raw.get("bot_token"),
         allowed_chat_ids=[str(item) for item in (telegram_raw.get("allowed_chat_ids") or [])],
+        owner_chat_ids=[str(item) for item in (telegram_raw.get("owner_chat_ids") or [])],
+        admin_chat_ids=[str(item) for item in (telegram_raw.get("admin_chat_ids") or [])],
+        allow_all_chats=bool(telegram_raw.get("allow_all_chats", False)),
+        admin_pin_hash=telegram_raw.get("admin_pin_hash"),
+        core_editing_enabled=bool(telegram_raw.get("core_editing_enabled", False)),
+        require_owner_approval_for_core_changes=bool(telegram_raw.get("require_owner_approval_for_core_changes", True)),
         provider=str(telegram_raw.get("provider", codex.provider)),
         model=telegram_raw.get("model"),
         system_prompt=str(
