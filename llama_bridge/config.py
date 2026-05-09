@@ -47,6 +47,8 @@ DEFAULT_CONFIG_TEMPLATE = """server:
   # Auto-started llama servers stop after this many idle seconds.
   # Set to 0 to keep them running until `llama stop`.
   idle_timeout_seconds: 180
+  # Optional second port without built-in tools for use with Open Web UI etc.
+  # openwebui_port: 8090
 
 providers:
   ollama_local:
@@ -210,16 +212,71 @@ telegram:
   enabled: false
   bot_token: ${TELEGRAM_BOT_TOKEN}
   allowed_chat_ids: []
+  owner_chat_ids: []
+  admin_chat_ids: []
+  allow_all_chats: false
   provider: ollama_cloud
   model: gemma4:31b
   system_prompt: "You are a restricted Telegram bot powered by llama bridge. Answer helpfully, keep replies concise, use bridge tools only when clearly needed, and refuse unsafe or privileged actions."
   max_input_chars: 4000
   max_output_tokens: 512
   poll_interval_seconds: 2.0
+  response_timeout_seconds: 180.0
   autonomous_enabled: true
   autonomous_interval_seconds: 1800
   self_evolution_enabled: true
   self_evolution_min_events: 3
+  command_policy:
+    help:
+      enabled: true
+      visible: true
+      permission: everyone
+    web:
+      enabled: true
+      visible: true
+      permission: everyone
+    deep:
+      enabled: true
+      visible: true
+      permission: everyone
+    allow:
+      enabled: true
+      visible: false
+      permission: owner
+    admin:
+      enabled: true
+      visible: false
+      permission: owner
+    core:
+      enabled: true
+      visible: false
+      permission: admin
+  tool_policy:
+    ai_auto_tools:
+      - datetime_now
+      - weather_current
+      - wikipedia_search
+      - tavily_search
+      - source_research
+    command_tools:
+      - image_research
+      - verify_sources
+    blocked_tools:
+      - shell.execute
+    user_visible_tools:
+      - weather_current
+      - wikipedia_search
+      - tavily_search
+      - image_research
+    require_admin_for:
+      - shell.execute
+      - manim_render
+    require_owner_for:
+      - shell.execute
+  telegram_help:
+    show_disabled_commands: false
+    show_tool_list: false
+    show_admin_commands_to_admins_only: true
 
 tools:
   enabled: true
@@ -348,6 +405,28 @@ vs_copilot:
       modified_at: "2026-04-02T09:00:00-08:00"
       size: 1000000000
       digest: dummy-custom-model
+
+openwebui:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+  bridge_tools_port: null
+  bridge_llm_only_port: null
+  auth_enabled: false
+  auto_login: true
+  hf_token: null
+  openai_base_url_mode: llm_only
+  openwebui_data_dir: null
+  web_search_enabled: true
+  web_search_provider: ollama
+  search_result_count: 3
+  concurrent_requests: 1
+  bypass_embedding_and_retrieval: false
+  bypass_web_loader: false
+  preferred_env_name: omx-open-webui
+  preferred_python: null
+  preferred_command: null
+  auto_discover: true
 """
 
 
@@ -357,6 +436,7 @@ class ServerConfig:
     port: int = 8089
     auth_token: str = "change-me"
     idle_timeout_seconds: int = 180
+    openwebui_port: int | None = None
 
 
 @dataclass(slots=True)
@@ -448,6 +528,61 @@ class PoolsideConfig:
 
 
 @dataclass(slots=True)
+class CommandPolicy:
+    enabled: bool = True
+    visible: bool = True
+    permission: str = "everyone"  # everyone, allowed, admin, owner
+
+
+@dataclass(slots=True)
+class ToolPolicy:
+    ai_auto_tools: list[str] = field(default_factory=lambda: [
+        "datetime_now", "weather_current", "wikipedia_search",
+        "tavily_search", "source_research",
+    ])
+    command_tools: list[str] = field(default_factory=lambda: [
+        "image_research", "verify_sources",
+    ])
+    blocked_tools: list[str] = field(default_factory=lambda: ["shell.execute"])
+    user_visible_tools: list[str] = field(default_factory=lambda: [
+        "weather_current", "wikipedia_search",
+        "tavily_search", "image_research",
+    ])
+    require_admin_for: list[str] = field(default_factory=lambda: ["shell.execute", "manim_render"])
+    require_owner_for: list[str] = field(default_factory=lambda: ["shell.execute"])
+
+
+DEFAULT_COMMAND_POLICIES: dict[str, CommandPolicy] = {
+    "help": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "status": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "clear": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "reload": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "whoami": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "memory": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "remember": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "docs": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "editdoc": CommandPolicy(enabled=True, visible=True, permission="admin"),
+    "image": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "file": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "schedule": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "evolve": CommandPolicy(enabled=True, visible=True, permission="admin"),
+    "poll": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "web": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "deep": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "summarize": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "explain": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "myid": CommandPolicy(enabled=True, visible=True, permission="everyone"),
+    "allowlist": CommandPolicy(enabled=True, visible=True, permission="admin"),
+    "allow": CommandPolicy(enabled=True, visible=True, permission="owner"),
+    "admin": CommandPolicy(enabled=True, visible=True, permission="owner"),
+    "owner": CommandPolicy(enabled=True, visible=True, permission="owner"),
+    "core": CommandPolicy(enabled=True, visible=True, permission="admin"),
+    "project": CommandPolicy(enabled=True, visible=True, permission="admin"),
+    "tools": CommandPolicy(enabled=True, visible=True, permission="admin"),
+}
+
+
+@dataclass(slots=True)
 class TelegramBotConfig:
     enabled: bool = False
     bot_token: str | None = None
@@ -473,6 +608,13 @@ class TelegramBotConfig:
     autonomous_interval_seconds: float = 1800.0
     self_evolution_enabled: bool = True
     self_evolution_min_events: int = 3
+    command_policy: dict[str, CommandPolicy] = field(default_factory=lambda: dict(DEFAULT_COMMAND_POLICIES))
+    tool_policy: ToolPolicy = field(default_factory=ToolPolicy)
+    telegram_help: dict[str, bool] = field(default_factory=lambda: {
+        "show_disabled_commands": False,
+        "show_tool_list": False,
+        "show_admin_commands_to_admins_only": True,
+    })
 
 
 @dataclass(slots=True)
@@ -600,6 +742,33 @@ class MasterReviewConfig:
 
 
 @dataclass(slots=True)
+class OpenWebUIConfig:
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8080
+    bridge_tools_port: int | None = None
+    bridge_llm_only_port: int | None = None
+    auth_enabled: bool = False
+    auto_login: bool = True
+    web_search_enabled: bool = True
+    web_search_provider: str = "ollama"
+    web_search_providers: dict[str, ExternalToolProviderConfig] = field(default_factory=dict)
+    search_result_count: int = 3
+    concurrent_requests: int = 1
+    bypass_embedding_and_retrieval: bool = False
+    bypass_web_loader: bool = False
+    hf_token: str | None = None
+    openai_base_url_mode: str = "llm_only"
+    openwebui_data_dir: str | None = None
+    extra_env: dict[str, str] = field(default_factory=dict)
+    # Discovery config
+    preferred_env_name: str = "omx-open-webui"
+    preferred_python: str | None = None
+    preferred_command: str | None = None
+    auto_discover: bool = True
+
+
+@dataclass(slots=True)
 class BridgeConfig:
     server: ServerConfig
     providers: dict[str, ProviderConfig]
@@ -614,6 +783,7 @@ class BridgeConfig:
     vs_copilot_models: list[VsCopilotModel]
     tools: ToolConfig
     master_review: MasterReviewConfig
+    openwebui: OpenWebUIConfig
     source_path: Path
 
 
@@ -1020,11 +1190,13 @@ def load_config(path: Path | None = None) -> BridgeConfig:
     raw = _expand_env(raw)
 
     server_raw = raw.get("server", {})
+    raw_openwebui_port = server_raw.get("openwebui_port")
     server = ServerConfig(
         host=server_raw.get("host", "127.0.0.1"),
         port=int(server_raw.get("port", 8089)),
         auth_token=server_raw.get("auth_token", "change-me"),
         idle_timeout_seconds=max(0, int(server_raw.get("idle_timeout_seconds", 180))),
+        openwebui_port=int(raw_openwebui_port) if raw_openwebui_port is not None else None,
     )
     if server.auth_token == "change-me" and server.host not in {"127.0.0.1", "localhost", "::1"}:
         warnings.warn(
@@ -1175,7 +1347,31 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             f"Unknown provider referenced by poolside.provider: {poolside.provider}"
         )
 
+    def _load_command_policy(raw_policy: dict[str, Any]) -> dict[str, CommandPolicy]:
+        policies = dict(DEFAULT_COMMAND_POLICIES)
+        for cmd_name, entry in raw_policy.items():
+            if isinstance(entry, dict):
+                policies[cmd_name] = CommandPolicy(
+                    enabled=bool(entry.get("enabled", True)),
+                    visible=bool(entry.get("visible", True)),
+                    permission=str(entry.get("permission", "everyone")),
+                )
+        return policies
+
+    def _load_tool_policy(raw_policy: dict[str, Any]) -> ToolPolicy:
+        return ToolPolicy(
+            ai_auto_tools=list(raw_policy.get("ai_auto_tools", ToolPolicy().ai_auto_tools)),
+            command_tools=list(raw_policy.get("command_tools", ToolPolicy().command_tools)),
+            blocked_tools=list(raw_policy.get("blocked_tools", ToolPolicy().blocked_tools)),
+            user_visible_tools=list(raw_policy.get("user_visible_tools", ToolPolicy().user_visible_tools)),
+            require_admin_for=list(raw_policy.get("require_admin_for", ToolPolicy().require_admin_for)),
+            require_owner_for=list(raw_policy.get("require_owner_for", ToolPolicy().require_owner_for)),
+        )
+
     telegram_raw = raw.get("telegram", {}) or {}
+    command_policy_raw = telegram_raw.get("command_policy", {}) or {}
+    tool_policy_raw = telegram_raw.get("tool_policy", {}) or {}
+    telegram_help_raw = telegram_raw.get("telegram_help", {}) or {}
     telegram = TelegramBotConfig(
         enabled=bool(telegram_raw.get("enabled", False)),
         bot_token=telegram_raw.get("bot_token"),
@@ -1208,6 +1404,13 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         ),
         self_evolution_enabled=bool(telegram_raw.get("self_evolution_enabled", True)),
         self_evolution_min_events=max(1, int(telegram_raw.get("self_evolution_min_events", 3))),
+        command_policy=_load_command_policy(command_policy_raw.get("commands", {}) if "commands" in command_policy_raw else command_policy_raw),
+        tool_policy=_load_tool_policy(tool_policy_raw),
+        telegram_help={
+            "show_disabled_commands": bool(telegram_help_raw.get("show_disabled_commands", False)),
+            "show_tool_list": bool(telegram_help_raw.get("show_tool_list", False)),
+            "show_admin_commands_to_admins_only": bool(telegram_help_raw.get("show_admin_commands_to_admins_only", True)),
+        },
     )
     if telegram.provider not in providers:
         raise ValueError(
@@ -1217,6 +1420,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
     vs_copilot_models = _load_vs_copilot_models(raw, providers, aliases, pi, codex)
     tools = _load_tool_config(raw)
     master_review = _load_master_review_config(raw)
+    openwebui = _load_openwebui_config(raw, server, tools)
 
     bridge_config = BridgeConfig(
         server=server,
@@ -1232,6 +1436,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         vs_copilot_models=vs_copilot_models,
         tools=tools,
         master_review=master_review,
+        openwebui=openwebui,
         source_path=config_path,
     )
     write_claude_api_settings(
@@ -1520,6 +1725,44 @@ def _default_vs_copilot_models(
     provider = providers[alias.provider]
     model = alias.model or provider.default_model or alias.alias
     return [{"name": model, "provider": alias.provider, "model": model}]
+
+
+def _load_openwebui_config(raw: dict[str, Any], server: ServerConfig, tools: ToolConfig) -> OpenWebUIConfig:
+    owui_raw = raw.get("openwebui", {}) or {}
+    web_search_providers: dict[str, ExternalToolProviderConfig] = {}
+    ow_providers_raw = owui_raw.get("web_search_providers", {}) or {}
+    for name in ("ollama", "tavily", "serpapi", "searchapi"):
+        p_raw = ow_providers_raw.get(name, {}) or {}
+        web_search_providers[name] = ExternalToolProviderConfig(
+            enabled=bool(p_raw.get("enabled", True)),
+            api_key=p_raw.get("api_key"),
+            base_url=p_raw.get("base_url"),
+            defaults=p_raw.get("defaults", {}) or {},
+        )
+    return OpenWebUIConfig(
+        enabled=bool(owui_raw.get("enabled", True)),
+        host=str(owui_raw.get("host", "127.0.0.1")),
+        port=int(owui_raw.get("port", 8080)),
+        bridge_tools_port=int(owui_raw["bridge_tools_port"]) if owui_raw.get("bridge_tools_port") is not None else None,
+        bridge_llm_only_port=int(owui_raw["bridge_llm_only_port"]) if owui_raw.get("bridge_llm_only_port") is not None else None,
+        auth_enabled=bool(owui_raw.get("auth_enabled", False)),
+        auto_login=bool(owui_raw.get("auto_login", True)),
+        web_search_enabled=bool(owui_raw.get("web_search_enabled", tools.default_search_provider != "disabled" if hasattr(tools, 'default_search_provider') else True)),
+        web_search_provider=str(owui_raw.get("web_search_provider", "ollama")),
+        web_search_providers=web_search_providers,
+        search_result_count=max(1, int(owui_raw.get("search_result_count", 3))),
+        concurrent_requests=max(1, int(owui_raw.get("concurrent_requests", 1))),
+        bypass_embedding_and_retrieval=bool(owui_raw.get("bypass_embedding_and_retrieval", False)),
+        bypass_web_loader=bool(owui_raw.get("bypass_web_loader", False)),
+        hf_token=owui_raw.get("hf_token"),
+        openai_base_url_mode=str(owui_raw.get("openai_base_url_mode", "llm_only")),
+        openwebui_data_dir=owui_raw.get("openwebui_data_dir"),
+        extra_env=dict(owui_raw.get("extra_env", {}) or {}),
+        preferred_env_name=str(owui_raw.get("preferred_env_name", "omx-open-webui")),
+        preferred_python=owui_raw.get("preferred_python"),
+        preferred_command=owui_raw.get("preferred_command"),
+        auto_discover=bool(owui_raw.get("auto_discover", True)),
+    )
 
 
 def _default_config_template_path() -> Path:

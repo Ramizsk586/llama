@@ -19,6 +19,9 @@ dependencies = [
 video = [
   "manim>=0.20.0",
 ]
+openwebui = [
+  "open-webui>=0.3.0",
+]
 
 [project.scripts]
 llama = "llama_bridge.cli:main"

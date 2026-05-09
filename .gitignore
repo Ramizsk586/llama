@@ -17,3 +17,6 @@ test.py
 plugins
 llama_bridge_tools_claude
 .backups
+llama.telegram.active.json
+llama.telegram.log
+openwebui.log

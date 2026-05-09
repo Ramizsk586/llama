@@ -966,16 +966,43 @@ class TeligramBot:
             await asyncio.sleep(4.0)
 
     async def set_my_commands(self) -> None:
+        enabled_commands = []
+        for command, description in COMMANDS:
+            policy = self.telegram.command_policy.get(command)
+            if policy is None or (policy.enabled and policy.visible):
+                enabled_commands.append({"command": command, "description": description})
         response = await self.http.post(
             f"{self.api_base}/setMyCommands",
-            json={
-                "commands": [
-                    {"command": command, "description": description}
-                    for command, description in COMMANDS
-                ]
-            },
+            json={"commands": enabled_commands},
         )
         response.raise_for_status()
+
+    def _chat_role(self, chat_id: str, username: str = "") -> str:
+        if self.is_owner_chat(chat_id, username):
+            return "owner"
+        if self.is_admin_chat(chat_id, username):
+            return "admin"
+        if self.is_allowed_chat(chat_id, username):
+            return "allowed"
+        return "everyone"
+
+    def _command_allowed_for_role(self, command: str, role: str) -> bool:
+        policy = self.telegram.command_policy.get(command)
+        if policy is None:
+            return True
+        if not policy.enabled:
+            return False
+        required = policy.permission
+        role_order = {"everyone": 0, "allowed": 1, "admin": 2, "owner": 3}
+        return role_order.get(role, 0) >= role_order.get(required, 0)
+
+    def _filter_tools_by_policy(self) -> list[dict[str, Any]]:
+        if not self.tools:
+            return []
+        available = self.tools.openai_tools()
+        tp = self.telegram.tool_policy
+        blocked = set(tp.blocked_tools)
+        return [t for t in available if openai_tool_name(t) not in blocked]
 
     async def get_updates(self, offset: int | None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
@@ -1002,8 +1029,14 @@ class TeligramBot:
             return False
         command, argument = parsed
 
+        # Check command policy
+        role = self._chat_role(chat_id, "")
+        if command != "myid" and not self._command_allowed_for_role(command, role):
+            await self.send_message(chat_id, "Unknown command. Send /help to see available commands.")
+            return True
+
         if command in {"start", "help"}:
-            await self.send_message(chat_id, self.help_text())
+            await self.send_message(chat_id, self.help_text(chat_id, ""))
             return True
         if command == "status":
             await self.send_message(chat_id, self.status_text())
@@ -1121,9 +1154,6 @@ class TeligramBot:
             )
             return True
 
-        if command == "myid":
-            await self.send_message(chat_id, self.myid_text(chat_id, username, user_id))
-            return True
         if command == "allowlist":
             try:
                 self.require_admin(chat_id, username)
@@ -1497,7 +1527,13 @@ class TeligramBot:
             if not self.tools:
                 await self.send_message(chat_id, "No tools available")
                 return
-            names = sorted(self.available_tool_names())
+            tp = self.telegram.tool_policy
+            visible = set(tp.user_visible_tools)
+            all_names = self.available_tool_names()
+            if self.is_admin_chat(chat_id):
+                names = sorted(all_names)
+            else:
+                names = sorted(n for n in all_names if n in visible)
             await self.send_message(chat_id, f"Enabled tools: {', '.join(names) if names else 'none'}")
         elif subcommand == "test":
             if not self.is_admin_chat(chat_id):
@@ -1696,7 +1732,7 @@ class TeligramBot:
     def selected_openai_tools(self, messages: list[dict[str, str]]) -> list[dict[str, Any]]:
         if not self.tools or not getattr(self.provider_cfg, "supports_tools", False):
             return []
-        available = self.tools.openai_tools()
+        available = self._filter_tools_by_policy()
         if not available:
             return []
         query = latest_user_text(messages)[:500]
@@ -2715,28 +2751,25 @@ class TeligramBot:
             f"Allow all chats: {self.allow_all_chats}"
         )
 
-    def help_text(self) -> str:
-        return (
-            f"{self.agent_name} commands\n\n"
-            "/help - Show this list\n"
-            "/status - Show provider/model/workspace status\n"
-            "/clear - Clear this chat's memory\n"
-            "/reload - Reload workspace Markdown files\n"
-            "/whoami - Show agent identity\n"
-            "/memory - Show memory summary\n"
-            "/remember <note> - Save a memory note or rule\n"
-            "/docs - Show editable bot docs\n"
-            "/image <query> - Find and send an image\n"
-            "/file <txt|md|pdf> <name> | <request> - Create and send a file\n"
-            "/schedule <daily task> - Add an autonomous daily task\n"
-            "/evolve status|run|skills - Self-evolution controls\n"
-            "/poll Question | option 1 | option 2 - Create a poll\n"
-            "/web <query> - Web/search mode\n"
-            "/deep <topic> - Deeper research mode\n"
-            "/summarize <text> - Summarize text\n"
-            "/explain <topic> - Explain a topic\n\n"
-            "You can also just send a normal message."
-        )
+    def help_text(self, chat_id: str = "", username: str = "") -> str:
+        role = self._chat_role(chat_id, username)
+        lines = [f"{self.agent_name} commands\n"]
+        for cmd, description in COMMANDS:
+            policy = self.telegram.command_policy.get(cmd)
+            if policy is None:
+                include = True
+            else:
+                include = policy.enabled and policy.visible
+                if include:
+                    required = policy.permission
+                    role_order = {"everyone": 0, "allowed": 1, "admin": 2, "owner": 3}
+                    if role_order.get(role, 0) < role_order.get(required, 0):
+                        include = False
+            if include:
+                lines.append(f"/{cmd} - {description}")
+        lines.append("")
+        lines.append("You can also just send a normal message.")
+        return "\n".join(lines)
 
     def tools_available(self) -> bool:
         tools = getattr(self.config, "tools", None)

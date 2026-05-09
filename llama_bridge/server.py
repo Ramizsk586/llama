@@ -56,6 +56,7 @@ def create_app(
     idle_timeout_seconds: int = 0,
     idle_after_file: Path | None = None,
     config: BridgeConfig | None = None,
+    include_tools: bool = True,
 ) -> FastAPI:
     if config is None:
         config = load_config(config_path)
@@ -65,8 +66,12 @@ def create_app(
         name: build_provider(provider_config)
         for name, provider_config in config.providers.items()
     }
-    app.state.tools = ToolRegistry(config)
-    app.state.tool_manager = ToolManager(app.state.tools, config)
+    app.state.tools = ToolRegistry(config) if include_tools else None
+    app.state.tool_manager = (
+        ToolManager(app.state.tools, config)
+        if include_tools and app.state.tools is not None
+        else None
+    )
     app.state.anthropic_batches = {}
     app.state.anthropic_files = {}
     app.state.anthropic_skills = {}
@@ -88,7 +93,7 @@ def create_app(
                 _shutdown_after_idle(app, idle_timeout_seconds, idle_after_file)
             )
 
-    if config.telegram.enabled and config.telegram.bot_token and not config.telegram.bot_token.startswith("${"):
+    if include_tools and config.telegram.enabled and config.telegram.bot_token and not config.telegram.bot_token.startswith("${"):
         @app.on_event("startup")
         async def start_telegram_bot() -> None:
             app.state.telegram_task = asyncio.create_task(_run_embedded_telegram_bot(app))
@@ -102,7 +107,8 @@ def create_app(
                 await telegram_task
         for provider in app.state.providers.values():
             await provider.aclose()
-        await app.state.tools.aclose()
+        if app.state.tools is not None:
+            await app.state.tools.aclose()
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -1185,128 +1191,130 @@ def create_app(
         body = await request.json()
         return await _ollama_web_request(app, config, "web_fetch", body)
 
-    @app.get("/v1/tools")
-    @app.get("/api/tools")
-    async def list_bridge_tools(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
-        _check_tools_auth(config, x_api_key, authorization)
-        if not config.tools.expose_http:
-            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
-        tool_manager = app.state.tool_manager
-        full_schema = request.query_params.get("full_schema") == "true"
-        management_tools = tool_manager.management_openai_tools() if tool_manager else []
-        bridge_tools = app.state.tools.openai_tools()
-        if full_schema:
+    if include_tools:
+
+        @app.get("/v1/tools")
+        @app.get("/api/tools")
+        async def list_bridge_tools(
+            request: Request,
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+        ):
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            tool_manager = app.state.tool_manager
+            full_schema = request.query_params.get("full_schema") == "true"
+            management_tools = tool_manager.management_openai_tools() if tool_manager else []
+            bridge_tools = app.state.tools.openai_tools()
+            if full_schema:
+                return _bridge_tools_response_from_list([*bridge_tools, *management_tools])
             return _bridge_tools_response_from_list([*bridge_tools, *management_tools])
-        return _bridge_tools_response_from_list([*bridge_tools, *management_tools])
 
-    @app.post("/v1/tools/call")
-    @app.post("/api/tools/call")
-    async def call_bridge_tool(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
-        _check_tools_auth(config, x_api_key, authorization)
-        if not config.tools.expose_http:
-            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
-        body = await request.json()
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="tool call body must be an object")
-        name = body.get("name") or body.get("tool")
-        arguments = _bridge_tool_arguments(body)
-        if not isinstance(name, str) or not name:
-            raise HTTPException(status_code=400, detail="name is required")
-        if not isinstance(arguments, dict):
-            raise HTTPException(status_code=400, detail="arguments must be an object")
-        return await _call_bridge_tool(app, name, arguments)
+        @app.post("/v1/tools/call")
+        @app.post("/api/tools/call")
+        async def call_bridge_tool(
+            request: Request,
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+        ):
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="tool call body must be an object")
+            name = body.get("name") or body.get("tool")
+            arguments = _bridge_tool_arguments(body)
+            if not isinstance(name, str) or not name:
+                raise HTTPException(status_code=400, detail="name is required")
+            if not isinstance(arguments, dict):
+                raise HTTPException(status_code=400, detail="arguments must be an object")
+            return await _call_bridge_tool(app, name, arguments)
 
-    @app.post("/v1/tools/{tool_name}")
-    @app.post("/api/tools/{tool_name}")
-    async def call_named_bridge_tool(
-        tool_name: str,
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
-        _check_tools_auth(config, x_api_key, authorization)
-        if not config.tools.expose_http:
-            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
-        body = await _optional_json(request)
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="tool arguments must be an object")
-        return await _call_bridge_tool(app, tool_name, _bridge_tool_arguments(body))
+        @app.post("/v1/tools/{tool_name}")
+        @app.post("/api/tools/{tool_name}")
+        async def call_named_bridge_tool(
+            tool_name: str,
+            request: Request,
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+        ):
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            body = await _optional_json(request)
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="tool arguments must be an object")
+            return await _call_bridge_tool(app, tool_name, _bridge_tool_arguments(body))
 
-    @app.get("/v1/tools/compact")
-    @app.get("/api/tools/compact")
-    async def compact_tool_catalog(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-        query: str = "",
-        limit: int = 20,
-    ):
-        _check_tools_auth(config, x_api_key, authorization)
-        if not config.tools.expose_http:
-            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
-        tool_manager = app.state.tool_manager
-        compact = tool_manager.compact_manifest(query or "test", "openai")
-        return {"ok": True, "data": compact[:limit], "total": len(compact)}
+        @app.get("/v1/tools/compact")
+        @app.get("/api/tools/compact")
+        async def compact_tool_catalog(
+            request: Request,
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+            query: str = "",
+            limit: int = 20,
+        ):
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            tool_manager = app.state.tool_manager
+            compact = tool_manager.compact_manifest(query or "test", "openai")
+            return {"ok": True, "data": compact[:limit], "total": len(compact)}
 
-    @app.get("/v1/tools/{tool_name}/schema")
-    @app.get("/api/tools/{tool_name}/schema")
-    async def get_tool_schema(
-        tool_name: str,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-        fmt: str = "openai",
-    ):
-        _check_tools_auth(config, x_api_key, authorization)
-        if not config.tools.expose_http:
-            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
-        tool_manager = app.state.tool_manager
-        result = await tool_manager.call_management_tool(
-            "tool_schema_get", {"name": tool_name, "format": fmt}, "openai", None
-        )
-        return result
+        @app.get("/v1/tools/{tool_name}/schema")
+        @app.get("/api/tools/{tool_name}/schema")
+        async def get_tool_schema(
+            tool_name: str,
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+            fmt: str = "openai",
+        ):
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            tool_manager = app.state.tool_manager
+            result = await tool_manager.call_management_tool(
+                "tool_schema_get", {"name": tool_name, "format": fmt}, "openai", None
+            )
+            return result
 
-    @app.get("/v1/tools/{tool_name}/help")
-    @app.get("/api/tools/{tool_name}/help")
-    async def get_tool_help(
-        tool_name: str,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
-        _check_tools_auth(config, x_api_key, authorization)
-        if not config.tools.expose_http:
-            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
-        tool_manager = app.state.tool_manager
-        result = await tool_manager.call_management_tool(
-            "tool_usage_help", {"name": tool_name}, "openai", None
-        )
-        return result
+        @app.get("/v1/tools/{tool_name}/help")
+        @app.get("/api/tools/{tool_name}/help")
+        async def get_tool_help(
+            tool_name: str,
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+        ):
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            tool_manager = app.state.tool_manager
+            result = await tool_manager.call_management_tool(
+                "tool_usage_help", {"name": tool_name}, "openai", None
+            )
+            return result
 
-    @app.post("/v1/tools/search")
-    @app.post("/api/tools/search")
-    async def search_tools(
-        request: Request,
-        x_api_key: str | None = Header(default=None),
-        authorization: str | None = Header(default=None),
-    ):
-        _check_tools_auth(config, x_api_key, authorization)
-        if not config.tools.expose_http:
-            raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
-        body = await request.json()
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="Request body must be an object")
-        tool_manager = app.state.tool_manager
-        result = await tool_manager.call_management_tool(
-            "tool_catalog_search", body, "openai", None
-        )
-        return result
+        @app.post("/v1/tools/search")
+        @app.post("/api/tools/search")
+        async def search_tools(
+            request: Request,
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+        ):
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="Request body must be an object")
+            tool_manager = app.state.tool_manager
+            result = await tool_manager.call_management_tool(
+                "tool_catalog_search", body, "openai", None
+            )
+            return result
 
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(
@@ -1457,7 +1465,7 @@ def _safe_stream(source: AsyncIterable[str]) -> _SafeAsyncStream:
 
 def _with_bridge_tools(
     payload: dict[str, Any],
-    registry: ToolRegistry,
+    registry: ToolRegistry | None,
     config: BridgeConfig | None = None,
     enable_filtering: bool = True,
     max_exposed_tools: int = 5,
@@ -1467,7 +1475,10 @@ def _with_bridge_tools(
     """
     Merge bridge tools into request, optionally filtering by relevance.
     Uses ToolManager for compact-first tool management when enabled.
+    Returns payload unchanged when registry is None (no tools available).
     """
+    if registry is None:
+        return payload
     query = _latest_user_text(payload.get("messages", []))[:500]
     request_profile = _request_tool_profile(config, provider_config, payload.get("model"), query)
 
@@ -1964,7 +1975,8 @@ async def _chat_completion_with_bridge_tools(
     """
     request_payload = {**payload, "messages": list(payload.get("messages") or [])}
     tool_manager = getattr(app.state, "tool_manager", None)
-    bridge_tool_names = set(app.state.tools._tools)
+    tools_registry = getattr(app.state, "tools", None)
+    bridge_tool_names = set(tools_registry._tools) if tools_registry is not None else set()
     management_tool_names = (
         {
             ((tool.get("function") or {}).get("name") or tool.get("name") or "")
@@ -2077,38 +2089,37 @@ async def _chat_completion_with_bridge_tools(
                 },
             )
 
-            try:
-                tool_result = await app.state.tools.call_structured(name, arguments)
-                _write_dev_log(
-                    config,
-                    "tool_call_success" if tool_result.get("ok") else "tool_call_error",
-                    {
-                        "tool": name,
-                        "call_id": tool_call.get("id"),
-                        "ok": tool_result.get("ok"),
-                        "arguments": arguments,
-                        "result": tool_result,
-                    },
-                )
-            except Exception as exc:
-                error_msg = str(exc)
-                _write_dev_log(
-                    config,
-                    "tool_call_error",
-                    {
-                        "tool": name,
-                        "call_id": tool_call.get("id"),
-                        "error": error_msg,
-                        "error_type": type(exc).__name__,
-                    },
-                )
+            tools_registry = getattr(app.state, "tools", None)
+            if tools_registry is None:
                 tool_result = {
                     "ok": False,
                     "tool": name,
-                    "error": error_msg,
-                    "retryable": not isinstance(exc, (KeyError, ValueError)),
+                    "error": "Tools are not available on this server instance",
+                    "retryable": False,
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
+            else:
+                try:
+                    tool_result = await tools_registry.call_structured(name, arguments)
+                except Exception as exc:
+                    error_msg = str(exc)
+                    _write_dev_log(
+                        config,
+                        "tool_call_error",
+                        {
+                            "tool": name,
+                            "call_id": tool_call.get("id"),
+                            "error": error_msg,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    tool_result = {
+                        "ok": False,
+                        "tool": name,
+                        "error": error_msg,
+                        "retryable": not isinstance(exc, (KeyError, ValueError)),
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    }
 
             request_payload["messages"].append(
                 {

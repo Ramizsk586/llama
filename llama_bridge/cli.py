@@ -667,12 +667,13 @@ def main() -> None:
                 remove_target=args.rm,
             )
             return
-        if args.command == "telegram":
+        if args.command in ("telegram", "telegram-ui", "bot-ui", "teligram-ui"):
             config_path = _arg_path(args.config)
-            if args.telegram_command == "status":
-                _cmd_telegram_status(config_path)
-                return
-            parser.print_help()
+            _cmd_telegram_gui(config_path)
+            return
+        if args.command in ("gui", "control-center", "cc"):
+            config_path = _arg_path(args.config)
+            _cmd_llama_gui(config_path)
             return
         if args.command == "bot":
             config_path = _arg_path(getattr(args, "bot_run_config", None) or args.config)
@@ -694,7 +695,46 @@ def main() -> None:
                     args.chat_id,
                 )
                 return
+            if args.bot_command == "send-ai":
+                _cmd_bot_send_ai(config_path, " ".join(args.message).strip(), args.chat_id)
+                return
+            if args.bot_command == "test-token":
+                _cmd_bot_test_token(config_path)
+                return
+            if args.bot_command == "logs":
+                _cmd_bot_logs(config_path)
+                return
             parser.print_help()
+            return
+
+        if args.command in ("openwebui", "webui", "owui"):
+            config_path = _arg_path(args.config)
+            sub = args.owui_command
+            if sub is None or sub == "gui":
+                _cmd_openwebui_gui(config_path)
+                return
+            if sub == "start":
+                _cmd_openwebui_start(config_path, auth=args.auth, web_search=args.web_search, provider=args.provider)
+                return
+            if sub == "stop":
+                _cmd_openwebui_stop(config_path)
+                return
+            if sub == "restart":
+                _cmd_openwebui_restart(config_path)
+                return
+            if sub == "status":
+                _cmd_openwebui_status(config_path)
+                return
+            if sub == "logs":
+                _cmd_openwebui_logs(config_path)
+                return
+            if sub == "test-search":
+                _cmd_openwebui_test_search(config_path, args.query)
+                return
+            if sub == "configure":
+                _cmd_openwebui_configure(config_path)
+                return
+            _print_state("warn", f"Unknown openwebui subcommand: {sub}", "33")
             return
 
         parser.print_help()
@@ -1103,6 +1143,45 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_send_cmd = bot_subparsers.add_parser("send", help="send a Telegram message from the bot")
     bot_send_cmd.add_argument("--chat-id", help="explicit Telegram chat ID to send to")
     bot_send_cmd.add_argument("message", nargs="+", help="message text to send")
+    bot_send_ai = bot_subparsers.add_parser("send-ai", help="send an AI-generated message via Telegram")
+    bot_send_ai.add_argument("--chat-id", help="explicit Telegram chat ID to send to")
+    bot_send_ai.add_argument("message", nargs="+", help="prompt for the AI message")
+    bot_subparsers.add_parser("test-token", help="test Telegram bot token via getMe")
+    bot_subparsers.add_parser("logs", help="show last 50 lines of Telegram bot log")
+
+    tgui_cmd = subparsers.add_parser(
+        "telegram-ui",
+        help="Telegram Bot Setup Center - manage Telegram bot via compact GUI",
+        aliases=["bot-ui", "teligram-ui"],
+    )
+    tgui_cmd.add_argument("--config")
+
+    gui_cmd = subparsers.add_parser(
+        "gui",
+        help="Llama Bridge Control Center - manage server, providers, CLI tools via compact GUI",
+        aliases=["control-center", "cc"],
+    )
+    gui_cmd.add_argument("--config")
+
+    owui_cmd = subparsers.add_parser(
+        "openwebui",
+        help="Open WebUI Setup Center - manage Open WebUI and bridge together",
+        aliases=["webui", "owui"],
+    )
+    owui_cmd.add_argument("--config")
+    owui_sub = owui_cmd.add_subparsers(dest="owui_command")
+    owui_sub.add_parser("gui", help="launch the Open WebUI Setup Center GUI")
+    owui_start = owui_sub.add_parser("start", help="start Open WebUI (with bridge if needed)")
+    owui_start.add_argument("--auth", choices=["on", "off"], default=None, help="enable/disable authentication")
+    owui_start.add_argument("--web-search", choices=["on", "off"], default=None, help="enable/disable web search")
+    owui_start.add_argument("--provider", choices=["ollama", "tavily", "serpapi", "searchapi", "disabled"], default=None, help="web search provider")
+    owui_sub.add_parser("stop", help="stop Open WebUI")
+    owui_sub.add_parser("restart", help="restart Open WebUI")
+    owui_sub.add_parser("status", help="show Open WebUI and bridge status")
+    owui_sub.add_parser("logs", help="show Open WebUI logs")
+    owui_test = owui_sub.add_parser("test-search", help="test web search provider connectivity")
+    owui_test.add_argument("query", nargs="?", default="Open WebUI test search", help="search query to test with")
+    owui_sub.add_parser("configure", help="interactive Open WebUI configuration (CLI)")
 
     return parser
 
@@ -1378,8 +1457,20 @@ def _ensure_teligram_workspace_files(workspace: Path) -> None:
 
 def _cmd_endpoints() -> None:
     _title("llama endpoints")
-    _print_note("Use http://127.0.0.1:8089 for Ollama-style clients.")
-    _print_note("Use http://127.0.0.1:8089/v1 for OpenAI, LM Studio, Copilot, and Codex clients.")
+    port = 8089
+    host = "127.0.0.1"
+    owui_port = None
+    try:
+        cfg = load_config()
+        port = cfg.server.port
+        host = cfg.server.host
+        owui_port = cfg.server.openwebui_port
+    except Exception:
+        pass
+    _print_note(f"Use http://{host}:{port} for Ollama-style clients.")
+    _print_note(f"Use http://{host}:{port}/v1 for OpenAI, LM Studio, Copilot, and Codex clients.")
+    if owui_port is not None:
+        _print_note(f"Use http://{host}:{owui_port} for Open Web UI (LLM-only, no tools).")
     print()
     for group, rows in ENDPOINT_GROUPS:
         _print_endpoint_group(group, rows)
@@ -1663,8 +1754,33 @@ def _cmd_serve_foreground(
         config_path,
         idle_timeout_seconds=idle_timeout_seconds,
         idle_after_file=idle_after_file,
+        include_tools=True,
     )
-    uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="info")
+
+    openwebui_port = config.server.openwebui_port
+    if openwebui_port is not None:
+        app_no_tools = create_app(
+            config_path,
+            idle_timeout_seconds=0,
+            idle_after_file=None,
+            include_tools=False,
+        )
+        _print_state("dual", f"tools on {config.server.host}:{config.server.port}, llm-only on {config.server.host}:{openwebui_port}", "36")
+
+        async def _run_dual() -> None:
+            server_main = uvicorn.Server(
+                uvicorn.Config(app, host=config.server.host, port=config.server.port, log_level="info")
+            )
+            server_openwebui = uvicorn.Server(
+                uvicorn.Config(app_no_tools, host=config.server.host, port=openwebui_port, log_level="info")
+            )
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(server_main.serve())
+                tg.create_task(server_openwebui.serve())
+
+        asyncio.run(_run_dual())
+    else:
+        uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="info")
 
 
 def _configure_server_event_loop() -> None:
@@ -1688,7 +1804,7 @@ def _cmd_start(
     ensure_default_dirs(pid_path.parent)
     ensure_default_dirs(log_path.parent)
     _sync_config_clone_from_root(config_path)
-    load_config(config_path)
+    cfg = load_config(config_path)
     already_running, running_url = _server_is_running(config_path, pid_path)
     if _is_running(pid_path):
         _print_state("run", f"llama server is already running with pid {pid_path.read_text().strip()}", "32")
@@ -1722,6 +1838,9 @@ def _cmd_start(
             _print_note("Server will stay up until you run `llama stop`.")
         else:
             _print_note(f"Server will stop after {_format_idle_duration(idle_timeout_seconds)} of inactivity.")
+        openwebui_port = _try_openwebui_port(config_path)
+        if openwebui_port is not None:
+            _print_note(f"LLM-only (no tools) server on {_server_url(cfg.server.host, openwebui_port)} for Open Web UI")
         return
 
     with log_path.open("a", encoding="utf-8") as handle:
@@ -1748,6 +1867,17 @@ def _cmd_start(
         _print_note("Server will stay up until you run `llama stop`.")
     else:
         _print_note(f"Server will stop after {_format_idle_duration(idle_timeout_seconds)} of inactivity.")
+    openwebui_port = _try_openwebui_port(config_path)
+    if openwebui_port is not None:
+        _print_note(f"LLM-only (no tools) server on {_server_url(cfg.server.host, openwebui_port)} for Open Web UI")
+
+
+def _try_openwebui_port(config_path: Path) -> int | None:
+    try:
+        config = load_config(config_path)
+        return config.server.openwebui_port
+    except Exception:
+        return None
 
 
 def _sync_config_clone_from_root(config_path: Path) -> bool:
@@ -1851,12 +1981,10 @@ def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
         pid_path.unlink(missing_ok=True)
         pid = None
 
-    url = None
-    http_status = None
     if config is not None:
-        url = _server_url(config.server.host, config.server.port)
-        http_status = _http_status(url)
-        if not process_running and http_status.startswith("ok"):
+        main_url = _server_url(config.server.host, config.server.port)
+        main_http = _http_status(main_url)
+        if not process_running and main_http.startswith("ok"):
             process_running = True
 
     _title("llama status")
@@ -1867,10 +1995,13 @@ def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
         rows.append(("pid", "unknown"))
 
     if config is not None:
+        rows.append(("url (tools)", f"{main_url} ({main_http})" if main_http else main_url))
+        if config.server.openwebui_port is not None:
+            owui_url = _server_url(config.server.host, config.server.openwebui_port)
+            owui_http = _http_status(owui_url)
+            rows.append(("url (llm-only)", f"{owui_url} ({owui_http})" if owui_http else owui_url))
         rows.extend(
             [
-                ("url", url or ""),
-                ("http", http_status or ""),
                 ("config", str(config.source_path)),
                 ("claude settings", str(api_settings_path)),
                 ("connect", f"claude --settings {api_settings_path}"),
@@ -2018,6 +2149,88 @@ def _cmd_bot_send(config_path: Path, message: str, chat_id: str | None = None) -
             ("message", message[:80] + ("..." if len(message) > 80 else "")),
         ]
     )
+
+
+def _cmd_bot_send_ai(config_path: Path, prompt: str, chat_id: str | None = None) -> None:
+    config = load_config(config_path)
+    telegram = config.telegram
+    if not telegram.enabled or not telegram.bot_token or telegram.bot_token.startswith("${"):
+        raise SystemExit("Telegram bot is not configured.")
+    if not prompt.strip():
+        raise SystemExit("Prompt text is required.")
+
+    target_chat_id = str(chat_id or _default_telegram_chat_id(config, config_path) or "").strip()
+    if not target_chat_id:
+        raise SystemExit("No Telegram chat target found.")
+
+    from .providers import build_provider
+    provider = build_provider(config.providers[telegram.provider])
+    messages = [
+        {"role": "system", "content": telegram.system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+    response = provider.chat_completion(
+        messages=messages,
+        model=telegram.model or config.providers[telegram.provider].default_model,
+        max_output_tokens=telegram.max_output_tokens,
+    )
+    content = response.choices[0].message.content if hasattr(response, "choices") else str(response)
+
+    resp = httpx.post(
+        f"https://api.telegram.org/bot{telegram.bot_token}/sendMessage",
+        json={"chat_id": target_chat_id, "text": content},
+        timeout=httpx.Timeout(30.0, connect=10.0),
+    )
+    resp.raise_for_status()
+    _title("llama bot send-ai")
+    _print_state("ok", "AI message sent", "32")
+    _kv_rows([("chat", target_chat_id), ("prompt", prompt[:60] + ("..." if len(prompt) > 60 else ""))])
+
+
+def _cmd_bot_test_token(config_path: Path) -> None:
+    config = load_config(config_path)
+    token = config.telegram.bot_token
+    if not token or token.startswith("${"):
+        raise SystemExit("Bot token not configured.")
+    from .telegram_launcher import test_telegram_token
+    result = test_telegram_token(token)
+    if result.get("ok"):
+        info = result["result"]
+        _title("llama bot test-token")
+        _print_state("ok", "Token is valid", "32")
+        _kv_rows([
+            ("username", f"@{info.get('username', '?')}"),
+            ("id", info.get("id", "?")),
+            ("first_name", info.get("first_name", "?")),
+        ])
+    else:
+        raise SystemExit(f"Token test failed: {result.get('error', 'unknown')}")
+
+
+def _cmd_bot_logs(config_path: Path) -> None:
+    from .telegram_launcher import follow_telegram_log
+    lines = follow_telegram_log(config_path, n_lines=50)
+    _title("llama bot logs")
+    for line in lines:
+        print(line)
+
+
+def _cmd_telegram_gui(config_path: Path) -> None:
+    from .telegram_setup_gui import HAS_TK as _HAS_TK
+    if not _HAS_TK:
+        raise SystemExit("Tkinter is not available. Install python-tk or python3-tk.")
+    from .telegram_setup_gui import TelegramSetupCenter
+    app = TelegramSetupCenter(config_path)
+    app.run()
+
+
+def _cmd_llama_gui(config_path: Path) -> None:
+    from .llama_gui import HAS_TK as _HAS_TK
+    if not _HAS_TK:
+        raise SystemExit("Tkinter is not available. Install python-tk or python3-tk.")
+    from .llama_gui import LlamaControlCenter
+    app = LlamaControlCenter(config_path)
+    app.run()
 
 
 def _render_api_limits_screen(config) -> None:
@@ -6743,6 +6956,155 @@ def _serve_command(
     if idle_after_file is not None:
         command.extend(["--idle-after-file", str(idle_after_file)])
     return command
+
+
+def _cmd_openwebui_gui(config_path: Path) -> None:
+    from .openwebui_gui import launch_gui
+    launch_gui(config_path)
+
+
+def _cmd_openwebui_start(config_path: Path, auth: str | None = None, web_search: str | None = None, provider: str | None = None) -> None:
+    import yaml
+    from .openwebui_launcher import start_bridge, start_openwebui
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    owui_raw = raw.setdefault("openwebui", {})
+
+    if auth is not None:
+        owui_raw["auth_enabled"] = auth == "on"
+        owui_raw["auto_login"] = auth != "on"
+    if web_search is not None:
+        owui_raw["web_search_enabled"] = web_search == "on"
+    if provider is not None:
+        owui_raw["web_search_provider"] = provider
+
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+
+    _title("llama openwebui start")
+    _print_state("start", "Starting bridge and Open WebUI...", "36")
+
+    ok, msg = start_bridge(config_path)
+    _print_state("bridge" if ok else "fail", msg, "32" if ok else "31")
+
+    ok, msg = start_openwebui(config_path)
+    _print_state("owui" if ok else "fail", msg, "32" if ok else "31")
+
+    try:
+        cfg = load_config(config_path)
+        _kv_rows([
+            ("Open WebUI", f"http://{cfg.openwebui.host}:{cfg.openwebui.port}"),
+            ("LLM endpoint", f"http://{cfg.server.host}:{cfg.server.openwebui_port or 11534}/v1"),
+            ("Tools endpoint", f"http://{cfg.server.host}:{cfg.server.port}/v1"),
+            ("Auth", "on" if cfg.openwebui.auth_enabled else "off"),
+            ("Web search", cfg.openwebui.web_search_provider if cfg.openwebui.web_search_enabled else "off"),
+        ])
+    except Exception:
+        pass
+
+
+def _cmd_openwebui_stop(config_path: Path) -> None:
+    from .openwebui_launcher import stop_openwebui
+    _title("llama openwebui stop")
+    ok, msg = stop_openwebui()
+    _print_state("stop", msg, "33")
+
+
+def _cmd_openwebui_restart(config_path: Path) -> None:
+    from .openwebui_launcher import stop_openwebui, start_openwebui, start_bridge
+    _title("llama openwebui restart")
+    _print_state("stop", "Stopping Open WebUI...", "33")
+    stop_openwebui()
+    _print_state("start", "Starting bridge...", "36")
+    ok, msg = start_bridge(config_path)
+    _print_state("bridge" if ok else "fail", msg, "32" if ok else "31")
+    _print_state("start", "Starting Open WebUI...", "36")
+    ok, msg = start_openwebui(config_path)
+    _print_state("owui" if ok else "fail", msg, "32" if ok else "31")
+
+
+def _cmd_openwebui_status(config_path: Path) -> None:
+    from .openwebui_launcher import status as launcher_status
+    st = launcher_status(config_path)
+    _title("llama openwebui status")
+    rows: list[tuple[str, str | int]] = [
+        ("Bridge", _status_label(st["bridge"]["running"])),
+        ("Bridge PID", st["bridge"]["pid"] or "-"),
+        ("Open WebUI", _status_label(st["openwebui"]["running"])),
+        ("Open WebUI PID", st["openwebui"]["pid"] or "-"),
+        ("Open WebUI installed", str(st["openwebui"]["installed"])),
+        ("Auth", "on" if st["config"]["auth_enabled"] else "off"),
+        ("Web search", st["config"]["web_search_provider"] if st["config"]["web_search_enabled"] else "off"),
+    ]
+    _kv_rows(rows)
+    print()
+    _print_note("URLs:")
+    for label, url in st["urls"].items():
+        _print_note(f"  {label}: {url}")
+
+
+def _cmd_openwebui_logs(config_path: Path) -> None:
+    from .openwebui_launcher import OPENWEBUI_LOG_PATH, LLAMA_LOG_PATH, follow_log
+    _title("llama openwebui logs")
+    print(_style("=== Bridge Log ===", "1;36"))
+    for line in follow_log(LLAMA_LOG_PATH, 50):
+        print(_format_log_line(line))
+    print()
+    print(_style("=== Open WebUI Log ===", "1;36"))
+    for line in follow_log(OPENWEBUI_LOG_PATH, 50):
+        print(line)
+
+
+def _cmd_openwebui_test_search(config_path: Path, query: str) -> None:
+    from .openwebui_config import test_search_provider, load_openwebui_config
+    owui = load_openwebui_config(config_path)
+    provider = owui.web_search_provider
+    if provider == "disabled":
+        _print_state("warn", "Web search is disabled", "33")
+        return
+    pcfg = owui.web_search_providers.get(provider)
+    api_key = pcfg.api_key if pcfg else None
+    if not api_key or api_key.startswith("${"):
+        api_key = os.environ.get(f"{provider.upper()}_API_KEY")
+
+    _title(f"llama openwebui test-search ({provider})")
+    _print_note(f"Query: {query}")
+    ok, msg = test_search_provider(provider, api_key, query)
+    if ok:
+        _print_state("ok", msg, "32")
+    else:
+        _print_state("fail", msg, "31")
+
+
+def _cmd_openwebui_configure(config_path: Path) -> None:
+    import yaml
+    from .openwebui_config import save_openwebui_config, VALID_SEARCH_PROVIDERS
+    merge_missing_config_fields(config_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    owui_raw = raw.setdefault("openwebui", {})
+
+    _title("llama openwebui configure")
+
+    owui_raw["enabled"] = _prompt_yes_no("Enable Open WebUI?", default=bool(owui_raw.get("enabled", True)))
+    owui_raw["host"] = _prompt_text("Open WebUI host", str(owui_raw.get("host", "127.0.0.1")))
+    owui_raw["port"] = int(_prompt_text("Open WebUI port", str(owui_raw.get("port", 8080))))
+    owui_raw["auth_enabled"] = _prompt_yes_no("Enable authentication?", default=bool(owui_raw.get("auth_enabled", False)))
+    owui_raw["auto_login"] = not owui_raw["auth_enabled"]
+    owui_raw["web_search_enabled"] = _prompt_yes_no("Enable web search?", default=bool(owui_raw.get("web_search_enabled", True)))
+
+    if owui_raw["web_search_enabled"]:
+        current_provider = str(owui_raw.get("web_search_provider", "ollama"))
+        owui_raw["web_search_provider"] = _prompt_choice(
+            "Web search provider", list(VALID_SEARCH_PROVIDERS), current_provider
+        )
+
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+    _print_state("ok", "Open WebUI configuration updated", "32")
+    _kv_rows([
+        ("host", owui_raw.get("host", "127.0.0.1")),
+        ("port", owui_raw.get("port", 8080)),
+        ("auth", "on" if owui_raw.get("auth_enabled") else "off"),
+        ("web search", owui_raw.get("web_search_provider", "ollama") if owui_raw.get("web_search_enabled") else "off"),
+        ("config", str(config_path)),
+    ])
 
 
 def _start_windows_background(
