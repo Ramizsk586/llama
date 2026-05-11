@@ -2225,6 +2225,12 @@ def _cmd_telegram_gui(config_path: Path) -> None:
 
 
 def _cmd_llama_gui(config_path: Path) -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.FreeConsole()
+        except Exception:
+            pass
     from .llama_gui import HAS_TK as _HAS_TK
     if not _HAS_TK:
         raise SystemExit("Tkinter is not available. Install python-tk or python3-tk.")

@@ -20,3 +20,4 @@ llama_bridge_tools_claude
 llama.telegram.active.json
 llama.telegram.log
 openwebui.log
+openwebui_install.log

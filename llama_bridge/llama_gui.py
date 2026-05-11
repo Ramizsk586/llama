@@ -13,46 +13,28 @@ from typing import Any
 from .config import DEFAULT_CONFIG_PATH, load_config, BridgeConfig
 
 try:
-    import tkinter as tk
-    from tkinter import ttk, messagebox
+    import customtkinter as ctk
     HAS_TK = True
 except ImportError:
     HAS_TK = False
-    class FakeTK:
-        class Tk:
+    class _FakeCTk:
+        class CTk:
             def __init__(self):
-                raise RuntimeError("Tkinter not available")
-    tk = FakeTK()
+                raise RuntimeError("customtkinter not available")
+    ctk = _FakeCTk()
 
-
-BG = "#050505"
-BG_ALT = "#0B0B0B"
-SURFACE = "#111111"
-SURFACE2 = "#171717"
-SURFACE3 = "#1D1D1D"
-BORDER = "#2A2A2A"
-TEXT = "#E0E0E0"
-TEXT_BRIGHT = "#FAFAFA"
-MUTED = "#9A9A9A"
 GREEN = "#4FD1A1"
 RED = "#FF6B6B"
 YELLOW = "#F2C66D"
-CARD_GREEN = "#102A28"
-CARD_RED = "#34181B"
-CARD_GREEN_BORDER = "#1E6054"
-CARD_RED_BORDER = "#7B3840"
-BUTTON_TOP = "#1A2840"
-BUTTON_BOTTOM = "#152035"
-BUTTON_BORDER = "#314766"
 
 LAYOUT = {
-    "HEADER_H": 90,
-    "PAD": 24,
-    "CARD_H": 64,
-    "CARD_GAP": 10,
-    "BTN_H": 38,
-    "WIN_W": 620,
-    "WIN_H": 640,
+    "PAD": 20,
+    "HEADER_H": 80,
+    "CARD_H": 68,
+    "CARD_GAP": 8,
+    "BTN_H": 36,
+    "WIN_W": 640,
+    "WIN_H": 420,
 }
 PAD = LAYOUT["PAD"]
 
@@ -65,10 +47,10 @@ class AppStatus(Enum):
 
 
 class ToolTip:
-    def __init__(self, widget: tk.Widget, text: str) -> None:
+    def __init__(self, widget: ctk.CTkBaseClass, text: str) -> None:
         self.widget = widget
         self.text = text
-        self.tip: tk.Toplevel | None = None
+        self.tip: ctk.CTkToplevel | None = None
         widget.bind("<Enter>", self._enter, add=True)
         widget.bind("<Leave>", self._leave, add=True)
 
@@ -77,38 +59,23 @@ class ToolTip:
             return
         x = self.widget.winfo_rootx() + 20
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-        self.tip = tk.Toplevel(self.widget)
+        self.tip = ctk.CTkToplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f"+{x}+{y}")
-        lbl = tk.Label(self.tip, text=self.text, bg=SURFACE3, fg=TEXT_BRIGHT,
-                       font=("Segoe UI", 9), padx=8, pady=4, relief="solid", bd=1)
+        lbl = ctk.CTkLabel(self.tip, text=self.text,
+                           font=("Segoe UI", 9), padx=8, pady=4)
         lbl.pack()
 
     def _leave(self, _event: Any = None) -> None:
         if self.tip:
             try:
                 self.tip.destroy()
-            except tk.TclError:
+            except Exception:
                 pass
             self.tip = None
 
 
-def _set_dark_titlebar(root: tk.Tk) -> None:
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-            ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int),
-        )
-    except Exception:
-        pass
-
-
-def _center_window(root: tk.Tk, w: int, h: int) -> None:
+def _center_window(root: ctk.CTk, w: int, h: int) -> None:
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
     x = (sw - w) // 2
@@ -161,26 +128,23 @@ def _pid_alive(pid: int) -> bool:
 
 class LlamaControlCenter:
     def __init__(self, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
         self.config_path = config_path
         self._stopped = threading.Event()
 
         W, H = LAYOUT["WIN_W"], LAYOUT["WIN_H"]
-        self.root = tk.Tk()
+        self.root = ctk.CTk()
         self.root.title("Llama Bridge - Control Center")
         _center_window(self.root, W, H)
-        self.root.minsize(580, 560)
-        self.root.configure(bg=BG)
+        self.root.minsize(520, 380)
         self.root.resizable(True, True)
-        _set_dark_titlebar(self.root)
 
         self.status = AppStatus.READY
         self._config: BridgeConfig | None = None
         self._log_lines: list[str] = []
         self._server_pid: int | None = None
-
-        self.header_canvas: tk.Canvas | None = None
-        self.cards_canvas: tk.Canvas | None = None
-        self.util_btns: dict[str, tk.Button] = {}
 
         self._card_data = [
             {"key": "server", "title": "Server", "ok": False, "subtitle": "Stopped", "status": "Stopped"},
@@ -188,6 +152,7 @@ class LlamaControlCenter:
             {"key": "cli_tools", "title": "CLI Tools", "ok": False, "subtitle": "0 configured", "status": "None"},
             {"key": "models", "title": "Anthropic Models", "ok": False, "subtitle": "0 aliases", "status": "None"},
         ]
+        self._card_widgets: list[ctk.CTkFrame] = []
 
         self._build_ui()
         self._load_config()
@@ -195,158 +160,159 @@ class LlamaControlCenter:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
-        main = tk.Frame(self.root, bg=BG)
+        main = ctk.CTkFrame(self.root, fg_color="transparent")
         main.pack(fill="both", expand=True)
 
-        self.header_canvas = tk.Canvas(main, bg=BG, highlightthickness=0)
-        self.header_canvas.pack(fill="x", side="top")
-        self.header_canvas.configure(height=LAYOUT["HEADER_H"])
+        self._build_header(main)
 
-        self.cards_canvas = tk.Canvas(main, bg=BG, highlightthickness=0)
-        self.cards_canvas.pack(fill="both", expand=True, side="top")
-
-        sep = tk.Frame(main, bg=BORDER, height=1)
-        sep.pack(fill="x", side="bottom")
+        sep = ctk.CTkFrame(main, fg_color=GREEN, height=2, corner_radius=0)
+        sep.pack(fill="x", padx=PAD, pady=(4, 0))
 
         self._build_footer(main)
 
-        self.header_canvas.bind("<Configure>", lambda e: self._draw_header())
-        self.cards_canvas.bind("<Configure>", lambda e: self._draw_cards())
+        self.cards_area = ctk.CTkFrame(main, fg_color="transparent")
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(PAD // 2, 0))
 
-    def _build_footer(self, parent: tk.Frame) -> None:
-        footer = tk.Frame(parent, bg=BG)
-        footer.pack(fill="x", side="bottom", pady=(6, 10))
+    def _build_header(self, parent: ctk.CTkFrame) -> None:
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=PAD, pady=(PAD, 0))
 
-        util = tk.Frame(footer, bg=BG)
-        util.pack(fill="x", padx=PAD)
+        header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
 
-        util_items = [
-            ("btn_server", "\u2699 Server Config", self._open_server_config),
-            ("btn_providers", "\U0001f310 Providers", self._open_providers),
-            ("btn_cli", "\U0001f528 CLI Tools", self._open_cli_tools),
-            ("btn_models", "\U0001f916 Models", self._open_models),
-            ("btn_logs", "\U0001f4cb Logs", self._open_logs),
-            ("btn_details", "\u2139 Details", self._open_details),
-        ]
-        for i, (key, text, cmd) in enumerate(util_items):
-            btn = tk.Button(
-                util, text=text, command=cmd,
-                bg=BG_ALT, fg=MUTED, font=("Segoe UI", 9),
-                relief="flat", bd=0, padx=8, pady=2,
-                activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                cursor="hand2",
-            )
-            btn.pack(side="left" if i < 5 else "right", padx=(0, 12))
-            self.util_btns[key] = btn
-            tips = {
-                "btn_server": "Configure server host, port, auth",
-                "btn_providers": "View and manage API providers",
-                "btn_cli": "Configure CLI tool settings",
-                "btn_models": "Manage anthropic model aliases",
-                "btn_logs": "View server logs",
-                "btn_details": "Show full technical details",
-            }
-            ToolTip(btn, tips[key])
+        title_frame = ctk.CTkFrame(header, fg_color="transparent")
+        title_frame.grid(row=0, column=0, sticky="w")
 
-    def _draw_header(self) -> None:
-        cv = self.header_canvas
-        if not cv:
-            return
-        cv.delete("all")
-        w = cv.winfo_width() or LAYOUT["WIN_W"]
-        h = LAYOUT["HEADER_H"]
-        p = PAD
+        ctk.CTkLabel(title_frame, text="Llama Bridge Control Center",
+                     font=("Segoe UI", 18, "bold"), anchor="w").pack(anchor="w")
+        self.subtitle_label = ctk.CTkLabel(title_frame, text="",
+                                           font=("Segoe UI", 10),
+                                           text_color=("#888888", "#888888"), anchor="w")
+        self.subtitle_label.pack(anchor="w", pady=(2, 0))
 
-        cv.create_text(p, 16, anchor="nw", text="Llama Bridge Control Center",
-                       font=("Segoe UI", 16, "bold"), fill=TEXT_BRIGHT)
+        self.badge = ctk.CTkLabel(header, text="  READY  ",
+                                  font=("Segoe UI", 9, "bold"), corner_radius=4)
+        self.badge.grid(row=0, column=1, sticky="ne", pady=(4, 0))
 
-        subtitle = self._subtitle_text()
-        cv.create_text(p, h // 2 + 10, anchor="nw", text=subtitle,
-                       font=("Segoe UI", 10), fill=MUTED)
+        self._update_header()
 
+    def _update_header(self) -> None:
+        self.subtitle_label.configure(text=self._subtitle_text())
         badge_text, badge_color = self._get_badge_info()
-        btxt = f"  {badge_text}  "
-        font_sz = 9
-        tw = len(btxt) * (font_sz + 1)
-        bx = w - p - tw - 12
-        by = 20
-        bw = tw + 12
-        bh = 26
-        cv.create_rectangle(bx, by, bx + bw, by + bh, fill="", outline=badge_color, width=1)
-        cv.create_text(bx + bw // 2, by + bh // 2, text=badge_text,
-                       font=("Segoe UI", 9, "bold"), fill=badge_color)
+        badge_bg = {
+            AppStatus.RUNNING: "#0a2a1a",
+            AppStatus.READY: "#0a2a1a",
+            AppStatus.ERROR: "#2a0a0a",
+        }.get(self.status, "#0a2a1a")
+        self.badge.configure(text=f"  {badge_text}  ",
+                             fg_color=badge_bg,
+                             text_color=badge_color)
 
-        sep_color = self._get_separator_color()
-        cv.create_rectangle(0, h - 3, w, h, fill=sep_color, outline="")
+    def _build_footer(self, parent: ctk.CTkFrame) -> None:
+        footer = ctk.CTkFrame(parent, fg_color="transparent")
+        footer.pack(fill="x", side="bottom", pady=(6, 12), padx=PAD)
 
-    def _draw_cards(self) -> None:
-        cv = self.cards_canvas
-        if not cv:
-            return
-        cv.delete("all")
-        w = cv.winfo_width() or LAYOUT["WIN_W"]
-        p = PAD
-        card_w = w - 2 * p
-        y = 12
-        ch = LAYOUT["CARD_H"]
+        for col in range(3):
+            footer.columnconfigure(col, weight=1, uniform="ftr_col")
 
-        for card in self._card_data:
-            ok = card["ok"]
-            fill = CARD_GREEN if ok else CARD_RED
-            border = CARD_GREEN_BORDER if ok else CARD_RED_BORDER
-            accent = GREEN if ok else RED
+        sub_panels = [
+            ("Config", [("\u2699 Server", self._open_server_config),
+                        ("\U0001f310 Providers", self._open_providers)]),
+            ("Tools", [("\U0001f528 CLI Tools", self._open_cli_tools),
+                       ("\U0001f916 Models", self._open_models)]),
+            ("Info", [("\U0001f4cb Logs", self._open_logs),
+                      ("\u2139 Details", self._open_details)]),
+        ]
+        self.util_btns: dict[str, ctk.CTkButton] = {}
+        for col, (panel_title, buttons) in enumerate(sub_panels):
+            panel = ctk.CTkFrame(footer, fg_color=("#e8e8e8", "#1e1e1e"), corner_radius=6)
+            panel.grid(row=0, column=col, sticky="nsew", padx=4, pady=2)
+            panel.columnconfigure(0, weight=1)
+            panel.columnconfigure(1, weight=1)
 
-            cv.create_rectangle(p, y, p + card_w, y + ch, fill=fill, outline=border, width=1)
-            cv.create_rectangle(p, y, p + 5, y + ch, fill=accent, outline=accent, width=0)
+            ctk.CTkLabel(panel, text=panel_title,
+                         font=("Segoe UI", 8, "bold"),
+                         text_color=("#666666", "#888888")).grid(
+                row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 0))
 
-            cx, cy = p + 34, y + ch // 2
-            cr = 14
-            cv.create_oval(cx - cr, cy - cr, cx + cr, cy + cr, outline=accent, width=2)
-            if ok:
-                cv.create_line(cx - 7, cy, cx - 1, cy + 6, cx + 7, cy - 6,
-                               fill=accent, width=2, capstyle="round", joinstyle="round")
-            else:
-                cv.create_line(cx - 5, cy - 5, cx + 5, cy + 5, fill=accent, width=2)
-                cv.create_line(cx + 5, cy - 5, cx - 5, cy + 5, fill=accent, width=2)
+            tips = {
+                "\u2699 Server": "Configure server host, port, auth",
+                "\U0001f310 Providers": "View and manage API providers",
+                "\U0001f528 CLI Tools": "Configure CLI tool settings",
+                "\U0001f916 Models": "Manage anthropic model aliases",
+                "\U0001f4cb Logs": "View server logs",
+                "\u2139 Details": "Show full technical details",
+            }
+            for i, (text, cmd) in enumerate(buttons):
+                btn = ctk.CTkButton(
+                    panel, text=text, command=cmd,
+                    font=("Segoe UI", 9), height=26,
+                    fg_color=("#e0e0e0", "#2a2a2a"),
+                    text_color=("#333333", "#cccccc"),
+                    hover_color=("#d0d0d0", "#3a3a3a"),
+                    corner_radius=4,
+                )
+                btn.grid(row=1, column=i, sticky="ew", padx=4, pady=(2, 4))
+                self.util_btns[text] = btn
+                ToolTip(btn, tips.get(text, ""))
 
-            tx = p + 68
-            cv.create_text(tx, y + 14, text=card["title"],
-                           fill=TEXT_BRIGHT, font=("Segoe UI", 11, "bold"), anchor="w")
+    def _create_card(self, card_data: dict, parent: ctk.CTkFrame | None = None) -> ctk.CTkFrame:
+        if parent is None:
+            parent = self.cards_area
+        ok = card_data["ok"]
+        card_bg = "#0f2820" if ok else "#281414"
+        accent_color = GREEN if ok else RED
+        icon_text = "\u2713" if ok else "\u2717"
 
-            sub = card.get("subtitle", "")
-            safe_sub = self._ellipsize(cv, sub, ("Segoe UI", 9), card_w - 190)
-            cv.create_text(tx, y + 37, text=safe_sub,
-                           fill=MUTED, font=("Segoe UI", 9), anchor="w")
+        card = ctk.CTkFrame(parent, fg_color=card_bg, corner_radius=8, height=LAYOUT["CARD_H"])
+        card.grid_propagate(False)
 
-            st = card.get("status", "")
-            cv.create_text(p + card_w - 14, y + ch // 2, text=st,
-                           fill=accent, font=("Segoe UI", 9, "bold"), anchor="e")
+        card.columnconfigure(0, weight=0)
+        card.columnconfigure(1, weight=0)
+        card.columnconfigure(2, weight=1)
+        card.columnconfigure(3, weight=0)
 
-            y += ch + LAYOUT["CARD_GAP"]
+        accent = ctk.CTkFrame(card, fg_color=accent_color, width=5, corner_radius=0)
+        accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 10))
 
-    @staticmethod
-    def _ellipsize(cv: tk.Canvas, text: str, font: tuple[str, int], max_width: int) -> str:
-        if not text or max_width < 20:
-            return ""
-        tid = cv.create_text(-9999, -9999, text=text, font=font, anchor="w")
-        try:
-            bbox = cv.bbox(tid)
-            if bbox and (bbox[2] - bbox[0]) <= max_width:
-                return text
-        finally:
-            cv.delete(tid)
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            candidate = text[:mid] + "..."
-            tid = cv.create_text(-9999, -9999, text=candidate, font=font, anchor="w")
-            bbox = cv.bbox(tid)
-            cv.delete(tid)
-            if bbox and (bbox[2] - bbox[0]) <= max_width:
-                lo = mid
-            else:
-                hi = mid - 1
-        return text[:lo] + "..." if lo > 0 else "..."
+        ctk.CTkLabel(card, text=icon_text,
+                     font=("Segoe UI", 14, "bold"),
+                     text_color=accent_color).grid(row=0, column=1, rowspan=2, padx=(0, 6))
+
+        ctk.CTkLabel(card, text=card_data["title"],
+                     font=("Segoe UI", 10, "bold"), anchor="w").grid(
+            row=0, column=2, sticky="w", pady=(6, 0))
+
+        ctk.CTkLabel(card, text=card_data.get("subtitle", ""),
+                     font=("Segoe UI", 9),
+                     text_color=("#888888", "#888888"), anchor="w").grid(
+            row=1, column=2, sticky="w", pady=(0, 6))
+
+        ctk.CTkLabel(card, text=card_data.get("status", ""),
+                     font=("Segoe UI", 9, "bold"),
+                     text_color=accent_color).grid(
+            row=0, column=3, rowspan=2, sticky="e", padx=(0, 16))
+
+        return card
+
+    def _rebuild_cards(self) -> None:
+        for w in self._card_widgets:
+            w.destroy()
+        self._card_widgets.clear()
+
+        self.cards_area.columnconfigure(0, weight=1, uniform="card_col")
+        self.cards_area.columnconfigure(1, weight=1, uniform="card_col")
+
+        GAP = LAYOUT["CARD_GAP"] // 2
+        for idx, card_data in enumerate(self._card_data):
+            r, c = divmod(idx, 2)
+            px = (0, GAP) if c == 0 else (GAP, 0)
+            card = self._create_card(card_data, parent=self.cards_area)
+            card.grid(row=r, column=c, sticky="nsew", padx=px, pady=GAP)
+            self._card_widgets.append(card)
+
+        for r in range((len(self._card_data) + 1) // 2):
+            self.cards_area.rowconfigure(r, weight=0)
 
     def _subtitle_text(self) -> str:
         if self.status == AppStatus.READY:
@@ -354,33 +320,22 @@ class LlamaControlCenter:
         if self.status == AppStatus.RUNNING:
             return "Server is running."
         if self.status == AppStatus.ERROR:
-            return f"Error \u2014 check Logs"
+            return "Error \u2014 check Logs"
         return ""
 
     def _get_badge_info(self) -> tuple[str, str]:
         s = self.status
         if s == AppStatus.ERROR:
             return "ERROR", RED
-        if s == AppStatus.READY:
-            return "READY", GREEN
-        if s == AppStatus.RUNNING:
-            return "RUNNING", GREEN
+        if s in (AppStatus.READY, AppStatus.RUNNING):
+            return "RUNNING" if s == AppStatus.RUNNING else "READY", GREEN
         return "READY", GREEN
-
-    def _get_separator_color(self) -> str:
-        s = self.status
-        if s == AppStatus.ERROR:
-            return RED
-        if s == AppStatus.RUNNING:
-            return GREEN
-        return GREEN
 
     def _update_card_data(self) -> None:
         cfg = self._config
         if not cfg:
             return
 
-        # Server
         server = cfg.server
         running = self._server_pid is not None and _pid_alive(self._server_pid)
         self._card_data[0] = {
@@ -390,7 +345,6 @@ class LlamaControlCenter:
             "status": "Running" if running else "Stopped",
         }
 
-        # Providers
         prov_count = len(cfg.providers)
         prov_configured = sum(1 for p in cfg.providers.values() if p.api_key and not p.api_key.startswith("${"))
         self._card_data[1] = {
@@ -400,7 +354,6 @@ class LlamaControlCenter:
             "status": f"{prov_configured}/{prov_count}" if prov_count > 0 else "None",
         }
 
-        # CLI Tools
         tools_configured = 0
         tool_names = []
         for name, tool in [("Pi", cfg.pi), ("Codex", cfg.codex), ("Copilot", cfg.copilot_cli),
@@ -415,7 +368,6 @@ class LlamaControlCenter:
             "status": str(tools_configured),
         }
 
-        # Anthropic Models
         alias_count = len(cfg.anthropic_models)
         self._card_data[3] = {
             "key": "models", "title": "Anthropic Models",
@@ -435,7 +387,6 @@ class LlamaControlCenter:
         if not self._config:
             self.status = AppStatus.READY
             return
-        # Check if server is running by PID
         pid_path = self.config_path.parent / "llama.pid"
         pid = _read_pid(pid_path)
         self._server_pid = pid
@@ -448,8 +399,8 @@ class LlamaControlCenter:
         self._load_config()
         self._determine_status()
         self._update_card_data()
-        self._draw_header()
-        self._draw_cards()
+        self._update_header()
+        self._rebuild_cards()
 
     def _on_close(self) -> None:
         self._stopped.set()
@@ -483,60 +434,13 @@ class LlamaControlCenter:
         DetailsDialog(self.root, self.config_path)
 
 
-class _StyledScrollbar(tk.Frame):
-    """Custom dark-themed scrollbar matching GUI theme."""
-    def __init__(self, master: tk.Widget, command=None, **kwargs):
-        kwargs.setdefault("width", 12)
-        super().__init__(master, bg=BG, **kwargs)
-        self._cmd = command
-        self._lo = 0.0
-        self._hi = 1.0
-        self.pack_propagate(False)
-        self._c = tk.Canvas(self, bg=BG, highlightthickness=0, width=12)
-        self._c.pack(fill="both", expand=True)
-        self._c.bind("<Button-1>", self._on_scroll_click)
-        self._c.bind("<B1-Motion>", self._on_scroll_drag)
-        self._c.bind("<MouseWheel>", self._on_scroll_wheel)
-        self._draw()
-
-    def set(self, lo: float, hi: float) -> None:
-        self._lo = float(lo)
-        self._hi = float(hi)
-        self._draw()
-
-    def _draw(self) -> None:
-        c = self._c
-        c.delete("all")
-        w = c.winfo_width() or 12
-        h = c.winfo_height() or 200
-        c.create_rectangle(0, 0, w, h, fill=BG, outline="")
-        rh = max(20, int(h * (self._hi - self._lo)))
-        ry = int(self._lo * (h - rh))
-        c.create_rectangle(2, ry, w - 2, ry + rh, fill=SURFACE2, outline=BORDER, width=1)
-
-    def _on_scroll_click(self, e: tk.Event) -> None:
-        if self._cmd:
-            h = self._c.winfo_height() or 200
-            self._cmd("moveto", max(0.0, min(1.0, e.y / max(1, h))))
-
-    def _on_scroll_drag(self, e: tk.Event) -> None:
-        if self._cmd:
-            h = self._c.winfo_height() or 200
-            self._cmd("moveto", max(0.0, min(1.0, e.y / max(1, h))))
-
-    def _on_scroll_wheel(self, e: tk.Event) -> None:
-        if self._cmd:
-            self._cmd("scroll", -1 if e.delta > 0 else 1, "units")
-
-
 class ServerConfigDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path, on_save=None) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path, on_save=None) -> None:
         self.config_path = config_path
         self.on_save = on_save
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Server Config")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("460x340")
+        self.dialog.geometry("420x300")
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -549,100 +453,96 @@ class ServerConfigDialog:
         self.server_raw = self.raw.setdefault("server", {})
 
     def _build(self) -> None:
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
 
-        def add_label(row, text):
-            tk.Label(main, text=text, bg=BG, fg=TEXT, font=("Segoe UI", 9), anchor="w").grid(
-                row=row, column=0, sticky="w", pady=2, padx=(0, 8))
-
+        fields: list[tuple[str, str, type]] = [
+            ("host", "Host", str),
+            ("port", "Port", int),
+            ("auth_token", "Auth Token", str),
+            ("idle_timeout_seconds", "Idle Timeout (s)", int),
+            ("openwebui_port", "Open WebUI Port", str),
+        ]
+        self._vars: dict[str, ctk.StringVar] = {}
         row = 0
-        add_label(row, "Host")
-        self.host_var = tk.StringVar(value=str(self.server_raw.get("host", "127.0.0.1")))
-        tk.Entry(main, textvariable=self.host_var, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                 relief="flat", bd=0, highlightbackground=BORDER, highlightthickness=1).grid(
-            row=row, column=1, sticky="ew", pady=2)
-        row += 1
+        for key, label, _ in fields:
+            ctk.CTkLabel(main, text=label, font=("Segoe UI", 10), anchor="w").grid(
+                row=row, column=0, sticky="w", pady=(0, 10), padx=(0, 8))
 
-        add_label(row, "Port")
-        self.port_var = tk.StringVar(value=str(self.server_raw.get("port", 8089)))
-        tk.Spinbox(main, from_=1024, to=65535, textvariable=self.port_var,
-                   bg=SURFACE2, fg=TEXT, buttonbackground=SURFACE2, relief="flat",
-                   highlightbackground=BORDER, highlightthickness=1, width=10).grid(
-            row=row, column=1, sticky="w", pady=2)
-        row += 1
+            if key == "idle_timeout_seconds":
+                var = ctk.StringVar(value=str(self.server_raw.get(key, 180)))
+                entry = ctk.CTkEntry(main, textvariable=var, width=100,
+                                     font=("Segoe UI", 10))
+                entry.grid(row=row, column=1, sticky="w", pady=(0, 10))
+            elif key == "port":
+                var = ctk.StringVar(value=str(self.server_raw.get(key, 8089)))
+                entry = ctk.CTkEntry(main, textvariable=var, width=100,
+                                     font=("Segoe UI", 10))
+                entry.grid(row=row, column=1, sticky="w", pady=(0, 10))
+            elif key == "auth_token":
+                var = ctk.StringVar(value=str(self.server_raw.get(key, "")))
+                auth_frame = ctk.CTkFrame(main, fg_color="transparent")
+                auth_frame.grid(row=row, column=1, sticky="ew", pady=(0, 10))
+                entry = ctk.CTkEntry(auth_frame, textvariable=var,
+                                     font=("Segoe UI", 10), show="*")
+                entry.pack(side="left", fill="x", expand=True)
+                self.show_auth_var = ctk.BooleanVar(value=False)
+                def _toggle_auth():
+                    entry.configure(show="" if self.show_auth_var.get() else "*")
+                ctk.CTkCheckBox(auth_frame, text="Show", variable=self.show_auth_var,
+                                command=_toggle_auth, font=("Segoe UI", 10)).pack(side="left", padx=(6, 0))
+            elif key == "openwebui_port":
+                ow_port = self.server_raw.get(key)
+                var = ctk.StringVar(value=str(ow_port) if ow_port else "")
+                entry = ctk.CTkEntry(main, textvariable=var, width=120,
+                                     font=("Segoe UI", 10))
+                entry.grid(row=row, column=1, sticky="w", pady=(0, 10))
+            else:
+                var = ctk.StringVar(value=str(self.server_raw.get(key, "127.0.0.1")))
+                entry = ctk.CTkEntry(main, textvariable=var, width=240,
+                                     font=("Segoe UI", 10))
+                entry.grid(row=row, column=1, sticky="ew", pady=(0, 10))
 
-        add_label(row, "Auth Token")
-        self.auth_var = tk.StringVar(value=str(self.server_raw.get("auth_token", "")))
-        auth_frame = tk.Frame(main, bg=BG)
-        auth_frame.grid(row=row, column=1, sticky="ew", pady=2)
-        tk.Entry(auth_frame, textvariable=self.auth_var, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                 relief="flat", bd=0, highlightbackground=BORDER, highlightthickness=1,
-                 show="*").pack(side="left", fill="x", expand=True)
-        self.show_auth_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(auth_frame, text="Show", variable=self.show_auth_var,
-                       bg=BG, fg=MUTED, selectcolor=SURFACE2, activebackground=BG,
-                       command=lambda: self.auth_var).pack(side="left", padx=(4, 0))
-        row += 1
+            self._vars[key] = var
+            row += 1
 
-        add_label(row, "Idle Timeout (s)")
-        self.idle_var = tk.StringVar(value=str(self.server_raw.get("idle_timeout_seconds", 180)))
-        tk.Spinbox(main, from_=0, to=3600, increment=30, textvariable=self.idle_var,
-                   bg=SURFACE2, fg=TEXT, buttonbackground=SURFACE2, relief="flat",
-                   highlightbackground=BORDER, highlightthickness=1, width=10).grid(
-            row=row, column=1, sticky="w", pady=2)
-        row += 1
+        main.grid_columnconfigure(1, weight=1)
 
-        add_label(row, "Open WebUI Port")
-        ow_port = self.server_raw.get("openwebui_port")
-        self.owui_port_var = tk.StringVar(value=str(ow_port) if ow_port else "")
-        tk.Entry(main, textvariable=self.owui_port_var, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                 relief="flat", bd=0, highlightbackground=BORDER, highlightthickness=1).grid(
-            row=row, column=1, sticky="ew", pady=2)
-        row += 1
-
-        btn_row = tk.Frame(main, bg=BG)
-        btn_row.grid(row=row, column=0, columnspan=2, pady=(16, 0))
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left", padx=(0, 8))
-        tk.Button(btn_row, text="Cancel", command=self.dialog.destroy,
-                  bg=BG_ALT, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left")
-
-        main.columnconfigure(1, weight=1)
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
+        btn_row.grid(row=row, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        ctk.CTkButton(btn_row, text="Save", command=self._save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.dialog.destroy,
+                      font=("Segoe UI", 10), fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555"), width=90).pack(side="right")
 
     def _save(self) -> None:
         import yaml
-        self.server_raw["host"] = self.host_var.get().strip()
-        self.server_raw["port"] = int(self.port_var.get())
-        token = self.auth_var.get().strip()
+        self.server_raw["host"] = self._vars["host"].get().strip()
+        self.server_raw["port"] = int(self._vars["port"].get())
+        token = self._vars["auth_token"].get().strip()
         if token:
             self.server_raw["auth_token"] = token
-        self.server_raw["idle_timeout_seconds"] = int(self.idle_var.get())
-        ow = self.owui_port_var.get().strip()
+        self.server_raw["idle_timeout_seconds"] = int(self._vars["idle_timeout_seconds"].get())
+        ow = self._vars["openwebui_port"].get().strip()
         if ow:
             self.server_raw["openwebui_port"] = int(ow)
         else:
             self.server_raw.pop("openwebui_port", None)
-        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self.config_path.write_text(
+            yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
         if self.on_save:
             self.on_save()
         self.dialog.destroy()
 
 
 class ProvidersDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path, on_save=None) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path, on_save=None) -> None:
         self.config_path = config_path
         self.on_save = on_save
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Providers")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("760x520")
+        self.dialog.geometry("820x580")
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -655,18 +555,12 @@ class ProvidersDialog:
         self.providers_raw = self.raw.setdefault("providers", {})
 
     def _build(self) -> None:
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
 
-        scroll_outer = tk.Frame(main, bg=BG)
-        scroll_outer.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(scroll_outer, bg=BG, highlightthickness=0)
-        scrollbar = _StyledScrollbar(scroll_outer, command=canvas.yview)
-        inner = tk.Frame(canvas, bg=BG)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        scroll = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
 
         TYPE_OPTIONS = [
             "openai", "ollama_cloud", "ollama_local", "lm_studio",
@@ -677,16 +571,16 @@ class ProvidersDialog:
         self._entries: dict[str, dict[str, Any]] = {}
         items = sorted(self.providers_raw.items())
         num_cols = 2
+
         for idx, (name, prov) in enumerate(items):
-            row_idx = idx // num_cols
-            col_idx = idx % num_cols
+            card = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            card.grid(row=idx // num_cols, column=idx % num_cols,
+                      sticky="nsew", padx=4, pady=5)
 
-            card = tk.Frame(inner, bg=SURFACE, bd=1, relief="flat",
-                            highlightbackground=BORDER, highlightthickness=1)
-            card.grid(row=row_idx, column=col_idx, sticky="nsew", padx=4, pady=5)
-
-            tk.Label(card, text=name, bg=SURFACE, fg=TEXT_BRIGHT,
-                     font=("Segoe UI", 11, "bold"), anchor="w").pack(anchor="w", padx=12, pady=(8, 3))
+            ctk.CTkLabel(card, text=name, font=("Segoe UI", 12, "bold"),
+                         anchor="w").pack(anchor="w", padx=12, pady=(8, 4))
+            ctk.CTkFrame(card, fg_color=("#333333", "#333333"), height=1,
+                         corner_radius=0).pack(fill="x", padx=12, pady=(0, 6))
 
             entries: dict[str, Any] = {}
             fields: list[tuple[str, Any, str]] = [
@@ -698,66 +592,56 @@ class ProvidersDialog:
             ]
 
             for label, values, kind in fields:
-                row = tk.Frame(card, bg=SURFACE)
-                row.pack(fill="x", padx=12, pady=1)
-                tk.Label(row, text=label.replace("_", " ").title(), bg=SURFACE, fg=TEXT,
-                         font=("Segoe UI", 9), anchor="w", width=12).pack(side="left")
+                row = ctk.CTkFrame(card, fg_color="transparent")
+                row.pack(fill="x", padx=12, pady=2)
+                ctk.CTkLabel(row, text=label.replace("_", " ").title(),
+                             font=("Segoe UI", 9), anchor="w", width=100).pack(side="left")
                 if kind == "combobox":
-                    var = tk.StringVar(value=str(prov.get(label, values[0])))
-                    ttk.Combobox(row, textvariable=var, values=values,
-                                 state="readonly").pack(side="left", fill="x", expand=True)
+                    var = ctk.StringVar(value=str(prov.get(label, values[0])))
+                    ctk.CTkComboBox(row, variable=var, values=values,
+                                    state="readonly", font=("Segoe UI", 9)).pack(
+                        side="left", fill="x", expand=True)
                 elif kind == "key":
-                    var = tk.StringVar(value=str(prov.get(label, "")))
-                    ef = tk.Entry(row, textvariable=var, bg=SURFACE2, fg=TEXT,
-                                  insertbackground=TEXT, relief="flat", bd=0,
-                                  highlightbackground=BORDER, highlightthickness=1, show="*")
-                    ef.pack(side="left", fill="x", expand=True)
-                    sv = tk.BooleanVar(value=False)
-                    def _toggle_key(entry=ef, show_var=sv):
-                        entry.configure(show="" if show_var.get() else "*")
-                    tk.Checkbutton(row, text="S", variable=sv, bg=SURFACE, fg=MUTED,
-                                   selectcolor=SURFACE2, activebackground=SURFACE,
-                                   command=_toggle_key).pack(side="left", padx=(2, 0))
+                    var = ctk.StringVar(value=str(prov.get(label, "")))
+                    entry = ctk.CTkEntry(row, textvariable=var,
+                                         font=("Segoe UI", 9), show="*")
+                    entry.pack(side="left", fill="x", expand=True)
+                    sv = ctk.BooleanVar(value=False)
+                    def _toggle_key(e=entry, sv=sv):
+                        e.configure(show="" if sv.get() else "*")
+                    ctk.CTkCheckBox(row, text="Show", variable=sv,
+                                    command=_toggle_key, width=52).pack(side="left", padx=(4, 0))
                 elif kind == "check":
-                    var = tk.BooleanVar(value=bool(prov.get(label, True)))
-                    tk.Checkbutton(row, variable=var, bg=SURFACE, fg=TEXT,
-                                   selectcolor=SURFACE2, activebackground=SURFACE).pack(side="left")
+                    var = ctk.BooleanVar(value=bool(prov.get(label, True)))
+                    ctk.CTkCheckBox(row, variable=var, text="", width=20).pack(side="left")
                 else:
-                    var = tk.StringVar(value=str(prov.get(label, "")))
-                    tk.Entry(row, textvariable=var, bg=SURFACE2, fg=TEXT,
-                             insertbackground=TEXT, relief="flat", bd=0,
-                             highlightbackground=BORDER, highlightthickness=1
-                             ).pack(side="left", fill="x", expand=True)
+                    var = ctk.StringVar(value=str(prov.get(label, "")))
+                    ctk.CTkEntry(row, textvariable=var,
+                                 font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True)
                 entries[label] = var
             self._entries[name] = entries
-            tk.Frame(card, bg=SURFACE, height=4).pack(fill="x")
 
         for c in range(num_cols):
-            inner.grid_columnconfigure(c, weight=1, uniform="col")
-        inner.grid_rowconfigure(len(items) // num_cols + (1 if len(items) % num_cols else 0), weight=1)
+            scroll.grid_columnconfigure(c, weight=1, uniform="col")
+        total_rows = (len(items) + num_cols - 1) // num_cols
+        if total_rows > 0:
+            scroll.grid_rowconfigure(total_rows, weight=1)
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        btn_row = tk.Frame(main, bg=BG)
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
         btn_row.pack(fill="x", pady=(10, 0))
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, padx=20, pady=6,
-                  activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="right", padx=(6, 0))
-        tk.Button(btn_row, text="Cancel", command=self.dialog.destroy,
-                  bg=BG_ALT, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", bd=0, padx=20, pady=6,
-                  activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="right")
+        ctk.CTkButton(btn_row, text="Save", command=self._save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.dialog.destroy,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right")
 
     def _save(self) -> None:
         import yaml
         for name, entries in self._entries.items():
             prov = self.providers_raw.setdefault(name, {})
             for label, var in entries.items():
-                if isinstance(var, tk.BooleanVar):
+                if isinstance(var, ctk.BooleanVar):
                     prov[label] = bool(var.get())
                 else:
                     val = var.get().strip()
@@ -771,13 +655,12 @@ class ProvidersDialog:
 
 
 class CliToolsDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path, on_save=None) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path, on_save=None) -> None:
         self.config_path = config_path
         self.on_save = on_save
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("CLI Tools")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("760x520")
+        self.dialog.geometry("820x580")
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -791,18 +674,12 @@ class CliToolsDialog:
         self.provider_names = provider_names if provider_names else ["ollama_cloud"]
 
     def _build(self) -> None:
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
 
-        scroll_outer = tk.Frame(main, bg=BG)
-        scroll_outer.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(scroll_outer, bg=BG, highlightthickness=0)
-        scrollbar = _StyledScrollbar(scroll_outer, command=canvas.yview)
-        inner = tk.Frame(canvas, bg=BG)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        scroll = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
 
         self._entries = {}
         tool_keys = [
@@ -816,61 +693,53 @@ class CliToolsDialog:
 
         num_cols = 2
         for idx, (tool_name, section_key, fields) in enumerate(tool_keys):
-            row_idx = idx // num_cols
-            col_idx = idx % num_cols
             section = self.raw.get(section_key, {}) or {}
 
-            card = tk.Frame(inner, bg=SURFACE, bd=1, relief="flat",
-                            highlightbackground=BORDER, highlightthickness=1)
-            card.grid(row=row_idx, column=col_idx, sticky="nsew", padx=4, pady=5)
+            card = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            card.grid(row=idx // num_cols, column=idx % num_cols, sticky="nsew", padx=4, pady=5)
 
-            tk.Label(card, text=tool_name, bg=SURFACE, fg=TEXT_BRIGHT,
-                     font=("Segoe UI", 11, "bold"), anchor="w").pack(anchor="w", padx=12, pady=(8, 3))
+            ctk.CTkLabel(card, text=tool_name, font=("Segoe UI", 12, "bold"),
+                         anchor="w").pack(anchor="w", padx=12, pady=(8, 4))
+            ctk.CTkFrame(card, fg_color=("#333333", "#333333"), height=1,
+                         corner_radius=0).pack(fill="x", padx=12, pady=(0, 6))
 
             entries = {}
             for field in fields:
-                row = tk.Frame(card, bg=SURFACE)
+                row = ctk.CTkFrame(card, fg_color="transparent")
                 row.pack(fill="x", padx=12, pady=1)
-                tk.Label(row, text=field.replace("_", " ").title(), bg=SURFACE, fg=TEXT,
-                         font=("Segoe UI", 9), anchor="w", width=16).pack(side="left")
+                ctk.CTkLabel(row, text=field.replace("_", " ").title(),
+                             font=("Segoe UI", 9), anchor="w", width=120).pack(side="left")
 
                 if field == "provider":
-                    var = tk.StringVar(value=str(section.get(field, self.provider_names[0])))
-                    ttk.Combobox(row, textvariable=var, values=self.provider_names,
-                                 state="readonly").pack(side="left", fill="x", expand=True)
+                    var = ctk.StringVar(value=str(section.get(field, self.provider_names[0])))
+                    ctk.CTkComboBox(row, variable=var, values=self.provider_names,
+                                    state="readonly", font=("Segoe UI", 9)).pack(
+                        side="left", fill="x", expand=True)
                 elif field in ("max_prompt_tokens", "max_output_tokens", "context_size", "output_tokens"):
-                    var = tk.StringVar(value=str(section.get(field, "")))
-                    tk.Spinbox(row, from_=0, to=262144, textvariable=var,
-                               bg=SURFACE2, fg=TEXT, buttonbackground=SURFACE2, relief="flat",
-                               highlightbackground=BORDER, highlightthickness=1, width=12).pack(side="left")
+                    var = ctk.StringVar(value=str(section.get(field, "")))
+                    ctk.CTkEntry(row, textvariable=var, width=100,
+                                 font=("Segoe UI", 9)).pack(side="left")
                 else:
-                    var = tk.StringVar(value=str(section.get(field, "")))
-                    tk.Entry(row, textvariable=var, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                             relief="flat", bd=0, highlightbackground=BORDER,
-                             highlightthickness=1).pack(side="left", fill="x", expand=True)
+                    var = ctk.StringVar(value=str(section.get(field, "")))
+                    ctk.CTkEntry(row, textvariable=var, font=("Segoe UI", 9)).pack(
+                        side="left", fill="x", expand=True)
                 entries[field] = var
             self._entries[section_key] = entries
 
         for c in range(num_cols):
-            inner.grid_columnconfigure(c, weight=1, uniform="col")
+            scroll.grid_columnconfigure(c, weight=1, uniform="col")
         total_rows = (len(tool_keys) + num_cols - 1) // num_cols
-        inner.grid_rowconfigure(total_rows, weight=1)
+        if total_rows > 0:
+            scroll.grid_rowconfigure(total_rows, weight=1)
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        btn_row = tk.Frame(main, bg=BG)
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
         btn_row.pack(fill="x", pady=(10, 0))
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, padx=20, pady=6,
-                  activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="right", padx=(6, 0))
-        tk.Button(btn_row, text="Cancel", command=self.dialog.destroy,
-                  bg=BG_ALT, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", bd=0, padx=20, pady=6,
-                  activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="right")
+        ctk.CTkButton(btn_row, text="Save", command=self._save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.dialog.destroy,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right")
 
     def _save(self) -> None:
         import yaml
@@ -885,20 +754,20 @@ class CliToolsDialog:
                 else:
                     if val and not val.startswith("${"):
                         section[field] = val
-        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self.config_path.write_text(
+            yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
         if self.on_save:
             self.on_save()
         self.dialog.destroy()
 
 
 class ModelsDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path, on_save=None) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path, on_save=None) -> None:
         self.config_path = config_path
         self.on_save = on_save
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Anthropic Models")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("500x360")
+        self.dialog.geometry("600x440")
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -912,57 +781,43 @@ class ModelsDialog:
         self.provider_names = provider_names if provider_names else ["ollama_cloud"]
 
     def _build(self) -> None:
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
 
-        scroll_outer = tk.Frame(main, bg=BG)
-        scroll_outer.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(scroll_outer, bg=BG, highlightthickness=0)
-        scrollbar = _StyledScrollbar(scroll_outer, command=canvas.yview)
-        inner = tk.Frame(canvas, bg=BG)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        scroll = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
 
         aliases_raw = self.raw.get("anthropic_models", {}) or {}
-        self._entries = {}
+        self._entries: dict[str, tuple[ctk.StringVar, ctk.StringVar]] = {}
         for alias, value in sorted(aliases_raw.items()):
             if not isinstance(value, dict):
                 value = {}
-            card = tk.Frame(inner, bg=SURFACE, bd=1, relief="flat",
-                            highlightbackground=BORDER, highlightthickness=1)
-            card.pack(fill="x", pady=3, padx=2)
+            card = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            card.pack(fill="x", pady=4, padx=4)
 
-            tk.Label(card, text=alias, bg=SURFACE, fg=TEXT_BRIGHT,
-                     font=("Segoe UI", 10, "bold"), anchor="w", width=12).pack(side="left", padx=8, pady=4)
+            ctk.CTkLabel(card, text=alias, font=("Segoe UI", 10, "bold"),
+                         anchor="w", width=90).pack(side="left", padx=(10, 4), pady=8)
 
-            prov_var = tk.StringVar(value=str(value.get("provider", self.provider_names[0])))
-            ttk.Combobox(card, textvariable=prov_var, values=self.provider_names,
-                         state="readonly", width=18).pack(side="left", padx=2, pady=4)
+            prov_var = ctk.StringVar(value=str(value.get("provider", self.provider_names[0])))
+            ctk.CTkComboBox(card, variable=prov_var, values=self.provider_names,
+                            state="readonly", font=("Segoe UI", 9), width=180).pack(
+                side="left", padx=(4, 6), pady=8)
 
-            model_var = tk.StringVar(value=str(value.get("model", "")))
-            tk.Entry(card, textvariable=model_var, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                     relief="flat", bd=0, highlightbackground=BORDER,
-                     highlightthickness=1).pack(side="left", fill="x", expand=True, padx=4, pady=4)
+            model_var = ctk.StringVar(value=str(value.get("model", "")))
+            ctk.CTkEntry(card, textvariable=model_var,
+                         font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True, padx=4, pady=8)
 
             self._entries[alias] = (prov_var, model_var)
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        btn_row = tk.Frame(main, bg=BG)
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
         btn_row.pack(fill="x", pady=(10, 0))
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, padx=20, pady=6,
-                  activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="right", padx=(6, 0))
-        tk.Button(btn_row, text="Cancel", command=self.dialog.destroy,
-                  bg=BG_ALT, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", bd=0, padx=20, pady=6,
-                  activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="right")
+        ctk.CTkButton(btn_row, text="Save", command=self._save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.dialog.destroy,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right")
 
     def _save(self) -> None:
         import yaml
@@ -975,53 +830,46 @@ class ModelsDialog:
                 entry["model"] = model
             else:
                 entry.pop("model", None)
-        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self.config_path.write_text(
+            yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
         if self.on_save:
             self.on_save()
         self.dialog.destroy()
 
 
 class LogsDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path) -> None:
         self.config_path = config_path
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Server Logs")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("720x520")
-        self.dialog.minsize(560, 360)
+        self.dialog.geometry("740x540")
+        self.dialog.minsize(580, 380)
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self._poll_id = None
         self._build()
 
     def _build(self) -> None:
-        text_frame = tk.Frame(self.dialog, bg=BG)
-        text_frame.pack(fill="both", expand=True, padx=12, pady=(12, 4))
-        self.text = tk.Text(text_frame, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                             font=("Consolas", 9), relief="flat", bd=0,
-                             highlightbackground=BORDER, highlightthickness=1)
-        self.text.pack(fill="both", expand=True)
-        self.text.config(state="disabled")
-        self.text.bind("<MouseWheel>", lambda e: self.text.yview_scroll(-1 * (e.delta // 120), "units"))
-        self.text.tag_configure("error", foreground=RED)
-        self.text.tag_configure("warn", foreground=YELLOW)
-        self.text.tag_configure("info", foreground=GREEN)
-        self.text.tag_configure("muted", foreground=MUTED)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
 
-        btn_row = tk.Frame(self.dialog, bg=BG)
-        btn_row.pack(fill="x", padx=12, pady=(4, 12))
-        tk.Button(btn_row, text="Refresh", command=self._refresh,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10),
-                  relief="flat", padx=14, pady=4, activebackground=BUTTON_BOTTOM,
-                  cursor="hand2").pack(side="left", padx=4)
-        tk.Button(btn_row, text="Clear", command=self._clear,
-                  bg=SURFACE2, fg=TEXT, font=("Segoe UI", 10),
-                  relief="flat", padx=14, pady=4, activebackground=SURFACE3,
-                  cursor="hand2").pack(side="left", padx=4)
-        tk.Button(btn_row, text="Close", command=self._close,
-                  bg=SURFACE2, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", padx=14, pady=4, activebackground=SURFACE3,
-                  cursor="hand2").pack(side="right", padx=4)
+        self.text = ctk.CTkTextbox(main, font=("Consolas", 10), wrap="none",
+                                   activate_scrollbars=True)
+        self.text.pack(fill="both", expand=True)
+        self.text.bind("<MouseWheel>", lambda e: self.text.yview_scroll(-1 * (e.delta // 120), "units"))
+
+        btn_row = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkButton(btn_row, text="Refresh", command=self._refresh,
+                      font=("Segoe UI", 10), width=80).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="Clear", command=self._clear,
+                      font=("Segoe UI", 10), width=80,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="Close", command=self._close,
+                      font=("Segoe UI", 10), width=80,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right", padx=4)
 
         self.dialog.bind("<Escape>", lambda e: self._close())
         self.dialog.protocol("WM_DELETE_WINDOW", self._close)
@@ -1030,30 +878,18 @@ class LogsDialog:
 
     def _load_log(self) -> None:
         log_path = self.config_path.parent / "llama.log"
-        lines = []
+        self.text.delete("0.0", "end")
         if log_path.exists():
             try:
                 text = log_path.read_text(encoding="utf-8", errors="replace")
                 lines = text.splitlines()[-200:]
+                for line in lines:
+                    self.text.insert("end", line + "\n")
+                self.text.see("end")
             except OSError:
-                lines = ["[Could not read log]"]
+                self.text.insert("end", "[Could not read log]")
         else:
-            lines = ["[No log file found]"]
-        self.text.config(state="normal")
-        self.text.delete("1.0", "end")
-        for line in lines:
-            lower = line.lower()
-            if "error" in lower or "exception" in lower or "traceback" in lower:
-                tag = "error"
-            elif "warn" in lower:
-                tag = "warn"
-            elif "info" in lower or "start" in lower or "running" in lower or "ready" in lower:
-                tag = "info"
-            else:
-                tag = "muted"
-            self.text.insert("end", line + "\n", tag)
-        self.text.config(state="disabled")
-        self.text.see("end")
+            self.text.insert("end", "[No log file found]")
 
     def _start_polling(self) -> None:
         self._poll()
@@ -1067,25 +903,14 @@ class LogsDialog:
         try:
             if not log_path.exists():
                 return
-            current = self.text.get("1.0", "end-1c").splitlines()
+            current = self.text.get("0.0", "end-1c").splitlines()
             raw = log_path.read_text(encoding="utf-8", errors="replace")
             new_lines = raw.splitlines()
             if new_lines == current:
                 return
-            self.text.config(state="normal")
-            self.text.delete("1.0", "end")
+            self.text.delete("0.0", "end")
             for line in new_lines[-200:]:
-                lower = line.lower()
-                if "error" in lower or "exception" in lower or "traceback" in lower:
-                    tag = "error"
-                elif "warn" in lower:
-                    tag = "warn"
-                elif "info" in lower or "start" in lower or "running" in lower or "ready" in lower:
-                    tag = "info"
-                else:
-                    tag = "muted"
-                self.text.insert("end", line + "\n", tag)
-            self.text.config(state="disabled")
+                self.text.insert("end", line + "\n")
             self.text.see("end")
         except Exception:
             pass
@@ -1108,79 +933,83 @@ class LogsDialog:
         self.dialog.destroy()
 
 
-class _DetailItem:
-    def __init__(self, label: str, display_value: str, full_value: str) -> None:
-        self.label = label
-        self.display_value = display_value
-        self.full_value = full_value
-
-
 class DetailsDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path) -> None:
         self.config_path = config_path
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Details")
-        self.dialog.geometry("760x520")
-        self.dialog.minsize(620, 420)
-        self.dialog.configure(bg=BG)
+        self.dialog.geometry("780x540")
+        self.dialog.minsize(640, 440)
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self.dialog.resizable(True, True)
 
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        import tkinter as tk
+        from tkinter import ttk
 
-        self.items = self._build_items()
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
+
+        items = self._build_items()
 
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Treeview",
-                        background=BG_ALT, foreground=TEXT,
-                        fieldbackground=BG_ALT,
-                        font=("Segoe UI", 9), rowheight=26, borderwidth=0)
-        style.configure("Treeview.Heading",
-                        background=SURFACE2, foreground=TEXT_BRIGHT,
+        dark_bg = "#1a1a1a"
+        dark_fg = "#e0e0e0"
+        sel_bg = "#2a2a2a"
+        heading_bg = "#222222"
+        heading_fg = "#fafafa"
+        style.configure("CTk.Treeview",
+                        background=dark_bg, foreground=dark_fg,
+                        fieldbackground=dark_bg,
+                        font=("Segoe UI", 9), rowheight=28, borderwidth=0)
+        style.configure("CTk.Treeview.Heading",
+                        background=heading_bg, foreground=heading_fg,
                         font=("Segoe UI", 9, "bold"), borderwidth=0)
-        style.map("Treeview",
-                  background=[("selected", SURFACE3)],
-                  foreground=[("selected", TEXT_BRIGHT)])
-        style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        style.map("CTk.Treeview",
+                  background=[("selected", sel_bg)],
+                  foreground=[("selected", dark_fg)])
+        style.layout("CTk.Treeview", [("CTk.Treeview.treearea", {"sticky": "nswe"})])
 
-        self.tree = ttk.Treeview(main, columns=("field", "value"), show="headings",
-                                  selectmode="browse")
+        tree_frame = ctk.CTkFrame(main, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(tree_frame, columns=("field", "value"), show="headings",
+                                 selectmode="browse", style="CTk.Treeview")
         self.tree.heading("field", text="Field", anchor="w")
         self.tree.heading("value", text="Value", anchor="w")
-        self.tree.column("field", width=180, minwidth=140, stretch=False)
+        self.tree.column("field", width=200, minwidth=140, stretch=False)
         self.tree.column("value", width=500, minwidth=300, stretch=True)
         self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<MouseWheel>", self._on_tree_mousewheel)
+        self.tree.bind("<MouseWheel>", lambda e: self.tree.yview_scroll(-1 * (e.delta // 120), "units"))
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._on_right_click)
 
-        for idx, item in enumerate(self.items):
-            self.tree.insert("", "end", iid=str(idx),
-                             values=(item.label, item.display_value))
+        for idx, item in enumerate(items):
+            self.tree.insert("", "end", iid=str(idx), values=(item.label, item.display_value))
         self._selected_idx: str | None = None
 
-        btn_row = tk.Frame(self.dialog, bg=BG)
-        btn_row.pack(fill="x", padx=16, pady=(8, 10))
-        tk.Button(btn_row, text="Copy Selected Value", command=self._copy_selected,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 9, "bold"),
-                  relief="flat", padx=12, pady=4, activebackground=BUTTON_BOTTOM,
-                  cursor="hand2").pack(side="left", padx=(0, 6))
-        tk.Button(btn_row, text="Copy All Details", command=self._copy_all,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 9, "bold"),
-                  relief="flat", padx=12, pady=4, activebackground=BUTTON_BOTTOM,
-                  cursor="hand2").pack(side="left", padx=(0, 6))
-        tk.Button(btn_row, text="Close", command=self.dialog.destroy,
-                  bg=SURFACE2, fg=MUTED, font=("Segoe UI", 9),
-                  relief="flat", padx=16, pady=4, activebackground=SURFACE3,
-                  cursor="hand2").pack(side="right", padx=4)
+        btn_row = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkButton(btn_row, text="Copy Selected Value", command=self._copy_selected,
+                      font=("Segoe UI", 9), height=30).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Copy All Details", command=self._copy_all,
+                      font=("Segoe UI", 9), height=30).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Close", command=self.dialog.destroy,
+                      font=("Segoe UI", 9), height=30,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right", padx=4)
         self.dialog.bind("<Escape>", lambda e: self.dialog.destroy())
+
+    class _DetailItem:
+        def __init__(self, label: str, display_value: str, full_value: str) -> None:
+            self.label = label
+            self.display_value = display_value
+            self.full_value = full_value
 
     def _build_items(self) -> list[_DetailItem]:
         import yaml
-        items: list[_DetailItem] = []
+        items: list[DetailsDialog._DetailItem] = []
         try:
             raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         except Exception:
@@ -1188,32 +1017,30 @@ class DetailsDialog:
         server_raw = raw.get("server", {}) or {}
         providers_raw = raw.get("providers", {}) or {}
 
-        items.append(_DetailItem("Config path", _compact_path(str(self.config_path)), str(self.config_path)))
-        items.append(_DetailItem("Host", str(server_raw.get("host", "127.0.0.1")), str(server_raw.get("host", "127.0.0.1"))))
-        items.append(_DetailItem("Port", str(server_raw.get("port", 8089)), str(server_raw.get("port", 8089))))
+        items.append(DetailsDialog._DetailItem("Config path", _compact_path(str(self.config_path)), str(self.config_path)))
+        items.append(DetailsDialog._DetailItem("Host", str(server_raw.get("host", "127.0.0.1")), str(server_raw.get("host", "127.0.0.1"))))
+        items.append(DetailsDialog._DetailItem("Port", str(server_raw.get("port", 8089)), str(server_raw.get("port", 8089))))
         auth = server_raw.get("auth_token", "")
-        items.append(_DetailItem("Auth token", "set" if (auth and auth != "change-me") else "change-me",
-                                 "set" if (auth and auth != "change-me") else "change-me"))
-        items.append(_DetailItem("Idle timeout", f"{server_raw.get('idle_timeout_seconds', 180)}s",
-                                 str(server_raw.get('idle_timeout_seconds', 180))))
-        items.append(_DetailItem("OpenWebUI port", str(server_raw.get("openwebui_port", "none")),
-                                 str(server_raw.get("openwebui_port", "none"))))
-        items.append(_DetailItem("Providers", str(len(providers_raw)), ", ".join(providers_raw.keys()) if providers_raw else "none"))
+        items.append(DetailsDialog._DetailItem("Auth token", "set" if (auth and auth != "change-me") else "change-me",
+                                               "set" if (auth and auth != "change-me") else "change-me"))
+        items.append(DetailsDialog._DetailItem("Idle timeout", f"{server_raw.get('idle_timeout_seconds', 180)}s",
+                                               str(server_raw.get('idle_timeout_seconds', 180))))
+        items.append(DetailsDialog._DetailItem("OpenWebUI port", str(server_raw.get("openwebui_port", "none")),
+                                               str(server_raw.get("openwebui_port", "none"))))
+        items.append(DetailsDialog._DetailItem("Providers", str(len(providers_raw)),
+                                               ", ".join(providers_raw.keys()) if providers_raw else "none"))
         for name, prov in sorted(providers_raw.items()):
             ptype = prov.get("type", "?")
             model = prov.get("default_model", "-") or "-"
-            items.append(_DetailItem(f"  {name}", f"{ptype} / {model}", f"{ptype} / {model}"))
+            items.append(DetailsDialog._DetailItem(f"  {name}", f"{ptype} / {model}", f"{ptype} / {model}"))
 
         tools_raw = raw.get("tools", {}) or {}
-        items.append(_DetailItem("Tools enabled", str(tools_raw.get("enabled", True)), str(tools_raw.get("enabled", True))))
-        items.append(_DetailItem("Tools include", ", ".join(tools_raw.get("include", []) or []) or "none",
-                                 ", ".join(tools_raw.get("include", []) or []) or "none"))
-        items.append(_DetailItem("Search", str(tools_raw.get("default_search_provider", "tavily")),
-                                 str(tools_raw.get("default_search_provider", "tavily"))))
+        items.append(DetailsDialog._DetailItem("Tools enabled", str(tools_raw.get("enabled", True)), str(tools_raw.get("enabled", True))))
+        items.append(DetailsDialog._DetailItem("Tools include", ", ".join(tools_raw.get("include", []) or []) or "none",
+                                               ", ".join(tools_raw.get("include", []) or []) or "none"))
+        items.append(DetailsDialog._DetailItem("Search", str(tools_raw.get("default_search_provider", "tavily")),
+                                               str(tools_raw.get("default_search_provider", "tavily"))))
         return items
-
-    def _on_tree_mousewheel(self, event: Any) -> None:
-        self.tree.yview_scroll(-1 * (event.delta // 120), "units")
 
     def _on_select(self, _event: Any = None) -> None:
         sel = self.tree.selection()
@@ -1234,13 +1061,14 @@ class DetailsDialog:
             self._selected_idx = sel[0]
         try:
             idx = int(self._selected_idx)
-            item = self.items[idx]
+            item = self._build_items()[idx]
             self.dialog.clipboard_clear()
             self.dialog.clipboard_append(item.full_value)
         except (ValueError, IndexError):
             pass
 
     def _copy_all(self) -> None:
-        lines = [f"{item.label}: {item.full_value}" for item in self.items]
+        items = self._build_items()
+        lines = [f"{item.label}: {item.full_value}" for item in items]
         self.dialog.clipboard_clear()
         self.dialog.clipboard_append("\n".join(lines))

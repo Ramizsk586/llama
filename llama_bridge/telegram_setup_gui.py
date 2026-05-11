@@ -20,46 +20,26 @@ from .telegram_launcher import (
 )
 
 try:
-    import tkinter as tk
-    from tkinter import ttk, messagebox
+    import customtkinter as ctk
     HAS_TK = True
 except ImportError:
     HAS_TK = False
-    class FakeTK:
-        class Tk:
+    class _FakeCTk:
+        class CTk:
             def __init__(self):
-                raise RuntimeError("Tkinter not available")
-    tk = FakeTK()
+                raise RuntimeError("customtkinter not available")
+    ctk = _FakeCTk()
 
-
-BG = "#050505"
-BG_ALT = "#0B0B0B"
-SURFACE = "#111111"
-SURFACE2 = "#171717"
-SURFACE3 = "#1D1D1D"
-BORDER = "#2A2A2A"
-TEXT = "#E0E0E0"
-TEXT_BRIGHT = "#FAFAFA"
-MUTED = "#9A9A9A"
 GREEN = "#4FD1A1"
 RED = "#FF6B6B"
 YELLOW = "#F2C66D"
-CARD_GREEN = "#102A28"
-CARD_RED = "#34181B"
-CARD_GREEN_BORDER = "#1E6054"
-CARD_RED_BORDER = "#7B3840"
-BUTTON_TOP = "#1A2840"
-BUTTON_BOTTOM = "#152035"
-BUTTON_BORDER = "#314766"
 
 LAYOUT = {
-    "HEADER_H": 90,
-    "PAD": 24,
-    "CARD_H": 64,
-    "CARD_GAP": 10,
-    "BTN_H": 38,
-    "WIN_W": 608,
-    "WIN_H": 620,
+    "PAD": 20,
+    "CARD_H": 68,
+    "CARD_GAP": 8,
+    "WIN_W": 640,
+    "WIN_H": 480,
 }
 PAD = LAYOUT["PAD"]
 
@@ -73,10 +53,10 @@ class BotStatus(Enum):
 
 
 class ToolTip:
-    def __init__(self, widget: tk.Widget, text: str) -> None:
+    def __init__(self, widget: ctk.CTkBaseClass, text: str) -> None:
         self.widget = widget
         self.text = text
-        self.tip: tk.Toplevel | None = None
+        self.tip: ctk.CTkToplevel | None = None
         widget.bind("<Enter>", self._enter, add=True)
         widget.bind("<Leave>", self._leave, add=True)
 
@@ -85,38 +65,22 @@ class ToolTip:
             return
         x = self.widget.winfo_rootx() + 20
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-        self.tip = tk.Toplevel(self.widget)
+        self.tip = ctk.CTkToplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f"+{x}+{y}")
-        lbl = tk.Label(self.tip, text=self.text, bg=SURFACE3, fg=TEXT_BRIGHT,
-                       font=("Segoe UI", 9), padx=8, pady=4, relief="solid", bd=1)
+        lbl = ctk.CTkLabel(self.tip, text=self.text, font=("Segoe UI", 9), padx=8, pady=4)
         lbl.pack()
 
     def _leave(self, _event: Any = None) -> None:
         if self.tip:
             try:
                 self.tip.destroy()
-            except tk.TclError:
+            except Exception:
                 pass
             self.tip = None
 
 
-def _set_dark_titlebar(root: tk.Tk) -> None:
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-            ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int),
-        )
-    except Exception:
-        pass
-
-
-def _center_window(root: tk.Tk, w: int, h: int) -> None:
+def _center_window(root: ctk.CTk, w: int, h: int) -> None:
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
     x = (sw - w) // 2
@@ -140,17 +104,18 @@ def _compact_path(path_str: str, max_len: int = 50) -> str:
 
 class TelegramSetupCenter:
     def __init__(self, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
         self.config_path = config_path
         self._stopped = threading.Event()
 
         W, H = LAYOUT["WIN_W"], LAYOUT["WIN_H"]
-        self.root = tk.Tk()
+        self.root = ctk.CTk()
         self.root.title("Llama Bridge - Telegram Bot Setup")
         _center_window(self.root, W, H)
-        self.root.minsize(560, 520)
-        self.root.configure(bg=BG)
+        self.root.minsize(520, 400)
         self.root.resizable(True, True)
-        _set_dark_titlebar(self.root)
 
         self.status = BotStatus.SETUP
         self._config = None
@@ -160,20 +125,13 @@ class TelegramSetupCenter:
         self._bot_id: str | None = None
         self._test_ok = False
 
-        self.header_canvas: tk.Canvas | None = None
-        self.cards_canvas: tk.Canvas | None = None
-        self.status_label: tk.Label | None = None
-        self.primary_btn: tk.Button | None = None
-        self.access_btn: tk.Button | None = None
-        self.auto_btn: tk.Button | None = None
-        self.util_btns: dict[str, tk.Button] = {}
-
         self._card_data = [
             {"key": "token", "title": "Bot Token", "ok": False, "subtitle": "Missing", "status": "Missing"},
             {"key": "api", "title": "Telegram API", "ok": False, "subtitle": "Not tested", "status": "Test"},
             {"key": "model", "title": "AI Model", "ok": False, "subtitle": "Missing", "status": "Missing"},
             {"key": "access", "title": "Access & Tools", "ok": False, "subtitle": "Not configured", "status": "Warn"},
         ]
+        self._card_widgets: list[ctk.CTkFrame] = []
 
         self._build_ui()
         self._load_config()
@@ -183,33 +141,65 @@ class TelegramSetupCenter:
         self.root.after(2000, self._poll_status)
 
     def _build_ui(self) -> None:
-        main = tk.Frame(self.root, bg=BG)
+        main = ctk.CTkFrame(self.root, fg_color="transparent")
         main.pack(fill="both", expand=True)
 
-        self.header_canvas = tk.Canvas(main, bg=BG, highlightthickness=0)
-        self.header_canvas.pack(fill="x", side="top")
-        self.header_canvas.configure(height=LAYOUT["HEADER_H"])
+        self._build_header(main)
 
-        self.cards_canvas = tk.Canvas(main, bg=BG, highlightthickness=0)
-        self.cards_canvas.pack(fill="both", expand=True, side="top")
+        sep = ctk.CTkFrame(main, fg_color=GREEN, height=2, corner_radius=0)
+        sep.pack(fill="x", padx=PAD, pady=(4, 0))
 
-        self.status_label = tk.Label(main, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9), anchor="w", padx=PAD)
-        self.status_label.pack(fill="x", side="top")
-
-        sep = tk.Frame(main, bg=BORDER, height=1)
-        sep.pack(fill="x", side="bottom")
+        self.status_label = ctk.CTkLabel(main, text="", font=("Segoe UI", 9),
+                                          text_color=("#888888", "#888888"), anchor="w")
+        self.status_label.pack(fill="x", padx=PAD, pady=(8, 0))
 
         self._build_footer(main)
 
-        self.header_canvas.bind("<Configure>", lambda e: self._draw_header())
-        self.cards_canvas.bind("<Configure>", lambda e: self._draw_cards())
+        self.cards_area = ctk.CTkFrame(main, fg_color="transparent")
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(8, 0))
 
-    def _build_footer(self, parent: tk.Frame) -> None:
-        footer = tk.Frame(parent, bg=BG)
-        footer.pack(fill="x", side="bottom", pady=(6, 10))
+    def _build_header(self, parent: ctk.CTkFrame) -> None:
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=PAD, pady=(PAD, 0))
 
-        util = tk.Frame(footer, bg=BG)
-        util.pack(fill="x", padx=PAD)
+        header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
+
+        title_frame = ctk.CTkFrame(header, fg_color="transparent")
+        title_frame.grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(title_frame, text="Telegram Bot Setup Center",
+                     font=("Segoe UI", 18, "bold"), anchor="w").pack(anchor="w")
+        self.subtitle_label = ctk.CTkLabel(title_frame, text="",
+                                           font=("Segoe UI", 10),
+                                           text_color=("#888888", "#888888"), anchor="w")
+        self.subtitle_label.pack(anchor="w", pady=(2, 0))
+
+        self.badge = ctk.CTkLabel(header, text="  SETUP  ",
+                                  font=("Segoe UI", 9, "bold"), corner_radius=4)
+        self.badge.grid(row=0, column=1, sticky="ne", pady=(4, 0))
+
+        self._update_header()
+
+    def _update_header(self) -> None:
+        self.subtitle_label.configure(text=self._subtitle_text())
+        badge_text, badge_color = self._get_badge_info()
+        badge_bg = {
+            BotStatus.RUNNING: "#0a2a1a",
+            BotStatus.READY: "#0a2a1a",
+            BotStatus.SETUP: "#2a2a0a",
+            BotStatus.STARTING: "#2a2a0a",
+            BotStatus.ERROR: "#2a0a0a",
+        }.get(self.status, "#0a2a1a")
+        self.badge.configure(text=f"  {badge_text}  ",
+                             fg_color=badge_bg, text_color=badge_color)
+
+    def _build_footer(self, parent: ctk.CTkFrame) -> None:
+        footer = ctk.CTkFrame(parent, fg_color="transparent")
+        footer.pack(fill="x", side="bottom", pady=(4, 12), padx=PAD)
+
+        util = ctk.CTkFrame(footer, fg_color="transparent")
+        util.pack(fill="x")
 
         util_items = [
             ("btn_config", "\u2699 Config", self._open_config),
@@ -219,15 +209,17 @@ class TelegramSetupCenter:
             ("btn_logs", "\U0001f4cb Logs", self._open_logs),
             ("btn_details", "\u2139 Details", self._open_details),
         ]
-        for i, (key, text, cmd) in enumerate(util_items):
-            btn = tk.Button(
+        self.util_btns: dict[str, ctk.CTkButton] = {}
+        for key, text, cmd in util_items:
+            btn = ctk.CTkButton(
                 util, text=text, command=cmd,
-                bg=BG_ALT, fg=MUTED, font=("Segoe UI", 9),
-                relief="flat", bd=0, padx=8, pady=2,
-                activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                cursor="hand2",
+                font=("Segoe UI", 10), height=30,
+                fg_color=("#e0e0e0", "#2a2a2a"),
+                text_color=("#333333", "#cccccc"),
+                hover_color=("#d0d0d0", "#3a3a3a"),
+                corner_radius=4,
             )
-            btn.pack(side="left" if i < 5 else "right", padx=(0, 12))
+            btn.pack(side="left", padx=(0, 8))
             self.util_btns[key] = btn
             tooltip_map = {
                 "btn_config": "Open configuration dialog",
@@ -239,138 +231,93 @@ class TelegramSetupCenter:
             }
             ToolTip(btn, tooltip_map[key])
 
-        action = tk.Frame(footer, bg=BG)
-        action.pack(fill="x", padx=PAD, pady=(4, 0))
+        action = ctk.CTkFrame(footer, fg_color="transparent")
+        action.pack(fill="x", pady=(6, 0))
 
-        self.access_btn = tk.Button(
+        self.access_btn = ctk.CTkButton(
             action, text="Access: Private", command=self._toggle_access,
-            bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-            relief="flat", bd=0, padx=16, pady=8,
-            activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-            cursor="hand2",
+            font=("Segoe UI", 10, "bold"), height=34,
+            fg_color=("#1a4030", "#1a4030"), text_color=GREEN,
+            hover_color=("#153828", "#153828"), corner_radius=6,
         )
         self.access_btn.pack(side="left", padx=(0, 8))
         ToolTip(self.access_btn, "Toggle between private and all-chats access")
 
-        self.auto_btn = tk.Button(
+        self.auto_btn = ctk.CTkButton(
             action, text="Auto: Off", command=self._toggle_auto,
-            bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-            relief="flat", bd=0, padx=16, pady=8,
-            activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-            cursor="hand2",
+            font=("Segoe UI", 10, "bold"), height=34,
+            fg_color=("#1a4030", "#1a4030"), text_color=GREEN,
+            hover_color=("#153828", "#153828"), corner_radius=6,
         )
         self.auto_btn.pack(side="left")
         ToolTip(self.auto_btn, "Toggle autonomous mode on/off")
 
-        self.primary_btn = tk.Button(
+        self.primary_btn = ctk.CTkButton(
             action, text="Start Bot", command=self._primary_action,
-            bg="#1A4030", fg=GREEN, font=("Segoe UI", 11, "bold"),
-            relief="flat", bd=0, padx=24, pady=8,
-            activebackground="#153828", activeforeground=GREEN,
-            cursor="hand2",
+            font=("Segoe UI", 11, "bold"), height=38,
+            fg_color=("#1a4030", "#1a4030"), text_color=GREEN,
+            hover_color=("#153828", "#153828"), corner_radius=6,
         )
         self.primary_btn.pack(side="right")
         ToolTip(self.primary_btn, "Start or stop the Telegram bot")
 
-    def _draw_header(self) -> None:
-        cv = self.header_canvas
-        if not cv:
-            return
-        cv.delete("all")
-        w = cv.winfo_width() or LAYOUT["WIN_W"]
-        h = LAYOUT["HEADER_H"]
-        p = PAD
+    def _create_card(self, card_data: dict, parent: ctk.CTkFrame | None = None) -> ctk.CTkFrame:
+        if parent is None:
+            parent = self.cards_area
+        ok = card_data["ok"]
+        card_bg = "#0f2820" if ok else "#281414"
+        accent_color = GREEN if ok else RED
+        icon_text = "\u2713" if ok else "\u2717"
 
-        cv.create_text(p, 16, anchor="nw", text="Telegram Bot Setup Center",
-                       font=("Segoe UI", 16, "bold"), fill=TEXT_BRIGHT)
+        card = ctk.CTkFrame(parent, fg_color=card_bg, corner_radius=8, height=LAYOUT["CARD_H"])
+        card.grid_propagate(False)
 
-        subtitle = self._subtitle_text()
-        cv.create_text(p, h // 2 + 10, anchor="nw", text=subtitle,
-                       font=("Segoe UI", 10), fill=MUTED)
+        card.columnconfigure(0, weight=0)
+        card.columnconfigure(1, weight=0)
+        card.columnconfigure(2, weight=1)
+        card.columnconfigure(3, weight=0)
 
-        badge_text, badge_color = self._get_badge_info()
-        btxt = f"  {badge_text}  "
-        font_sz = 9
-        tw = len(btxt) * (font_sz + 1)
-        bx = w - p - tw - 12
-        by = 20
-        bw = tw + 12
-        bh = 26
-        cv.create_rectangle(bx, by, bx + bw, by + bh, fill="", outline=badge_color, width=1)
-        cv.create_text(bx + bw // 2, by + bh // 2, text=badge_text,
-                       font=("Segoe UI", 9, "bold"), fill=badge_color)
+        accent = ctk.CTkFrame(card, fg_color=accent_color, width=5, corner_radius=0)
+        accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 10))
 
-        sep_color = self._get_separator_color()
-        cv.create_rectangle(0, h - 3, w, h, fill=sep_color, outline="")
+        ctk.CTkLabel(card, text=icon_text,
+                     font=("Segoe UI", 14, "bold"),
+                     text_color=accent_color).grid(row=0, column=1, rowspan=2, padx=(0, 6))
 
-    def _draw_cards(self) -> None:
-        cv = self.cards_canvas
-        if not cv:
-            return
-        cv.delete("all")
-        w = cv.winfo_width() or LAYOUT["WIN_W"]
-        p = PAD
-        card_w = w - 2 * p
-        y = 12
-        ch = LAYOUT["CARD_H"]
+        ctk.CTkLabel(card, text=card_data["title"],
+                     font=("Segoe UI", 10, "bold"), anchor="w").grid(
+            row=0, column=2, sticky="w", pady=(6, 0))
 
-        for card in self._card_data:
-            ok = card["ok"]
-            fill = CARD_GREEN if ok else CARD_RED
-            border = CARD_GREEN_BORDER if ok else CARD_RED_BORDER
-            accent = GREEN if ok else RED
+        ctk.CTkLabel(card, text=card_data.get("subtitle", ""),
+                     font=("Segoe UI", 9),
+                     text_color=("#888888", "#888888"), anchor="w").grid(
+            row=1, column=2, sticky="w", pady=(0, 6))
 
-            cv.create_rectangle(p, y, p + card_w, y + ch, fill=fill, outline=border, width=1)
-            cv.create_rectangle(p, y, p + 5, y + ch, fill=accent, outline=accent, width=0)
+        ctk.CTkLabel(card, text=card_data.get("status", ""),
+                     font=("Segoe UI", 9, "bold"),
+                     text_color=accent_color).grid(
+            row=0, column=3, rowspan=2, sticky="e", padx=(0, 16))
 
-            cx, cy = p + 34, y + ch // 2
-            cr = 14
-            cv.create_oval(cx - cr, cy - cr, cx + cr, cy + cr, outline=accent, width=2)
-            if ok:
-                cv.create_line(cx - 7, cy, cx - 1, cy + 6, cx + 7, cy - 6,
-                               fill=accent, width=2, capstyle="round", joinstyle="round")
-            else:
-                cv.create_line(cx - 5, cy - 5, cx + 5, cy + 5, fill=accent, width=2)
-                cv.create_line(cx + 5, cy - 5, cx - 5, cy + 5, fill=accent, width=2)
+        return card
 
-            tx = p + 68
-            cv.create_text(tx, y + 14, text=card["title"],
-                           fill=TEXT_BRIGHT, font=("Segoe UI", 11, "bold"), anchor="w")
+    def _rebuild_cards(self) -> None:
+        for w in self._card_widgets:
+            w.destroy()
+        self._card_widgets.clear()
 
-            sub = card.get("subtitle", "")
-            safe_sub = self._ellipsize(cv, sub, ("Segoe UI", 9), card_w - 190)
-            cv.create_text(tx, y + 37, text=safe_sub,
-                           fill=MUTED, font=("Segoe UI", 9), anchor="w")
+        self.cards_area.columnconfigure(0, weight=1, uniform="card_col")
+        self.cards_area.columnconfigure(1, weight=1, uniform="card_col")
 
-            st = card.get("status", "")
-            cv.create_text(p + card_w - 14, y + ch // 2, text=st,
-                           fill=accent, font=("Segoe UI", 9, "bold"), anchor="e")
+        GAP = LAYOUT["CARD_GAP"] // 2
+        for idx, card_data in enumerate(self._card_data):
+            r, c = divmod(idx, 2)
+            px = (0, GAP) if c == 0 else (GAP, 0)
+            card = self._create_card(card_data, parent=self.cards_area)
+            card.grid(row=r, column=c, sticky="nsew", padx=px, pady=GAP)
+            self._card_widgets.append(card)
 
-            y += ch + LAYOUT["CARD_GAP"]
-
-    @staticmethod
-    def _ellipsize(cv: tk.Canvas, text: str, font: tuple[str, int], max_width: int) -> str:
-        if not text or max_width < 20:
-            return ""
-        tid = cv.create_text(-9999, -9999, text=text, font=font, anchor="w")
-        try:
-            bbox = cv.bbox(tid)
-            if bbox and (bbox[2] - bbox[0]) <= max_width:
-                return text
-        finally:
-            cv.delete(tid)
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            candidate = text[:mid] + "..."
-            tid = cv.create_text(-9999, -9999, text=candidate, font=font, anchor="w")
-            bbox = cv.bbox(tid)
-            cv.delete(tid)
-            if bbox and (bbox[2] - bbox[0]) <= max_width:
-                lo = mid
-            else:
-                hi = mid - 1
-        return text[:lo] + "..." if lo > 0 else "..."
+        for r in range((len(self._card_data) + 1) // 2):
+            self.cards_area.rowconfigure(r, weight=0)
 
     def _subtitle_text(self) -> str:
         if self.status == BotStatus.SETUP:
@@ -398,16 +345,6 @@ class TelegramSetupCenter:
         if s == BotStatus.RUNNING:
             return "RUNNING", GREEN
         return "READY", GREEN
-
-    def _get_separator_color(self) -> str:
-        s = self.status
-        if s == BotStatus.ERROR:
-            return RED
-        if s == BotStatus.RUNNING:
-            return GREEN
-        if s == BotStatus.READY:
-            return GREEN
-        return BORDER
 
     def _update_card_data(self) -> None:
         cfg = self._config
@@ -466,23 +403,23 @@ class TelegramSetupCenter:
     def _refresh_all(self) -> None:
         self._load_config()
         self._update_card_data()
-        self._draw_header()
-        self._draw_cards()
+        self._update_header()
+        self._rebuild_cards()
         self._update_buttons()
 
     def _update_buttons(self) -> None:
         if not self.primary_btn:
             return
         if self.status == BotStatus.SETUP:
-            self.primary_btn.configure(text="Config", state="normal", bg="#1A4030", fg=GREEN)
+            self.primary_btn.configure(text="Config", state="normal", fg_color="#1a4030", text_color=GREEN)
         elif self.status == BotStatus.READY:
-            self.primary_btn.configure(text="Start Bot", state="normal", bg="#1A4030", fg=GREEN)
+            self.primary_btn.configure(text="Start Bot", state="normal", fg_color="#1a4030", text_color=GREEN)
         elif self.status == BotStatus.STARTING:
-            self.primary_btn.configure(text="Starting\u2026", state="disabled", bg=SURFACE3, fg=MUTED)
+            self.primary_btn.configure(text="Starting\u2026", state="disabled", fg_color=("#444444", "#333333"), text_color=("#888888", "#888888"))
         elif self.status == BotStatus.RUNNING:
-            self.primary_btn.configure(text="Stop Bot", state="normal", bg=CARD_RED, fg=RED)
+            self.primary_btn.configure(text="Stop Bot", state="normal", fg_color="#281414", text_color=RED)
         elif self.status == BotStatus.ERROR:
-            self.primary_btn.configure(text="Restart Bot", state="normal", bg="#1A4030", fg=GREEN)
+            self.primary_btn.configure(text="Restart Bot", state="normal", fg_color="#1a4030", text_color=GREEN)
 
         if self._config:
             tg = self._config.telegram
@@ -505,7 +442,7 @@ class TelegramSetupCenter:
         self._config.telegram.allow_all_chats = not self._config.telegram.allow_all_chats
         self._save_raw_config()
         self._update_card_data()
-        self._draw_cards()
+        self._rebuild_cards()
         self._update_buttons()
 
     def _toggle_auto(self) -> None:
@@ -652,8 +589,8 @@ class TelegramSetupCenter:
             self._bot_id = bot_id
             self._test_ok = True
             self._update_card_data()
-            self._draw_cards()
-            self._draw_header()
+            self._rebuild_cards()
+            self._update_header()
             self._update_buttons()
         ConfigDialog(self.root, self.config_path, self._on_config_saved, on_test_ok=_on_test_ok)
 
@@ -679,15 +616,14 @@ class TelegramSetupCenter:
 
 
 class ConfigDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path, on_save=None, on_test_ok=None) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path, on_save=None, on_test_ok=None) -> None:
         self.config_path = config_path
         self.on_save = on_save
         self.on_test_ok = on_test_ok
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Telegram Config")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("520x560")
-        self.dialog.minsize(460, 400)
+        self.dialog.geometry("540x580")
+        self.dialog.minsize(480, 420)
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -699,119 +635,105 @@ class ConfigDialog:
         self.raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         self.telegram_raw = self.raw.setdefault("telegram", {})
 
-    def _add_label(self, parent, row, text):
-        tk.Label(parent, text=text, bg=BG, fg=TEXT, font=("Segoe UI", 9), anchor="w").grid(
-            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
-
     def _build(self) -> None:
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
+
+        scroll = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
 
         row = 0
-        self.enabled_var = tk.BooleanVar(value=bool(self.telegram_raw.get("enabled", False)))
-        tk.Checkbutton(main, text="Enable Telegram bot", variable=self.enabled_var,
-                       bg=BG, fg=TEXT, selectcolor=SURFACE2, activebackground=BG).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=2)
+        self.enabled_var = ctk.BooleanVar(value=bool(self.telegram_raw.get("enabled", False)))
+        ctk.CTkCheckBox(scroll, text="Enable Telegram bot", variable=self.enabled_var,
+                        font=("Segoe UI", 10)).grid(row=row, column=0, columnspan=3, sticky="w", pady=2)
         row += 1
 
-        self._add_label(main, row, "Bot Token")
-        token_frame = tk.Frame(main, bg=BG)
+        ctk.CTkLabel(scroll, text="Bot Token", font=("Segoe UI", 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
+        token_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         token_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
-        self.token_entry = tk.Entry(token_frame, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                                     relief="flat", bd=0, highlightbackground=BORDER, highlightthickness=1,
-                                     show="*")
+        self.token_entry = ctk.CTkEntry(token_frame, font=("Segoe UI", 10), show="*")
         self.token_entry.pack(side="left", fill="x", expand=True)
         self.token_entry.insert(0, str(self.telegram_raw.get("bot_token", "")))
-        self.show_token_var = tk.BooleanVar(value=False)
-        show_cb = tk.Checkbutton(token_frame, text="Show", variable=self.show_token_var,
-                                  bg=BG, fg=MUTED, selectcolor=SURFACE2, activebackground=BG,
-                                  command=self._toggle_token_show)
-        show_cb.pack(side="left", padx=(4, 0))
+        self.show_token_var = ctk.BooleanVar(value=False)
+        def _toggle_token_show():
+            self.token_entry.configure(show="" if self.show_token_var.get() else "*")
+        ctk.CTkCheckBox(token_frame, text="Show", variable=self.show_token_var,
+                        command=_toggle_token_show, font=("Segoe UI", 9)).pack(side="left", padx=(6, 0))
         row += 1
 
-        test_btn = tk.Button(main, text="Test Token", command=self._test_token,
-                             bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 9, "bold"),
-                             relief="flat", bd=0, padx=12, pady=4,
-                             activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                             cursor="hand2")
-        test_btn.grid(row=row, column=1, sticky="w", pady=2)
-        self.test_result_var = tk.StringVar(value="")
-        tk.Label(main, textvariable=self.test_result_var, bg=BG, fg=MUTED, font=("Segoe UI", 9)).grid(
+        ctk.CTkButton(scroll, text="Test Token", command=self._test_token,
+                      font=("Segoe UI", 9, "bold"), width=100, height=28).grid(
+            row=row, column=1, sticky="w", pady=2)
+        self.test_result_var = ctk.StringVar(value="")
+        ctk.CTkLabel(scroll, textvariable=self.test_result_var,
+                     font=("Segoe UI", 9), text_color=("#888888", "#888888")).grid(
             row=row, column=2, sticky="w", padx=(8, 0))
         row += 1
 
         provider_names = list(self.raw.get("providers", {}).keys())
-        self._add_label(main, row, "Provider")
-        self.provider_var = tk.StringVar(
+        ctk.CTkLabel(scroll, text="Provider", font=("Segoe UI", 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
+        self.provider_var = ctk.StringVar(
             value=str(self.telegram_raw.get("provider", provider_names[0] if provider_names else "")))
-        ttk.Combobox(main, textvariable=self.provider_var, values=provider_names,
-                     state="readonly", width=28).grid(row=row, column=1, columnspan=2, sticky="w", pady=2)
+        ctk.CTkComboBox(scroll, variable=self.provider_var, values=provider_names,
+                        state="readonly", font=("Segoe UI", 10), width=200).grid(
+            row=row, column=1, columnspan=2, sticky="w", pady=2)
         row += 1
 
-        self._add_label(main, row, "Model")
-        self.model_entry = tk.Entry(main, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                                     relief="flat", bd=0, highlightbackground=BORDER, highlightthickness=1)
+        ctk.CTkLabel(scroll, text="Model", font=("Segoe UI", 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
+        self.model_entry = ctk.CTkEntry(scroll, font=("Segoe UI", 10))
         self.model_entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
         self.model_entry.insert(0, str(self.telegram_raw.get("model", "")))
         row += 1
 
-        self._add_label(main, row, "System Prompt")
-        self.prompt_text = tk.Text(main, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                                    relief="flat", bd=0, highlightbackground=BORDER, highlightthickness=1,
-                                    height=4)
+        ctk.CTkLabel(scroll, text="System Prompt", font=("Segoe UI", 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
+        self.prompt_text = ctk.CTkTextbox(scroll, font=("Segoe UI", 10), height=80)
         self.prompt_text.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
-        self.prompt_text.insert("1.0", str(self.telegram_raw.get("system_prompt", "")))
+        self.prompt_text.insert("0.0", str(self.telegram_raw.get("system_prompt", "")))
         row += 1
 
-        self._add_label(main, row, "Max Input Chars")
-        self.input_chars_var = tk.StringVar(value=str(self.telegram_raw.get("max_input_chars", 4000)))
-        tk.Spinbox(main, from_=200, to=16000, textvariable=self.input_chars_var,
-                   bg=SURFACE2, fg=TEXT, buttonbackground=SURFACE2, relief="flat",
-                   highlightbackground=BORDER, highlightthickness=1, width=10).grid(
-            row=row, column=1, sticky="w", pady=2)
+        ctk.CTkLabel(scroll, text="Max Input Chars", font=("Segoe UI", 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
+        self.input_chars_var = ctk.StringVar(value=str(self.telegram_raw.get("max_input_chars", 4000)))
+        ctk.CTkEntry(scroll, textvariable=self.input_chars_var, width=100,
+                     font=("Segoe UI", 10)).grid(row=row, column=1, sticky="w", pady=2)
         row += 1
 
-        self._add_label(main, row, "Max Output Tokens")
-        self.output_tokens_var = tk.StringVar(value=str(self.telegram_raw.get("max_output_tokens", 512)))
-        tk.Spinbox(main, from_=64, to=8192, textvariable=self.output_tokens_var,
-                   bg=SURFACE2, fg=TEXT, buttonbackground=SURFACE2, relief="flat",
-                   highlightbackground=BORDER, highlightthickness=1, width=10).grid(
-            row=row, column=1, sticky="w", pady=2)
+        ctk.CTkLabel(scroll, text="Max Output Tokens", font=("Segoe UI", 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
+        self.output_tokens_var = ctk.StringVar(value=str(self.telegram_raw.get("max_output_tokens", 512)))
+        ctk.CTkEntry(scroll, textvariable=self.output_tokens_var, width=100,
+                     font=("Segoe UI", 10)).grid(row=row, column=1, sticky="w", pady=2)
         row += 1
 
-        self._add_label(main, row, "Poll Interval (s)")
-        self.poll_interval_var = tk.StringVar(value=str(self.telegram_raw.get("poll_interval_seconds", 2.0)))
-        tk.Spinbox(main, from_=0.5, to=30, increment=0.5, textvariable=self.poll_interval_var,
-                   bg=SURFACE2, fg=TEXT, buttonbackground=SURFACE2, relief="flat",
-                   highlightbackground=BORDER, highlightthickness=1, width=10).grid(
-            row=row, column=1, sticky="w", pady=2)
+        ctk.CTkLabel(scroll, text="Poll Interval (s)", font=("Segoe UI", 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
+        self.poll_interval_var = ctk.StringVar(value=str(self.telegram_raw.get("poll_interval_seconds", 2.0)))
+        ctk.CTkEntry(scroll, textvariable=self.poll_interval_var, width=100,
+                     font=("Segoe UI", 10)).grid(row=row, column=1, sticky="w", pady=2)
         row += 1
 
-        self._add_label(main, row, "Response Timeout (s)")
-        self.resp_timeout_var = tk.StringVar(value=str(self.telegram_raw.get("response_timeout_seconds", 180.0)))
-        tk.Spinbox(main, from_=10, to=600, increment=10, textvariable=self.resp_timeout_var,
-                   bg=SURFACE2, fg=TEXT, buttonbackground=SURFACE2, relief="flat",
-                   highlightbackground=BORDER, highlightthickness=1, width=10).grid(
-            row=row, column=1, sticky="w", pady=2)
+        ctk.CTkLabel(scroll, text="Response Timeout (s)", font=("Segoe UI", 10), anchor="w").grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 8))
+        self.resp_timeout_var = ctk.StringVar(value=str(self.telegram_raw.get("response_timeout_seconds", 180.0)))
+        ctk.CTkEntry(scroll, textvariable=self.resp_timeout_var, width=100,
+                     font=("Segoe UI", 10)).grid(row=row, column=1, sticky="w", pady=2)
         row += 1
 
-        btn_row = tk.Frame(main, bg=BG)
-        btn_row.grid(row=row + 1, column=0, columnspan=3, pady=(12, 0))
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left", padx=(0, 8))
-        tk.Button(btn_row, text="Cancel", command=self.dialog.destroy,
-                  bg=BG_ALT, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left")
+        scroll.columnconfigure(1, weight=1)
 
-        main.columnconfigure(1, weight=1)
-
-    def _toggle_token_show(self) -> None:
-        self.token_entry.configure(show="" if self.show_token_var.get() else "*")
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.dialog.destroy,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right")
 
     def _test_token(self) -> None:
         token = self.token_entry.get().strip()
@@ -843,7 +765,7 @@ class ConfigDialog:
             self.telegram_raw["bot_token"] = token
         self.telegram_raw["provider"] = self.provider_var.get()
         self.telegram_raw["model"] = self.model_entry.get().strip()
-        self.telegram_raw["system_prompt"] = self.prompt_text.get("1.0", "end-1c").strip()
+        self.telegram_raw["system_prompt"] = self.prompt_text.get("0.0", "end-1c").strip()
         self.telegram_raw["max_input_chars"] = int(self.input_chars_var.get())
         self.telegram_raw["max_output_tokens"] = int(self.output_tokens_var.get())
         self.telegram_raw["poll_interval_seconds"] = float(self.poll_interval_var.get())
@@ -855,14 +777,13 @@ class ConfigDialog:
 
 
 class AccessDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path, on_save=None) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path, on_save=None) -> None:
         self.config_path = config_path
         self.on_save = on_save
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Access Control")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("540x500")
-        self.dialog.minsize(460, 400)
+        self.dialog.geometry("560x520")
+        self.dialog.minsize(480, 420)
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -875,81 +796,71 @@ class AccessDialog:
         self.telegram_raw = self.raw.setdefault("telegram", {})
 
     def _build(self) -> None:
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
+
+        scroll = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
 
         row = 0
-        self.allow_all_var = tk.BooleanVar(value=bool(self.telegram_raw.get("allow_all_chats", False)))
-        tk.Checkbutton(main, text="Allow all chats (WARNING: open to everyone)", variable=self.allow_all_var,
-                       bg=BG, fg=RED, selectcolor=SURFACE2, activebackground=BG).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=2)
+        self.allow_all_var = ctk.BooleanVar(value=bool(self.telegram_raw.get("allow_all_chats", False)))
+        ctk.CTkCheckBox(scroll, text="Allow all chats (WARNING: open to everyone)",
+                        variable=self.allow_all_var, font=("Segoe UI", 10),
+                        text_color=RED).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
         row += 1
 
-        tk.Label(main, text="Allowed Chat IDs", bg=BG, fg=TEXT_BRIGHT,
-                 font=("Segoe UI", 10, "bold"), anchor="w").grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ctk.CTkLabel(scroll, text="Allowed Chat IDs", font=("Segoe UI", 10, "bold"),
+                     anchor="w").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
         row += 1
-        self.allowed_text = tk.Text(main, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                                     height=4, relief="flat", bd=0,
-                                     highlightbackground=BORDER, highlightthickness=1)
+        self.allowed_text = ctk.CTkTextbox(scroll, font=("Segoe UI", 10), height=60)
         self.allowed_text.grid(row=row, column=0, columnspan=3, sticky="ew", pady=2)
-        self.allowed_text.insert("1.0", "\n".join(str(x) for x in (self.telegram_raw.get("allowed_chat_ids") or [])))
+        self.allowed_text.insert("0.0", "\n".join(str(x) for x in (self.telegram_raw.get("allowed_chat_ids") or [])))
         row += 1
 
-        tk.Label(main, text="Owner Chat IDs", bg=BG, fg=TEXT_BRIGHT,
-                 font=("Segoe UI", 10, "bold"), anchor="w").grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ctk.CTkLabel(scroll, text="Owner Chat IDs", font=("Segoe UI", 10, "bold"),
+                     anchor="w").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
         row += 1
-        self.owner_text = tk.Text(main, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                                   height=3, relief="flat", bd=0,
-                                   highlightbackground=BORDER, highlightthickness=1)
+        self.owner_text = ctk.CTkTextbox(scroll, font=("Segoe UI", 10), height=50)
         self.owner_text.grid(row=row, column=0, columnspan=3, sticky="ew", pady=2)
-        self.owner_text.insert("1.0", "\n".join(str(x) for x in (self.telegram_raw.get("owner_chat_ids") or [])))
+        self.owner_text.insert("0.0", "\n".join(str(x) for x in (self.telegram_raw.get("owner_chat_ids") or [])))
         row += 1
 
-        tk.Label(main, text="Admin Chat IDs", bg=BG, fg=TEXT_BRIGHT,
-                 font=("Segoe UI", 10, "bold"), anchor="w").grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ctk.CTkLabel(scroll, text="Admin Chat IDs", font=("Segoe UI", 10, "bold"),
+                     anchor="w").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
         row += 1
-        self.admin_text = tk.Text(main, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                                   height=3, relief="flat", bd=0,
-                                   highlightbackground=BORDER, highlightthickness=1)
+        self.admin_text = ctk.CTkTextbox(scroll, font=("Segoe UI", 10), height=50)
         self.admin_text.grid(row=row, column=0, columnspan=3, sticky="ew", pady=2)
-        self.admin_text.insert("1.0", "\n".join(str(x) for x in (self.telegram_raw.get("admin_chat_ids") or [])))
+        self.admin_text.insert("0.0", "\n".join(str(x) for x in (self.telegram_raw.get("admin_chat_ids") or [])))
         row += 1
 
-        tk.Label(main, text="To get your chat ID, send /myid to the bot in Telegram.",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 9)).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=2)
+        ctk.CTkLabel(scroll, text="To get your chat ID, send /myid to the bot in Telegram.",
+                     font=("Segoe UI", 9), text_color=("#888888", "#888888")).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=4)
         row += 1
 
-        self.core_edit_var = tk.BooleanVar(value=bool(self.telegram_raw.get("core_editing_enabled", False)))
-        tk.Checkbutton(main, text="Core editing enabled", variable=self.core_edit_var,
-                       bg=BG, fg=TEXT, selectcolor=SURFACE2, activebackground=BG).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=2)
+        self.core_edit_var = ctk.BooleanVar(value=bool(self.telegram_raw.get("core_editing_enabled", False)))
+        ctk.CTkCheckBox(scroll, text="Core editing enabled", variable=self.core_edit_var,
+                        font=("Segoe UI", 10)).grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
         row += 1
 
-        btn_row = tk.Frame(main, bg=BG)
-        btn_row.grid(row=row, column=0, columnspan=3, pady=(12, 0))
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left", padx=(0, 8))
-        tk.Button(btn_row, text="Cancel", command=self.dialog.destroy,
-                  bg=BG_ALT, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left")
+        scroll.columnconfigure(0, weight=1)
 
-        main.columnconfigure(0, weight=1)
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.dialog.destroy,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right")
 
     def _save(self) -> None:
         import yaml
         self.telegram_raw["allow_all_chats"] = bool(self.allow_all_var.get())
-        self.telegram_raw["allowed_chat_ids"] = [x.strip() for x in self.allowed_text.get("1.0", "end-1c").split("\n") if x.strip()]
-        self.telegram_raw["owner_chat_ids"] = [x.strip() for x in self.owner_text.get("1.0", "end-1c").split("\n") if x.strip()]
-        self.telegram_raw["admin_chat_ids"] = [x.strip() for x in self.admin_text.get("1.0", "end-1c").split("\n") if x.strip()]
+        self.telegram_raw["allowed_chat_ids"] = [x.strip() for x in self.allowed_text.get("0.0", "end-1c").split("\n") if x.strip()]
+        self.telegram_raw["owner_chat_ids"] = [x.strip() for x in self.owner_text.get("0.0", "end-1c").split("\n") if x.strip()]
+        self.telegram_raw["admin_chat_ids"] = [x.strip() for x in self.admin_text.get("0.0", "end-1c").split("\n") if x.strip()]
         self.telegram_raw["core_editing_enabled"] = bool(self.core_edit_var.get())
         self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
         if self.on_save:
@@ -967,14 +878,13 @@ _PERMISSION_LEVELS = ["everyone", "allowed", "admin", "owner"]
 
 
 class ToolsDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path, on_save=None) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path, on_save=None) -> None:
         self.config_path = config_path
         self.on_save = on_save
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Command & Tool Policy")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("660x560")
-        self.dialog.minsize(560, 480)
+        self.dialog.geometry("700x580")
+        self.dialog.minsize(580, 480)
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -989,86 +899,74 @@ class ToolsDialog:
         self.tool_policy_raw = self.telegram_raw.setdefault("tool_policy", {})
 
     def _build(self) -> None:
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
 
-        nb = ttk.Notebook(main)
-        nb.pack(fill="both", expand=True)
+        tabview = ctk.CTkTabview(main)
+        tabview.pack(fill="both", expand=True)
 
-        cmd_frame = tk.Frame(nb, bg=BG)
-        nb.add(cmd_frame, text="Commands")
-        self._build_commands(cmd_frame)
+        cmd_tab = tabview.add("Commands")
+        tool_tab = tabview.add("AI Tools")
 
-        tool_frame = tk.Frame(nb, bg=BG)
-        nb.add(tool_frame, text="AI Tools")
-        self._build_tools(tool_frame)
+        self._build_commands(cmd_tab)
+        self._build_tools(tool_tab)
 
-        btn_row = tk.Frame(main, bg=BG)
-        btn_row.pack(fill="x", pady=(8, 0))
-        tk.Button(btn_row, text="Save", command=self._save,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left", padx=(0, 8))
-        tk.Button(btn_row, text="Cancel", command=self.dialog.destroy,
-                  bg=BG_ALT, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left")
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.dialog.destroy,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right")
 
-    def _build_commands(self, parent: tk.Widget) -> None:
-        canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
-        scrollbar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=BG)
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+    def _build_commands(self, parent: ctk.CTkFrame) -> None:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
 
+        header_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        header_row.pack(fill="x", padx=4, pady=(4, 0))
         for i, h in enumerate(["Command", "Enabled", "Visible", "Permission"]):
-            tk.Label(scroll_frame, text=h, bg=BG, fg=TEXT_BRIGHT, font=("Segoe UI", 9, "bold")).grid(
-                row=0, column=i, padx=4, pady=2)
+            ctk.CTkLabel(header_row, text=h, font=("Segoe UI", 9, "bold"),
+                         anchor="w", width=90 if i == 0 else 60).pack(side="left", padx=4)
 
         self._cmd_widgets = {}
-        for idx, cmd in enumerate(_COMMAND_LIST, start=1):
+        for cmd in _COMMAND_LIST:
             policy = self.cmd_policy_raw.get(cmd, {})
             if not isinstance(policy, dict):
                 policy = {}
-            tk.Label(scroll_frame, text=f"/{cmd}", bg=BG, fg=TEXT, font=("Segoe UI", 9)).grid(
-                row=idx, column=0, sticky="w", padx=4, pady=1)
+            row = ctk.CTkFrame(scroll, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
 
-            en_var = tk.BooleanVar(value=bool(policy.get("enabled", True)))
-            tk.Checkbutton(scroll_frame, variable=en_var, bg=BG, selectcolor=SURFACE2).grid(
-                row=idx, column=1, padx=4, pady=1)
+            ctk.CTkLabel(row, text=f"/{cmd}", font=("Segoe UI", 9), anchor="w",
+                         width=90).pack(side="left", padx=4)
 
-            vis_var = tk.BooleanVar(value=bool(policy.get("visible", True)))
-            tk.Checkbutton(scroll_frame, variable=vis_var, bg=BG, selectcolor=SURFACE2).grid(
-                row=idx, column=2, padx=4, pady=1)
+            en_var = ctk.BooleanVar(value=bool(policy.get("enabled", True)))
+            ctk.CTkCheckBox(row, variable=en_var, text="", width=20).pack(side="left", padx=4)
 
-            perm_var = tk.StringVar(value=str(policy.get("permission", "everyone")))
-            ttk.Combobox(scroll_frame, textvariable=perm_var, values=_PERMISSION_LEVELS,
-                         state="readonly", width=12).grid(row=idx, column=3, padx=4, pady=1)
+            vis_var = ctk.BooleanVar(value=bool(policy.get("visible", True)))
+            ctk.CTkCheckBox(row, variable=vis_var, text="", width=20).pack(side="left", padx=4)
+
+            perm_var = ctk.StringVar(value=str(policy.get("permission", "everyone")))
+            ctk.CTkComboBox(row, variable=perm_var, values=_PERMISSION_LEVELS,
+                            state="readonly", font=("Segoe UI", 9), width=100).pack(side="left", padx=4)
 
             self._cmd_widgets[cmd] = (en_var, vis_var, perm_var)
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-    def _build_tools(self, parent: tk.Widget) -> None:
-        canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
-        scrollbar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=BG)
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+    def _build_tools(self, parent: ctk.CTkFrame) -> None:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
 
         from .config import ToolPolicy as Tp
         tp_default = Tp()
-        self._ai_auto_var = tk.StringVar(value=", ".join(self.tool_policy_raw.get("ai_auto_tools", tp_default.ai_auto_tools)))
-        self._cmd_tools_var = tk.StringVar(value=", ".join(self.tool_policy_raw.get("command_tools", tp_default.command_tools)))
-        self._blocked_var = tk.StringVar(value=", ".join(self.tool_policy_raw.get("blocked_tools", tp_default.blocked_tools)))
-        self._user_vis_var = tk.StringVar(value=", ".join(self.tool_policy_raw.get("user_visible_tools", tp_default.user_visible_tools)))
-        self._req_admin_var = tk.StringVar(value=", ".join(self.tool_policy_raw.get("require_admin_for", tp_default.require_admin_for)))
-        self._req_owner_var = tk.StringVar(value=", ".join(self.tool_policy_raw.get("require_owner_for", tp_default.require_owner_for)))
+        self._ai_auto_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("ai_auto_tools", tp_default.ai_auto_tools)))
+        self._cmd_tools_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("command_tools", tp_default.command_tools)))
+        self._blocked_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("blocked_tools", tp_default.blocked_tools)))
+        self._user_vis_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("user_visible_tools", tp_default.user_visible_tools)))
+        self._req_admin_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("require_admin_for", tp_default.require_admin_for)))
+        self._req_owner_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("require_owner_for", tp_default.require_owner_for)))
 
         sections = [
             ("AI Auto Tools", "Tools the AI can call automatically", self._ai_auto_var),
@@ -1078,19 +976,14 @@ class ToolsDialog:
             ("Require Admin", "These tools need admin role", self._req_admin_var),
             ("Require Owner", "These tools need owner role", self._req_owner_var),
         ]
-        for i, (title, sub, var) in enumerate(sections):
-            r = i * 2
-            tk.Label(scroll_frame, text=title, bg=BG, fg=TEXT_BRIGHT,
-                     font=("Segoe UI", 10, "bold"), anchor="w").grid(
-                row=r, column=0, sticky="w", pady=(8, 0))
-            tk.Label(scroll_frame, text=sub, bg=BG, fg=MUTED, font=("Segoe UI", 8), anchor="w").grid(
-                row=r + 1, column=0, sticky="w")
-            tk.Entry(scroll_frame, textvariable=var, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                      relief="flat", bd=0, highlightbackground=BORDER, highlightthickness=1).grid(
-                row=r + 1, column=0, sticky="ew", padx=(0, 8))
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        for title, sub, var in sections:
+            section = ctk.CTkFrame(scroll, fg_color="transparent")
+            section.pack(fill="x", pady=4)
+            ctk.CTkLabel(section, text=title, font=("Segoe UI", 10, "bold"),
+                         anchor="w").pack(anchor="w")
+            ctk.CTkLabel(section, text=sub, font=("Segoe UI", 8),
+                         text_color=("#888888", "#888888"), anchor="w").pack(anchor="w")
+            ctk.CTkEntry(section, textvariable=var, font=("Segoe UI", 9)).pack(fill="x", pady=(2, 0))
 
     def _save(self) -> None:
         import yaml
@@ -1115,13 +1008,12 @@ class ToolsDialog:
 
 
 class ForceMessageDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path) -> None:
         self.config_path = config_path
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Force Message")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("520x400")
-        self.dialog.minsize(460, 340)
+        self.dialog.geometry("540x420")
+        self.dialog.minsize(480, 360)
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -1134,8 +1026,8 @@ class ForceMessageDialog:
         self.telegram_raw = self.raw.setdefault("telegram", {})
 
     def _build(self) -> None:
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
 
         row = 0
         all_chats = list(set(
@@ -1146,48 +1038,44 @@ class ForceMessageDialog:
             ) if str(x).strip()
         ))
 
-        tk.Label(main, text="Target Chat ID", bg=BG, fg=TEXT, font=("Segoe UI", 9), anchor="w").grid(
+        ctk.CTkLabel(main, text="Target Chat ID", font=("Segoe UI", 10), anchor="w").grid(
             row=row, column=0, sticky="w", pady=2, padx=(0, 8))
-        self.chat_var = tk.StringVar(value=all_chats[0] if all_chats else "")
+        self.chat_var = ctk.StringVar(value=all_chats[0] if all_chats else "")
         if all_chats:
-            ttk.Combobox(main, textvariable=self.chat_var, values=all_chats, width=28).grid(
+            ctk.CTkComboBox(main, variable=self.chat_var, values=all_chats,
+                           font=("Segoe UI", 10), width=240).grid(
                 row=row, column=1, sticky="ew", pady=2)
         else:
-            tk.Entry(main, textvariable=self.chat_var, bg=SURFACE2, fg=TEXT,
-                     insertbackground=TEXT, relief="flat", bd=0,
-                     highlightbackground=BORDER, highlightthickness=1).grid(
+            ctk.CTkEntry(main, textvariable=self.chat_var, font=("Segoe UI", 10)).grid(
                 row=row, column=1, sticky="ew", pady=2)
         row += 1
 
-        tk.Label(main, text="Message", bg=BG, fg=TEXT, font=("Segoe UI", 9), anchor="w").grid(
+        ctk.CTkLabel(main, text="Message", font=("Segoe UI", 10), anchor="w").grid(
             row=row, column=0, sticky="w", pady=2, padx=(0, 8))
-        self.msg_text = tk.Text(main, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                                 height=6, relief="flat", bd=0,
-                                 highlightbackground=BORDER, highlightthickness=1)
+        self.msg_text = ctk.CTkTextbox(main, font=("Segoe UI", 10), height=120)
         self.msg_text.grid(row=row, column=1, sticky="ew", pady=2)
         row += 1
 
-        btn_row = tk.Frame(main, bg=BG)
-        btn_row.grid(row=row, column=0, columnspan=2, pady=(12, 0))
-        tk.Button(btn_row, text="Send", command=self._send,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=BUTTON_BOTTOM, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left", padx=(0, 8))
-        tk.Button(btn_row, text="Cancel", command=self.dialog.destroy,
-                  bg=BG_ALT, fg=MUTED, font=("Segoe UI", 10),
-                  relief="flat", bd=0, padx=16, pady=6,
-                  activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                  cursor="hand2").pack(side="left")
-
-        self.status_var = tk.StringVar(value="")
-        tk.Label(main, textvariable=self.status_var, bg=BG, fg=MUTED, font=("Segoe UI", 9)).grid(
-            row=row + 1, column=0, columnspan=2, pady=(4, 0))
         main.columnconfigure(1, weight=1)
+
+        self.status_var = ctk.StringVar(value="")
+        ctk.CTkLabel(main, textvariable=self.status_var, font=("Segoe UI", 9),
+                     text_color=("#888888", "#888888")).grid(
+            row=row, column=0, columnspan=2, pady=(4, 0))
+        row += 1
+
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
+        btn_row.grid(row=row, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        ctk.CTkButton(btn_row, text="Send", command=self._send,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.dialog.destroy,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right")
 
     def _send(self) -> None:
         chat_id = self.chat_var.get().strip()
-        text = self.msg_text.get("1.0", "end-1c").strip()
+        text = self.msg_text.get("0.0", "end-1c").strip()
         if not chat_id or not text:
             self.status_var.set("chat_id and message are required")
             return
@@ -1203,40 +1091,53 @@ class ForceMessageDialog:
 
 
 class LogsDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path, log_fetcher=None) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path, log_fetcher=None) -> None:
         self.config_path = config_path
         self.log_fetcher = log_fetcher or (lambda: follow_telegram_log(config_path))
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Telegram Bot Logs")
-        self.dialog.configure(bg=BG)
-        self.dialog.geometry("720x520")
-        self.dialog.minsize(560, 360)
+        self.dialog.geometry("740x540")
+        self.dialog.minsize(580, 380)
         self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self._filter = "all"
         self._build()
 
     def _build(self) -> None:
-        filter_row = tk.Frame(self.dialog, bg=BG)
-        filter_row.pack(fill="x", padx=12, pady=(8, 4))
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
+
+        filter_row = ctk.CTkFrame(main, fg_color="transparent")
+        filter_row.pack(fill="x", pady=(0, 8))
         for f in ["all", "errors", "access", "tools", "provider", "sends"]:
-            btn = tk.Button(filter_row, text=f, command=lambda lbl=f: self._set_filter(lbl),
-                            bg=BG_ALT, fg=MUTED, font=("Segoe UI", 9),
-                            relief="flat", bd=0, padx=8, pady=2,
-                            activebackground=SURFACE3, activeforeground=TEXT_BRIGHT,
-                            cursor="hand2")
+            btn = ctk.CTkButton(filter_row, text=f, command=lambda lbl=f: self._set_filter(lbl),
+                                font=("Segoe UI", 9), height=28,
+                                fg_color=("#e0e0e0", "#2a2a2a"),
+                                text_color=("#333333", "#cccccc"),
+                                hover_color=("#d0d0d0", "#3a3a3a"),
+                                corner_radius=4)
             btn.pack(side="left", padx=(0, 4))
 
-        self.text = tk.Text(self.dialog, bg=SURFACE2, fg=TEXT, insertbackground=TEXT,
-                             font=("Consolas", 9), relief="flat", bd=0,
-                             highlightbackground=BORDER, highlightthickness=1)
-        self.text.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-        self.text.config(state="disabled")
+        self.text = ctk.CTkTextbox(main, font=("Consolas", 10), wrap="none",
+                                   activate_scrollbars=True)
+        self.text.pack(fill="both", expand=True)
         self.text.bind("<MouseWheel>", lambda e: self.text.yview_scroll(-1 * (e.delta // 120), "units"))
-        self.text.tag_configure("error", foreground=RED)
-        self.text.tag_configure("warn", foreground=YELLOW)
-        self.text.tag_configure("info", foreground=GREEN)
-        self.text.tag_configure("muted", foreground=MUTED)
+
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(8, 0))
+        ctk.CTkButton(btn_row, text="Refresh", command=self._refresh,
+                      font=("Segoe UI", 10), width=80).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="Clear", command=self._clear,
+                      font=("Segoe UI", 10), width=80,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="Close", command=self._close,
+                      font=("Segoe UI", 10), width=80,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right", padx=4)
+
+        self.dialog.bind("<Escape>", lambda e: self._close())
+        self.dialog.protocol("WM_DELETE_WINDOW", self._close)
         self._refresh()
 
     def _set_filter(self, label: str) -> None:
@@ -1245,8 +1146,7 @@ class LogsDialog:
 
     def _refresh(self) -> None:
         lines = self.log_fetcher() if self.log_fetcher else []
-        self.text.config(state="normal")
-        self.text.delete("1.0", "end")
+        self.text.delete("0.0", "end")
         for line in lines:
             lower = line.lower()
             if self._filter != "all":
@@ -1260,18 +1160,14 @@ class LogsDialog:
                     continue
                 if self._filter == "sends" and "sent" not in lower:
                     continue
-            if "error" in lower or "exception" in lower or "traceback" in lower:
-                tag = "error"
-            elif "warn" in lower:
-                tag = "warn"
-            elif "info" in lower or "start" in lower or "running" in lower or "ready" in lower:
-                tag = "info"
-            else:
-                tag = "muted"
-            self.text.insert("end", line + "\n", tag)
-        self.text.config(state="disabled")
+            self.text.insert("end", line + "\n")
         self.text.see("end")
-        self.dialog.after(3000, self._refresh)
+
+    def _clear(self) -> None:
+        self.text.delete("0.0", "end")
+
+    def _close(self) -> None:
+        self.dialog.destroy()
 
 
 class _DetailItem:
@@ -1282,44 +1178,51 @@ class _DetailItem:
 
 
 class DetailsDialog:
-    def __init__(self, parent: tk.Widget, config_path: Path) -> None:
+    def __init__(self, parent: ctk.CTk, config_path: Path) -> None:
         self.config_path = config_path
-        self.dialog = tk.Toplevel(parent)
+        self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Telegram Bot Details")
-        self.dialog.geometry("760x520")
-        self.dialog.minsize(620, 420)
-        self.dialog.configure(bg=BG)
+        self.dialog.geometry("780x540")
+        self.dialog.minsize(640, 440)
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self.dialog.resizable(True, True)
 
-        main = tk.Frame(self.dialog, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=12)
+        import tkinter as tk
+        from tkinter import ttk
+
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
 
         self.items = self._build_items()
 
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Treeview",
-                        background=BG_ALT, foreground=TEXT,
-                        fieldbackground=BG_ALT,
-                        font=("Segoe UI", 9),
-                        rowheight=26,
-                        borderwidth=0)
-        style.configure("Treeview.Heading",
-                        background=SURFACE2, foreground=TEXT_BRIGHT,
-                        font=("Segoe UI", 9, "bold"),
-                        borderwidth=0)
-        style.map("Treeview",
-                  background=[("selected", SURFACE3)],
-                  foreground=[("selected", TEXT_BRIGHT)])
-        style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        dark_bg = "#1a1a1a"
+        dark_fg = "#e0e0e0"
+        sel_bg = "#2a2a2a"
+        heading_bg = "#222222"
+        heading_fg = "#fafafa"
+        style.configure("Telegram.Treeview",
+                        background=dark_bg, foreground=dark_fg,
+                        fieldbackground=dark_bg,
+                        font=("Segoe UI", 9), rowheight=28, borderwidth=0)
+        style.configure("Telegram.Treeview.Heading",
+                        background=heading_bg, foreground=heading_fg,
+                        font=("Segoe UI", 9, "bold"), borderwidth=0)
+        style.map("Telegram.Treeview",
+                  background=[("selected", sel_bg)],
+                  foreground=[("selected", dark_fg)])
+        style.layout("Telegram.Treeview", [("Telegram.Treeview.treearea", {"sticky": "nswe"})])
 
-        self.tree = ttk.Treeview(main, columns=("field", "value"), show="headings",
-                                  selectmode="browse")
+        tree_frame = ctk.CTkFrame(main, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(tree_frame, columns=("field", "value"), show="headings",
+                                 selectmode="browse", style="Telegram.Treeview")
         self.tree.heading("field", text="Field", anchor="w")
         self.tree.heading("value", text="Value", anchor="w")
-        self.tree.column("field", width=180, minwidth=140, stretch=False)
+        self.tree.column("field", width=200, minwidth=140, stretch=False)
         self.tree.column("value", width=500, minwidth=300, stretch=True)
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<MouseWheel>", self._on_tree_mousewheel)
@@ -1327,27 +1230,20 @@ class DetailsDialog:
         self.tree.bind("<Button-3>", self._on_right_click)
 
         for idx, item in enumerate(self.items):
-            self.tree.insert("", "end", iid=str(idx),
-                             values=(item.label, item.display_value))
+            self.tree.insert("", "end", iid=str(idx), values=(item.label, item.display_value))
 
         self._selected_idx: str | None = None
 
-        btn_row = tk.Frame(self.dialog, bg=BG)
-        btn_row.pack(fill="x", padx=16, pady=(8, 10))
-
-        tk.Button(btn_row, text="Copy Selected Value", command=self._copy_selected,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 9, "bold"),
-                  relief="flat", padx=12, pady=4, activebackground=BUTTON_BOTTOM,
-                  cursor="hand2").pack(side="left", padx=(0, 6))
-        tk.Button(btn_row, text="Copy All Details", command=self._copy_all,
-                  bg=BUTTON_TOP, fg=TEXT_BRIGHT, font=("Segoe UI", 9, "bold"),
-                  relief="flat", padx=12, pady=4, activebackground=BUTTON_BOTTOM,
-                  cursor="hand2").pack(side="left", padx=(0, 6))
-        tk.Button(btn_row, text="Close", command=self.dialog.destroy,
-                  bg=SURFACE2, fg=MUTED, font=("Segoe UI", 9),
-                  relief="flat", padx=16, pady=4, activebackground=SURFACE3,
-                  cursor="hand2").pack(side="right", padx=4)
-
+        btn_row = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkButton(btn_row, text="Copy Selected Value", command=self._copy_selected,
+                      font=("Segoe UI", 9), height=30).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Copy All Details", command=self._copy_all,
+                      font=("Segoe UI", 9), height=30).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Close", command=self.dialog.destroy,
+                      font=("Segoe UI", 9), height=30,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right", padx=4)
         self.dialog.bind("<Escape>", lambda e: self.dialog.destroy())
         self.dialog.bind("<Control-c>", lambda e: self._copy_selected())
 
@@ -1405,14 +1301,12 @@ class DetailsDialog:
         items.append(_DetailItem("Core editing", str(telegram_raw.get("core_editing_enabled", False)),
                                  str(telegram_raw.get("core_editing_enabled", False))))
 
-        # Runtime status
         items.append(_DetailItem("Runtime running", str(status_info.get("running", False)),
                                  str(status_info.get("running", False))))
         pid = status_info.get("pid")
         items.append(_DetailItem("Runtime PID", str(pid) if pid else "none",
                                  str(pid) if pid else "none"))
 
-        # Available tools
         tp = telegram_raw.get("tool_policy", {})
         ai_auto = tp.get("ai_auto_tools", [])
         cmd_tools = tp.get("command_tools", [])

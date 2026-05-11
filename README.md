@@ -764,3 +764,60 @@ anthropic_models:
     provider: nvidia_nim
     model: meta/llama-3.1-70b-instruct
 ```
+```
+A:\llama/
+├── .git/
+├── .gitignore
+├── Api.json                          # Claude Code settings file
+├── LICENSE
+├── README.md
+├── env.yml                           # Main config (providers, models, tools, telegram)
+├── pyproject.toml                    # Package metadata & dependencies
+│
+├── assets/
+│   └── llama_bridge.ico              # Application icon
+│
+├── llama_bridge/                     # Main Python package
+│   ├── __init__.py                   # Version = "0.1.0"
+│   ├── __main__.py                   # Entry: calls cli.main()
+│   ├── anthropic.py                  # Anthropic-compatible endpoint logic
+│   ├── cli.py                        # Main CLI (7137 lines) - dispatches to all GUIs
+│   ├── config.py                     # Config loading, defaults, path resolution
+│   ├── llama_claw.py                 # OpenClaw/Ollama integration
+│   ├── llama_gui.py                  # ★ LLAMA CONTROL CENTER GUI (1078 lines)
+│   ├── master.py                     # Master reviewer logic
+│   ├── mcp_tools.py                  # MCP tools bridge
+│   ├── openwebui_config.py           # OpenWebUI configuration utilities
+│   ├── openwebui_gui.py              # ★ OPENWEBUI SETUP GUI (1400 lines)
+│   ├── openwebui_launcher.py         # OpenWebUI process management
+│   ├── providers.py                  # Provider abstraction layer
+│   ├── server.py                     # FastAPI server
+│   ├── telegram_launcher.py          # Telegram bot process management
+│   ├── telegram_setup_gui.py         # ★ TELEGRAM SETUP GUI (1267 lines)
+│   ├── teligram.py                   # Telegram bot runtime
+│   ├── tool_management.py            # CLI tool management
+│   ├── tools.py                      # Tool registry and built-in tools
+│   │
+│   ├── bot_docs/                     # Telegram bot personality docs
+│   │   ├── .backups/
+│   │   ├── AGENTS.md
+│   │   ├── EVOLUTION.md
+│   │   ├── HEARTBEAT.md
+│   │   ├── IDENTITY.md
+│   │   ├── MEMORY.md
+│   │   ├── SOUL.md
+│   │   ├── TOOLS.md
+│   │   ├── USER.md
+│   │   └── skills/
+│   │
+│   └── __pycache__/
+│
+├── plugins/
+│   └── llama_bridge_tools_claude/    # Claude Code plugin
+│
+├── scripts/
+│   ├── build_setup_exe.ps1           # Builds Windows installer via PyInstaller
+│   └── llama_setup.py               # Llama installation/setup script (461 lines)
+│
+└── llama_bridge.egg-info/            # (should exist but not found during scan)
+```
