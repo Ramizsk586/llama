@@ -1,11 +1,9 @@
 ﻿from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
 import threading
-import time
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any
@@ -23,23 +21,29 @@ except ImportError:
                 raise RuntimeError("customtkinter not available")
     ctk = _FakeCTk()
 
-GREEN = "#4FD1A1"
-RED = "#FF6B6B"
-YELLOW = "#F2C66D"
-ACCENT = "#5BA4F5"
-DARK_BG = "#0D1117"
-SIDEBAR_BG = "#161B22"
-CARD_OK_BG = "#0f2820"
-CARD_ERR_BG = "#281414"
+GREEN = "#34D399"
+RED = "#FB7185"
+YELLOW = "#FBBF24"
+ACCENT = "#60A5FA"
+DARK_BG = "#0A0F16"
+SIDEBAR_BG = "#101720"
+PANEL_BG = "#121B26"
+PANEL_BG_SOFT = "#162231"
+BORDER = "#263241"
+MUTED = "#8B949E"
+TEXT = "#E6EDF3"
+CARD_OK_BG = "#0E2B22"
+CARD_ERR_BG = "#2A1519"
 
 LAYOUT = {
-    "PAD": 20,
-    "HEADER_H": 80,
-    "CARD_H": 68,
-    "CARD_GAP": 8,
+    "PAD": 24,
+    "HEADER_H": 86,
+    "CARD_H": 96,
+    "CARD_GAP": 14,
     "BTN_H": 36,
-    "WIN_W": 640,
-    "WIN_H": 420,
+    "WIN_W": 880,
+    "WIN_H": 560,
+    "SIDEBAR_W": 232,
 }
 PAD = LAYOUT["PAD"]
 
@@ -143,7 +147,7 @@ class LlamaControlCenter:
         self.root = ctk.CTk()
         self.root.title("Llama Bridge - Control Center")
         _center_window(self.root, W, H)
-        self.root.minsize(520, 380)
+        self.root.minsize(760, 500)
         self.root.resizable(True, True)
 
         self.status = AppStatus.READY
@@ -170,17 +174,21 @@ class LlamaControlCenter:
 
         self.root.configure(fg_color=DARK_BG)
 
-        sidebar = ctk.CTkFrame(self.root, width=200, fg_color=SIDEBAR_BG, corner_radius=0)
+        sidebar = ctk.CTkFrame(self.root, width=LAYOUT["SIDEBAR_W"], fg_color=SIDEBAR_BG, corner_radius=0)
         sidebar.pack(side="left", fill="y", padx=0, pady=0)
         sidebar.pack_propagate(False)
 
         ctk.CTkLabel(sidebar, text="Llama Bridge",
-                     font=("Segoe UI", 14, "bold"), anchor="w",
-                     fg_color=SIDEBAR_BG, text_color="#e6edf3").pack(
-            fill="x", padx=16, pady=(20, 8))
+                     font=("Segoe UI", 18, "bold"), anchor="w",
+                     fg_color=SIDEBAR_BG, text_color=TEXT).pack(
+            fill="x", padx=20, pady=(26, 0))
+        ctk.CTkLabel(sidebar, text="Control Center",
+                     font=("Segoe UI", 10), anchor="w",
+                     fg_color=SIDEBAR_BG, text_color=MUTED).pack(
+            fill="x", padx=20, pady=(2, 16))
 
-        sep = ctk.CTkFrame(sidebar, fg_color="#30363d", height=1)
-        sep.pack(fill="x", padx=12, pady=(0, 12))
+        sep = ctk.CTkFrame(sidebar, fg_color=BORDER, height=1)
+        sep.pack(fill="x", padx=16, pady=(0, 14))
 
         self._sidebar_buttons: dict[str, ctk.CTkButton] = {}
         nav_items = [
@@ -196,12 +204,12 @@ class LlamaControlCenter:
         for key, label, cmd in nav_items:
             btn = ctk.CTkButton(
                 sidebar, text=label, command=cmd,
-                font=("Segoe UI", 11), height=36,
-                fg_color="transparent", text_color="#c9d1d9",
-                hover_color="#21262d", corner_radius=6,
+                font=("Segoe UI", 11), height=38,
+                fg_color="transparent", text_color="#CBD5E1",
+                hover_color="#1C2734", corner_radius=8,
                 anchor="w",
             )
-            btn.pack(fill="x", padx=8, pady=1)
+            btn.pack(fill="x", padx=12, pady=2)
             self._sidebar_buttons[key] = btn
 
         self._active_nav = "dashboard"
@@ -209,11 +217,14 @@ class LlamaControlCenter:
         main = ctk.CTkFrame(self.root, fg_color="transparent")
         main.pack(side="left", fill="both", expand=True)
 
-        sep = ctk.CTkFrame(main, fg_color=GREEN, height=2, corner_radius=0)
-        sep.pack(fill="x", padx=PAD, pady=(4, 0))
+        self._build_header(main)
 
         self.cards_area = ctk.CTkFrame(main, fg_color="transparent")
-        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(PAD // 2, 0))
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(18, 0))
+
+        self.dashboard_body = ctk.CTkFrame(main, fg_color="transparent")
+        self.dashboard_body.pack(fill="both", expand=True, padx=PAD, pady=(10, PAD))
+        self._build_dashboard_body()
 
         self._content_area = ctk.CTkScrollableFrame(main, fg_color="transparent")
         self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(PAD // 2, 0))
@@ -224,37 +235,51 @@ class LlamaControlCenter:
         self._footer_frame.pack_forget()
 
         self._cards_area_visible = True
-        self._build_header(main)
         self._show_dashboard()
 
     def _set_active_nav(self, key: str) -> None:
         for k, btn in self._sidebar_buttons.items():
             if k == key:
-                btn.configure(fg_color="#238636", text_color="#ffffff")
+                btn.configure(fg_color="#238636", text_color="#ffffff", hover_color="#2EA043")
             else:
-                btn.configure(fg_color="transparent", text_color="#c9d1d9")
+                btn.configure(fg_color="transparent", text_color="#CBD5E1", hover_color="#1C2734")
 
     def _show_dashboard(self) -> None:
         self._current_view = "home"
         self._nav_stack.clear()
         self._cards_area_visible = True
-        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(PAD // 2, 0))
+        self._header_row.pack_configure(padx=PAD, pady=(PAD, 0))
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(18, 0))
+        self.dashboard_body.pack(fill="both", expand=True, padx=PAD, pady=(10, PAD))
         self._content_area.pack_forget()
         self._footer_frame.pack_forget()
         self._set_active_nav("dashboard")
         self.subtitle_label.configure(text=self._subtitle_text())
+        self._update_dashboard_summary()
 
     def _show_panel(self, panel: str) -> None:
         self._current_view = panel
         self._cards_area_visible = False
+        self._header_row.pack_configure(padx=PAD, pady=(18, 0))
         self.cards_area.pack_forget()
-        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(PAD // 2, 0))
+        self.dashboard_body.pack_forget()
+        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(8, PAD))
         for w in self._content_area.winfo_children():
             w.destroy()
         self._footer_frame.pack_forget()
 
+        panel_titles = {
+            "server": "Server Settings",
+            "providers": "Providers",
+            "cli_tools": "CLI Tools",
+            "models": "Anthropic Model Aliases",
+            "logs": "Server Logs",
+            "details": "Server Details",
+            "api_spec": "OpenAPI Specification",
+        }
+        self.subtitle_label.configure(text=panel_titles.get(panel, self._subtitle_text()))
+
         if panel == "logs":
-            self.subtitle_label.configure(text="Server Logs")
             from llama_bridge.telegram_launcher import follow_telegram_log
             log_lines = follow_telegram_log(self.config_path)
             text = ctk.CTkTextbox(self._content_area, font=("Consolas", 10), wrap="none")
@@ -263,7 +288,6 @@ class LlamaControlCenter:
                 text.insert("end", line + "\n")
             text.see("end")
         elif panel == "details":
-            self.subtitle_label.configure(text="Server Details")
             from llama_bridge.telegram_launcher import follow_telegram_log
             text = ctk.CTkTextbox(self._content_area, font=("Segoe UI", 10), wrap="word")
             text.pack(fill="both", expand=True)
@@ -271,7 +295,6 @@ class LlamaControlCenter:
             for line in lines[-50:]:
                 text.insert("end", line + "\n")
         elif panel == "api_spec":
-            self.subtitle_label.configure(text="OpenAPI Specification")
             text = ctk.CTkTextbox(self._content_area, font=("Consolas", 10), wrap="none")
             text.pack(fill="both", expand=True)
             try:
@@ -352,9 +375,8 @@ class LlamaControlCenter:
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         self._prov_raw = raw.setdefault("providers", {})
 
-        scroll = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-        scroll._scrollbar.grid_remove()
+        form = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        form.pack(fill="both", expand=True)
 
         TYPE_OPTIONS = [
             "openai", "ollama_cloud", "ollama_local", "lm_studio",
@@ -364,8 +386,8 @@ class LlamaControlCenter:
 
         self._prov_vars: dict[str, dict[str, Any]] = {}
         for name, prov in sorted(self._prov_raw.items()):
-            card = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
-            card.pack(fill="x", pady=6, padx=4)
+            card = ctk.CTkFrame(form, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            card.pack(fill="x", pady=(0, 10), padx=4)
             ctk.CTkLabel(card, text=name, font=("Segoe UI", 12, "bold"), anchor="w").pack(anchor="w", padx=12, pady=(8, 4))
             ctk.CTkFrame(card, fg_color="#333333", height=1).pack(fill="x", padx=12, pady=(0, 6))
 
@@ -415,9 +437,8 @@ class LlamaControlCenter:
         provider_names = list(raw.get("providers", {}).keys())
         self._cli_raw = raw
 
-        scroll = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-        scroll._scrollbar.grid_remove()
+        form = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        form.pack(fill="both", expand=True)
 
         tool_keys = [
             ("Pi", "pi", ["provider", "model"]),
@@ -430,8 +451,8 @@ class LlamaControlCenter:
         self._cli_vars: dict[str, dict[str, Any]] = {}
         for tool_name, section_key, fields in tool_keys:
             section = raw.get(section_key, {}) or {}
-            card = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
-            card.pack(fill="x", pady=6, padx=4)
+            card = ctk.CTkFrame(form, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            card.pack(fill="x", pady=(0, 10), padx=4)
             ctk.CTkLabel(card, text=tool_name, font=("Segoe UI", 12, "bold"), anchor="w").pack(anchor="w", padx=12, pady=(8, 4))
 
             entries = {}
@@ -479,16 +500,15 @@ class LlamaControlCenter:
         provider_names = list(raw.get("providers", {}).keys())
         self._models_raw = raw.setdefault("anthropic_models", {})
 
-        scroll = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-        scroll._scrollbar.grid_remove()
+        form = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        form.pack(fill="both", expand=True)
 
         self._models_vars: dict[str, tuple[ctk.StringVar, ctk.StringVar]] = {}
         for alias, value in sorted(self._models_raw.items()):
             if not isinstance(value, dict):
                 value = {}
-            row = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
-            row.pack(fill="x", pady=4, padx=4)
+            row = ctk.CTkFrame(form, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            row.pack(fill="x", pady=(0, 10), padx=4)
             ctk.CTkLabel(row, text=alias, font=("Segoe UI", 10, "bold"), width=90, anchor="w").pack(side="left", padx=(10, 4), pady=8)
             prov_var = ctk.StringVar(value=str(value.get("provider", provider_names[0] if provider_names else "")))
             ctk.CTkComboBox(row, variable=prov_var, values=provider_names, state="readonly", font=("Segoe UI", 9), width=150).pack(side="left", padx=(4, 6), pady=8)
@@ -496,7 +516,7 @@ class LlamaControlCenter:
             ctk.CTkEntry(row, textvariable=model_var, font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True, padx=4, pady=8)
             self._models_vars[alias] = (prov_var, model_var)
 
-        btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_row = ctk.CTkFrame(self._content_area, fg_color="transparent")
         btn_row.pack(fill="x", pady=(8, 0))
         ctk.CTkButton(btn_row, text="Save", command=self._save_models,
                       font=("Segoe UI", 10, "bold"), width=90).pack(side="right")
@@ -546,6 +566,130 @@ class LlamaControlCenter:
         self._set_active_nav("api_spec")
         self._show_panel("api_spec")
 
+    def _build_dashboard_body(self) -> None:
+        self.dashboard_body.columnconfigure(0, weight=3, uniform="dash")
+        self.dashboard_body.columnconfigure(1, weight=2, uniform="dash")
+
+        actions = ctk.CTkFrame(
+            self.dashboard_body,
+            fg_color=PANEL_BG,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+        )
+        actions.grid(row=0, column=0, sticky="nsew", padx=(0, 7), pady=0)
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            actions,
+            text="Quick Actions",
+            font=("Segoe UI", 12, "bold"),
+            text_color=TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 8))
+
+        action_buttons = [
+            ("Server", self._show_server),
+            ("Providers", self._show_providers),
+            ("CLI Tools", self._show_cli_tools),
+            ("Models", self._show_models),
+            ("Logs", self._show_logs),
+            ("API Spec", self._show_api_spec),
+        ]
+        for idx, (label, command) in enumerate(action_buttons):
+            btn = ctk.CTkButton(
+                actions,
+                text=label,
+                command=command,
+                height=34,
+                font=("Segoe UI", 10, "bold"),
+                fg_color=PANEL_BG_SOFT,
+                text_color=TEXT,
+                hover_color="#203046",
+                corner_radius=7,
+            )
+            btn.grid(row=1 + idx // 2, column=idx % 2, sticky="ew",
+                     padx=(16 if idx % 2 == 0 else 6, 16 if idx % 2 == 1 else 6),
+                     pady=5)
+
+        snapshot = ctk.CTkFrame(
+            self.dashboard_body,
+            fg_color=PANEL_BG,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+        )
+        snapshot.grid(row=0, column=1, sticky="nsew", padx=(7, 0), pady=0)
+        snapshot.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            snapshot,
+            text="Bridge Snapshot",
+            font=("Segoe UI", 12, "bold"),
+            text_color=TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 8))
+
+        self.dashboard_summary_labels: dict[str, ctk.CTkLabel] = {}
+        for row, (key, label) in enumerate([
+            ("endpoint", "Endpoint"),
+            ("providers", "Providers"),
+            ("tools", "CLI tools"),
+            ("models", "Model aliases"),
+        ], start=1):
+            ctk.CTkLabel(
+                snapshot,
+                text=label,
+                font=("Segoe UI", 10),
+                text_color=MUTED,
+                anchor="w",
+            ).grid(row=row, column=0, sticky="w", padx=(16, 10), pady=4)
+
+            value = ctk.CTkLabel(
+                snapshot,
+                text="-",
+                font=("Segoe UI", 10, "bold"),
+                text_color=TEXT,
+                anchor="e",
+            )
+            value.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=4)
+            self.dashboard_summary_labels[key] = value
+
+    def _update_dashboard_summary(self) -> None:
+        labels = getattr(self, "dashboard_summary_labels", None)
+        if not labels:
+            return
+
+        cfg = self._config
+        if not cfg:
+            values = {
+                "endpoint": "config unavailable",
+                "providers": "-",
+                "tools": "-",
+                "models": "-",
+            }
+        else:
+            server = cfg.server
+            providers_total = len(cfg.providers)
+            providers_ready = sum(
+                1 for provider in cfg.providers.values()
+                if provider.api_key and not provider.api_key.startswith("${")
+            )
+            tools_ready = sum(
+                1 for tool in [cfg.pi, cfg.codex, cfg.copilot_cli, cfg.opencode, cfg.openclaw, cfg.poolside]
+                if tool.provider and tool.provider in cfg.providers
+            )
+            values = {
+                "endpoint": f"{server.host}:{server.port}",
+                "providers": f"{providers_ready}/{providers_total} ready" if providers_total else "none",
+                "tools": f"{tools_ready} configured",
+                "models": f"{len(cfg.anthropic_models)} aliases",
+            }
+
+        for key, value in values.items():
+            labels[key].configure(text=value)
+
     def _build_header(self, parent: ctk.CTkFrame) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
         header.pack(fill="x", padx=PAD, pady=(PAD, 0))
@@ -560,15 +704,31 @@ class LlamaControlCenter:
         title_frame.grid(row=0, column=0, sticky="w")
 
         ctk.CTkLabel(title_frame, text="Llama Bridge Control Center",
-                     font=("Segoe UI", 18, "bold"), anchor="w").pack(anchor="w")
+                     font=("Segoe UI", 22, "bold"), anchor="w",
+                     text_color=TEXT).pack(anchor="w")
         self.subtitle_label = ctk.CTkLabel(title_frame, text="",
                                            font=("Segoe UI", 10),
-                                           text_color=("#888888", "#888888"), anchor="w")
+                                           text_color=MUTED, anchor="w")
         self.subtitle_label.pack(anchor="w", pady=(2, 0))
 
+        self.refresh_btn = ctk.CTkButton(
+            header,
+            text="Refresh",
+            command=self._refresh_all,
+            width=82,
+            height=32,
+            font=("Segoe UI", 10, "bold"),
+            fg_color=PANEL_BG_SOFT,
+            text_color=TEXT,
+            hover_color="#203046",
+            corner_radius=7,
+        )
+        self.refresh_btn.grid(row=0, column=1, sticky="ne", padx=(12, 10), pady=(4, 0))
+
         self.badge = ctk.CTkLabel(header, text="  READY  ",
-                                  font=("Segoe UI", 9, "bold"), corner_radius=4)
-        self.badge.grid(row=0, column=1, sticky="ne", pady=(4, 0))
+                                  font=("Segoe UI", 9, "bold"), corner_radius=7,
+                                  width=76, height=32)
+        self.badge.grid(row=0, column=2, sticky="ne", pady=(4, 0))
 
         self._update_header()
 
@@ -639,40 +799,71 @@ class LlamaControlCenter:
         if parent is None:
             parent = self.cards_area
         ok = card_data["ok"]
-        card_bg = "#0f2820" if ok else "#281414"
+        card_bg = CARD_OK_BG if ok else CARD_ERR_BG
         accent_color = GREEN if ok else RED
-        icon_text = "\u2713" if ok else "\u2717"
+        status_bg = "#123B2F" if ok else "#3B1C22"
 
-        card = ctk.CTkFrame(parent, fg_color=card_bg, corner_radius=8, height=LAYOUT["CARD_H"])
+        card = ctk.CTkFrame(
+            parent,
+            fg_color=card_bg,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+            height=LAYOUT["CARD_H"],
+        )
         card.grid_propagate(False)
 
         card.columnconfigure(0, weight=0)
-        card.columnconfigure(1, weight=0)
-        card.columnconfigure(2, weight=1)
+        card.columnconfigure(1, weight=1)
+        card.columnconfigure(2, weight=0)
         card.columnconfigure(3, weight=0)
+        card.rowconfigure(0, weight=1)
+        card.rowconfigure(1, weight=1)
 
         accent = ctk.CTkFrame(card, fg_color=accent_color, width=5, corner_radius=0)
-        accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 10))
-
-        ctk.CTkLabel(card, text=icon_text,
-                     font=("Segoe UI", 14, "bold"),
-                     text_color=accent_color).grid(row=0, column=1, rowspan=2, padx=(0, 6))
+        accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 14))
 
         ctk.CTkLabel(card, text=card_data["title"],
-                     font=("Segoe UI", 10, "bold"), anchor="w").grid(
-            row=0, column=2, sticky="w", pady=(6, 0))
+                     font=("Segoe UI", 13, "bold"), text_color=TEXT,
+                     anchor="w").grid(
+            row=0, column=1, sticky="sw", pady=(14, 0))
 
         ctk.CTkLabel(card, text=card_data.get("subtitle", ""),
-                     font=("Segoe UI", 9),
-                     text_color=("#888888", "#888888"), anchor="w").grid(
-            row=1, column=2, sticky="w", pady=(0, 6))
+                     font=("Segoe UI", 10),
+                     text_color="#A7B0BC", anchor="w").grid(
+            row=1, column=1, sticky="nw", pady=(2, 14))
 
         ctk.CTkLabel(card, text=card_data.get("status", ""),
                      font=("Segoe UI", 9, "bold"),
-                     text_color=accent_color).grid(
-            row=0, column=3, rowspan=2, sticky="e", padx=(0, 16))
+                     fg_color=status_bg,
+                     text_color=accent_color,
+                     corner_radius=7,
+                     width=70,
+                     height=28).grid(
+            row=0, column=2, rowspan=2, sticky="e", padx=(12, 16))
+
+        command = self._card_command(card_data["key"])
+        if command:
+            self._bind_clickable_card(card, command)
 
         return card
+
+    def _card_command(self, key: str):
+        return {
+            "server": self._show_server,
+            "providers": self._show_providers,
+            "cli_tools": self._show_cli_tools,
+            "models": self._show_models,
+        }.get(key)
+
+    def _bind_clickable_card(self, widget: Any, command) -> None:
+        try:
+            widget.configure(cursor="hand2")
+        except Exception:
+            pass
+        widget.bind("<Button-1>", lambda _event: command(), add=True)
+        for child in widget.winfo_children():
+            self._bind_clickable_card(child, command)
 
     def _rebuild_cards(self) -> None:
         for w in self._card_widgets:
@@ -780,6 +971,7 @@ class LlamaControlCenter:
         self._update_card_data()
         self._update_header()
         self._rebuild_cards()
+        self._update_dashboard_summary()
 
     def _on_close(self) -> None:
         self._stopped.set()
@@ -795,13 +987,9 @@ class LlamaControlCenter:
         self.root.mainloop()
 
     def _go_home(self) -> None:
-        self._current_view = "home"
-        self._nav_stack.clear()
-        self._back_btn.pack_forget()
-        self._footer_frame.pack(fill="x", side="bottom", pady=(6, 12), padx=PAD)
-        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(PAD // 2, 0))
-        self._content_area.pack_forget()
-        self._set_active_nav("dashboard")
+        if hasattr(self, "_back_btn"):
+            self._back_btn.pack_forget()
+        self._show_dashboard()
 
     def _show_logs(self) -> None:
         self._nav_stack.append("logs")
@@ -820,6 +1008,7 @@ class LlamaControlCenter:
 
     def _on_config_saved(self) -> None:
         self._refresh_all()
+        self._show_dashboard()
 
     def _open_logs(self) -> None:
         self._nav_stack.append("logs")
@@ -1350,7 +1539,6 @@ class DetailsDialog:
         self.dialog.grab_set()
         self.dialog.resizable(True, True)
 
-        import tkinter as tk
         from tkinter import ttk
 
         main = ctk.CTkFrame(self.dialog, fg_color="transparent")
@@ -1587,7 +1775,6 @@ class ApiSpecDialog:
 
     def _export_file(self) -> None:
         import json
-        import tkinter as tk
         from tkinter import filedialog
 
         file_path = filedialog.asksaveasfilename(

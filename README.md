@@ -670,7 +670,6 @@ Point Claude Code at the bridge:
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8089",
     "ANTHROPIC_AUTH_TOKEN": "change-me",
-    "ANTHROPIC_SMALL_FAST_MODEL": "haiku",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus"
@@ -700,7 +699,7 @@ Provider notes:
 - Set `supports_tools: false` only for chat-only models; Claude Code works best with a model/provider that supports OpenAI-compatible tool calls
 - Add `extra_body` under a provider when a server needs fixed request options, such as `reasoning_effort`, `num_ctx`, or vendor-specific flags
 
-Claude Code should normally keep using `haiku`, `sonnet`, `opus`, and `small_fast`. To use a different provider, point one of those aliases at that provider:
+Claude Code should normally keep using `haiku`, `sonnet`, and `opus`. To use a different provider, point one of those aliases at that provider:
 
 ```yaml
 anthropic_models:
@@ -719,9 +718,6 @@ anthropic_models:
   opus:
     provider: openrouter
     model: openrouter/auto
-  small_fast:
-    provider: deepseek
-    model: deepseek-v4-flash
 ```
 
 LM Studio example:

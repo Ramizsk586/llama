@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -33,11 +32,7 @@ from .openwebui_launcher import (
     start_bridge,
     start_openwebui,
     stop_openwebui,
-    restart_openwebui,
     follow_log,
-    status as launcher_status,
-    stop_all,
-    LLAMA_PID_PATH,
     OPENWEBUI_PID_PATH,
     LLAMA_LOG_PATH,
     OPENWEBUI_LOG_PATH,
@@ -54,19 +49,27 @@ except ImportError:
                 raise RuntimeError("customtkinter not available")
     ctk = _FakeCTk()
 
-import tkinter as tk
 from tkinter import ttk, messagebox
 
-GREEN = "#4FD1A1"
-RED = "#FF6B6B"
-YELLOW = "#F2C66D"
+GREEN = "#34D399"
+RED = "#FB7185"
+YELLOW = "#FBBF24"
+DARK_BG = "#0A0F16"
+PANEL_BG = "#121B26"
+PANEL_BG_SOFT = "#162231"
+BORDER = "#263241"
+MUTED = "#8B949E"
+TEXT = "#E6EDF3"
+CARD_OK_BG = "#0E2B22"
+CARD_ERR_BG = "#2A1519"
 
 LAYOUT = {
-    "PAD": 20,
-    "CARD_H": 68,
-    "CARD_GAP": 10,
-    "WIN_W": 640,
-    "WIN_H": 480,
+    "PAD": 24,
+    "CARD_H": 96,
+    "CARD_GAP": 14,
+    "WIN_W": 880,
+    "WIN_H": 560,
+    "SIDEBAR_W": 232,
 }
 PAD = LAYOUT["PAD"]
 
@@ -159,7 +162,7 @@ class OpenWebUISetupCenter:
         self.root = ctk.CTk()
         self.root.title("Llama Bridge - Open WebUI Setup")
         _center_window(self.root, W, H)
-        self.root.minsize(520, 400)
+        self.root.minsize(760, 500)
         self.root.resizable(True, True)
 
         self.phase = Phase.READY
@@ -186,24 +189,114 @@ class OpenWebUISetupCenter:
         self.root.after(200, self._poll_status)
 
     def _build_ui(self) -> None:
+        self.root.configure(fg_color=DARK_BG)
+
+        sidebar = ctk.CTkFrame(self.root, width=LAYOUT["SIDEBAR_W"], fg_color="#101720", corner_radius=0)
+        sidebar.pack(side="left", fill="y", padx=0, pady=0)
+        sidebar.pack_propagate(False)
+
+        ctk.CTkLabel(sidebar, text="Open WebUI",
+                     font=("Segoe UI", 18, "bold"), anchor="w",
+                     fg_color="#101720", text_color=TEXT).pack(
+            fill="x", padx=20, pady=(26, 0))
+        ctk.CTkLabel(sidebar, text="Setup Center",
+                     font=("Segoe UI", 10), anchor="w",
+                     fg_color="#101720", text_color=MUTED).pack(
+            fill="x", padx=20, pady=(2, 16))
+
+        ctk.CTkFrame(sidebar, fg_color=BORDER, height=1).pack(fill="x", padx=16, pady=(0, 14))
+
+        self._sidebar_buttons: dict[str, ctk.CTkButton] = {}
+        nav_items = [
+            ("dashboard", "Dashboard", self._show_dashboard),
+            ("config", "Config", self._show_config),
+            ("search", "Web Search", self._show_search),
+            ("logs", "Logs", self._show_logs),
+            ("details", "Details", self._show_details),
+            ("guide", "Setup Guide", self._show_guide),
+            ("env", "Env Preview", self._show_env_preview),
+        ]
+        for key, label, cmd in nav_items:
+            btn = ctk.CTkButton(
+                sidebar, text=label, command=cmd,
+                font=("Segoe UI", 11), height=38,
+                fg_color="transparent", text_color="#CBD5E1",
+                hover_color="#1C2734", corner_radius=8,
+                anchor="w",
+            )
+            btn.pack(fill="x", padx=12, pady=2)
+            self._sidebar_buttons[key] = btn
+
         main = ctk.CTkFrame(self.root, fg_color="transparent")
-        main.pack(fill="both", expand=True)
+        main.pack(side="left", fill="both", expand=True)
 
         self._build_header(main)
 
-        sep = ctk.CTkFrame(main, fg_color=GREEN, height=2, corner_radius=0)
-        sep.pack(fill="x", padx=PAD, pady=(4, 0))
-
         self.status_label = ctk.CTkLabel(main, text="", font=("Segoe UI", 9),
-                                          text_color=("#888888", "#888888"), anchor="w")
-        self.status_label.pack(fill="x", padx=PAD, pady=(6, 4))
-
-        self._build_footer(main)
+                                          text_color=MUTED, anchor="w")
+        self.status_label.pack(fill="x", padx=PAD, pady=(8, 0))
 
         self.cards_area = ctk.CTkFrame(main, fg_color="transparent")
-        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(8, 0))
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(18, 0))
 
+        self.dashboard_body = ctk.CTkFrame(main, fg_color="transparent")
+        self.dashboard_body.pack(fill="both", expand=True, padx=PAD, pady=(10, PAD))
+        self._build_dashboard_body()
+
+        self._content_area = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(8, PAD))
+        self._content_area._scrollbar.grid_remove()
+        self._content_area.pack_forget()
+
+        self._current_view = "dashboard"
+        self._set_active_nav("dashboard")
         self._bind_shortcuts()
+
+    def _set_active_nav(self, key: str) -> None:
+        for name, btn in self._sidebar_buttons.items():
+            if name == key:
+                btn.configure(fg_color="#238636", text_color="#ffffff", hover_color="#2EA043")
+            else:
+                btn.configure(fg_color="transparent", text_color="#CBD5E1", hover_color="#1C2734")
+
+    def _show_dashboard(self) -> None:
+        self._current_view = "dashboard"
+        self._set_active_nav("dashboard")
+        self._header_row.pack_configure(padx=PAD, pady=(PAD, 0))
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(18, 0))
+        self.dashboard_body.pack(fill="both", expand=True, padx=PAD, pady=(10, PAD))
+        self._content_area.pack_forget()
+        self._update_dashboard_summary()
+
+    def _show_panel(self, key: str, title: str, builder: Any) -> None:
+        self._current_view = key
+        self._set_active_nav(key)
+        self._header_row.pack_configure(padx=PAD, pady=(18, 0))
+        self.cards_area.pack_forget()
+        self.dashboard_body.pack_forget()
+        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(8, PAD))
+        for child in self._content_area.winfo_children():
+            child.destroy()
+        self.subtitle_label.configure(text=title)
+        builder()
+
+    def _show_config(self) -> None:
+        self._show_panel("config", "Open WebUI Configuration", self._build_config_panel)
+
+    def _show_search(self) -> None:
+        self._show_panel("search", "Web Search Settings", self._build_search_panel)
+
+    def _show_logs(self) -> None:
+        self._show_panel("logs", "Open WebUI & Bridge Logs", self._build_logs_panel)
+
+    def _show_details(self) -> None:
+        self._show_panel("details", "Environment Details", self._build_details_panel)
+
+    def _show_guide(self) -> None:
+        self._show_panel("guide", "Setup Guide", self._build_guide_panel)
+
+    def _show_env_preview(self) -> None:
+        self._show_panel("env", "Environment Preview", self._build_env_preview_panel)
 
     def _build_header(self, parent: ctk.CTkFrame) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -211,19 +304,22 @@ class OpenWebUISetupCenter:
 
         header.columnconfigure(0, weight=1)
         header.columnconfigure(1, weight=0)
+        self._header_row = header
 
         title_frame = ctk.CTkFrame(header, fg_color="transparent")
         title_frame.grid(row=0, column=0, sticky="w")
 
-        ctk.CTkLabel(title_frame, text="OpenWebUI Setup Center",
-                     font=("Segoe UI", 18, "bold"), anchor="w").pack(anchor="w")
+        ctk.CTkLabel(title_frame, text="Open WebUI Setup Center",
+                     font=("Segoe UI", 22, "bold"), text_color=TEXT,
+                     anchor="w").pack(anchor="w")
         self.subtitle_label = ctk.CTkLabel(title_frame, text="",
                                            font=("Segoe UI", 10),
-                                           text_color=("#888888", "#888888"), anchor="w")
+                                           text_color=MUTED, anchor="w")
         self.subtitle_label.pack(anchor="w", pady=(2, 0))
 
         self.badge = ctk.CTkLabel(header, text="  READY  ",
-                                  font=("Segoe UI", 10, "bold"), corner_radius=6)
+                                  font=("Segoe UI", 10, "bold"), corner_radius=7,
+                                  width=86, height=32)
         self.badge.grid(row=0, column=1, sticky="ne", pady=(4, 0))
 
         self._update_header()
@@ -232,15 +328,409 @@ class OpenWebUISetupCenter:
         self.subtitle_label.configure(text=self._get_subtitle())
         badge_text, badge_color = self._get_badge_info()
         badge_bg = {
-            Phase.RUNNING: "#0a2a1a",
-            Phase.READY: "#0a2a1a",
-            Phase.INSTALL_PREREQS: "#2a2a0a",
-            Phase.SETUP_ENV: "#2a2a0a",
-            Phase.STARTING: "#2a2a0a",
-            Phase.ERROR: "#2a0a0a",
-        }.get(self.phase, "#0a2a1a")
+            Phase.RUNNING: "#123B2F",
+            Phase.READY: "#123B2F",
+            Phase.INSTALL_PREREQS: "#3B3218",
+            Phase.SETUP_ENV: "#3B3218",
+            Phase.STARTING: "#3B3218",
+            Phase.ERROR: "#3B1C22",
+        }.get(self.phase, "#123B2F")
         self.badge.configure(text=f"  {badge_text}  ",
                              fg_color=badge_bg, text_color=badge_color)
+
+    def _build_dashboard_body(self) -> None:
+        self.dashboard_body.columnconfigure(0, weight=3, uniform="dash")
+        self.dashboard_body.columnconfigure(1, weight=2, uniform="dash")
+
+        actions = ctk.CTkFrame(
+            self.dashboard_body,
+            fg_color=PANEL_BG,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+        )
+        actions.grid(row=0, column=0, sticky="nsew", padx=(0, 7), pady=0)
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(actions, text="Launch & Configure",
+                     font=("Segoe UI", 12, "bold"), text_color=TEXT,
+                     anchor="w").grid(row=0, column=0, columnspan=2, sticky="ew",
+                                      padx=16, pady=(14, 8))
+
+        action_buttons = [
+            ("Config", self._show_config),
+            ("Web Search", self._show_search),
+            ("Logs", self._show_logs),
+            ("Details", self._show_details),
+            ("Setup Guide", self._show_guide),
+            ("Env Preview", self._show_env_preview),
+        ]
+        for idx, (label, command) in enumerate(action_buttons):
+            btn = ctk.CTkButton(
+                actions,
+                text=label,
+                command=command,
+                height=34,
+                font=("Segoe UI", 10, "bold"),
+                fg_color=PANEL_BG_SOFT,
+                text_color=TEXT,
+                hover_color="#203046",
+                corner_radius=7,
+            )
+            btn.grid(row=1 + idx // 2, column=idx % 2, sticky="ew",
+                     padx=(16 if idx % 2 == 0 else 6, 16 if idx % 2 == 1 else 6),
+                     pady=5)
+
+        self.primary_btn = ctk.CTkButton(
+            actions, text="Start Server", command=self._primary_action,
+            font=("Segoe UI", 11, "bold"), height=40,
+            fg_color="#123B2F", text_color=GREEN,
+            hover_color="#174A3A", corner_radius=8,
+        )
+        self.primary_btn.grid(row=4, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 16))
+        ToolTip(self.primary_btn, "Start or stop the Open WebUI server")
+
+        snapshot = ctk.CTkFrame(
+            self.dashboard_body,
+            fg_color=PANEL_BG,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+        )
+        snapshot.grid(row=0, column=1, sticky="nsew", padx=(7, 0), pady=0)
+        snapshot.columnconfigure(1, weight=1)
+        ctk.CTkLabel(snapshot, text="Open WebUI Snapshot",
+                     font=("Segoe UI", 12, "bold"), text_color=TEXT,
+                     anchor="w").grid(row=0, column=0, columnspan=2, sticky="ew",
+                                      padx=16, pady=(14, 8))
+
+        self.dashboard_summary_labels: dict[str, ctk.CTkLabel] = {}
+        for row, (key, label) in enumerate([
+            ("url", "URL"),
+            ("ports", "Bridge ports"),
+            ("search", "Search"),
+            ("auth", "Auth"),
+        ], start=1):
+            ctk.CTkLabel(snapshot, text=label, font=("Segoe UI", 10),
+                         text_color=MUTED, anchor="w").grid(
+                row=row, column=0, sticky="w", padx=(16, 10), pady=4)
+            value = ctk.CTkLabel(snapshot, text="-", font=("Segoe UI", 10, "bold"),
+                                 text_color=TEXT, anchor="e")
+            value.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=4)
+            self.dashboard_summary_labels[key] = value
+
+    def _update_dashboard_summary(self) -> None:
+        labels = getattr(self, "dashboard_summary_labels", None)
+        if not labels:
+            return
+        if not self._owui:
+            values = {"url": "-", "ports": "-", "search": "-", "auth": "-"}
+        else:
+            ports = get_effective_ports(self._owui, self._config) if self._config else {}
+            values = {
+                "url": f"http://{self._owui.host}:{ports.get('openwebui', self._owui.port)}",
+                "ports": f"tools {ports.get('bridge_tools', '?')} / llm {ports.get('bridge_llm_only', '?')}",
+                "search": self._owui.web_search_provider if self._owui.web_search_enabled else "disabled",
+                "auth": "enabled" if self._owui.auth_enabled else "disabled",
+            }
+        for key, value in values.items():
+            labels[key].configure(text=value)
+
+    def _panel_card(self, parent: ctk.CTkFrame, title: str) -> ctk.CTkFrame:
+        card = ctk.CTkFrame(parent, fg_color=PANEL_BG, corner_radius=8,
+                            border_width=1, border_color=BORDER)
+        card.pack(fill="x", pady=(0, 12), padx=4)
+        ctk.CTkLabel(card, text=title, font=("Segoe UI", 12, "bold"),
+                     text_color=TEXT, anchor="w").pack(fill="x", padx=16, pady=(14, 8))
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill="x", padx=16, pady=(0, 16))
+        return body
+
+    def _build_config_panel(self) -> None:
+        ow = self._owui or OpenWebUIConfig()
+        form = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        form.pack(fill="both", expand=True)
+        form.columnconfigure(0, weight=1, uniform="cfg")
+        form.columnconfigure(1, weight=1, uniform="cfg")
+
+        left = ctk.CTkFrame(form, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right = ctk.CTkFrame(form, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        server = self._panel_card(left, "Server")
+        prefs = self._panel_card(right, "Discovery & Storage")
+
+        self._cfg_host = ctk.StringVar(value="LAN (0.0.0.0)" if ow.host == "0.0.0.0" else "Local (127.0.0.1)")
+        self._cfg_port = ctk.StringVar(value=str(ow.port))
+        self._cfg_tools_port = ctk.StringVar(value=str(ow.bridge_tools_port or ""))
+        self._cfg_llm_port = ctk.StringVar(value=str(ow.bridge_llm_only_port or ""))
+        self._cfg_auth = ctk.BooleanVar(value=ow.auth_enabled)
+        self._cfg_auto_login = ctk.BooleanVar(value=ow.auto_login)
+        self._cfg_data = ctk.StringVar(value=ow.openwebui_data_dir or "")
+        self._cfg_hf = ctk.StringVar(value=ow.hf_token or "")
+        self._cfg_url_mode = ctk.StringVar(value=ow.openai_base_url_mode or "llm_only")
+        self._cfg_env_name = ctk.StringVar(value=ow.preferred_env_name or "omx-open-webui")
+        self._cfg_python = ctk.StringVar(value=ow.preferred_python or "")
+        self._cfg_command = ctk.StringVar(value=ow.preferred_command or "")
+        self._cfg_discover = ctk.BooleanVar(value=ow.auto_discover)
+
+        def row(parent: ctk.CTkFrame, label: str, var: ctk.StringVar, width: int | None = None, secret: bool = False) -> None:
+            frame = ctk.CTkFrame(parent, fg_color="transparent")
+            frame.pack(fill="x", pady=5)
+            ctk.CTkLabel(frame, text=label, font=("Segoe UI", 10), text_color="#CBD5E1",
+                         width=138, anchor="w").pack(side="left")
+            entry_kwargs = {"textvariable": var, "font": ("Segoe UI", 10), "show": "*" if secret else ""}
+            if width is not None:
+                entry_kwargs["width"] = width
+            ctk.CTkEntry(frame, **entry_kwargs).pack(side="left", fill="x", expand=width is None)
+
+        host_row = ctk.CTkFrame(server, fg_color="transparent")
+        host_row.pack(fill="x", pady=5)
+        ctk.CTkLabel(host_row, text="Server Type", font=("Segoe UI", 10), text_color="#CBD5E1",
+                     width=138, anchor="w").pack(side="left")
+        ctk.CTkComboBox(host_row, variable=self._cfg_host,
+                        values=["Local (127.0.0.1)", "LAN (0.0.0.0)"],
+                        state="readonly", font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        row(server, "Open WebUI Port", self._cfg_port, 120)
+        row(server, "Bridge Tools Port", self._cfg_tools_port, 120)
+        row(server, "Bridge LLM Port", self._cfg_llm_port, 120)
+        ctk.CTkCheckBox(server, text="Auth enabled", variable=self._cfg_auth,
+                        font=("Segoe UI", 10), height=30).pack(anchor="w", pady=(8, 2))
+        ctk.CTkCheckBox(server, text="Auto login", variable=self._cfg_auto_login,
+                        font=("Segoe UI", 10), height=30).pack(anchor="w", pady=2)
+
+        row(prefs, "Data Dir", self._cfg_data)
+        row(prefs, "HF Token", self._cfg_hf, secret=True)
+        row(prefs, "OpenAI URL Mode", self._cfg_url_mode)
+        row(prefs, "Preferred Env", self._cfg_env_name)
+        row(prefs, "Preferred Python", self._cfg_python)
+        row(prefs, "Preferred Command", self._cfg_command)
+        ctk.CTkCheckBox(prefs, text="Auto discover installation", variable=self._cfg_discover,
+                        font=("Segoe UI", 10), height=30).pack(anchor="w", pady=(8, 2))
+
+        btn_row = ctk.CTkFrame(form, fg_color="transparent")
+        btn_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._save_config_panel,
+                      font=("Segoe UI", 10, "bold"), width=112, height=36).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=112, height=36,
+                      fg_color=("#555555", "#444444")).pack(side="right")
+
+    def _save_config_panel(self) -> None:
+        ow = self._owui or OpenWebUIConfig()
+        new_owui = OpenWebUIConfig(
+            enabled=ow.enabled,
+            host="0.0.0.0" if "LAN" in self._cfg_host.get() else "127.0.0.1",
+            port=int(self._cfg_port.get().strip() or "8080"),
+            bridge_tools_port=int(v) if (v := self._cfg_tools_port.get().strip()) else None,
+            bridge_llm_only_port=int(v) if (v := self._cfg_llm_port.get().strip()) else None,
+            auth_enabled=self._cfg_auth.get(),
+            auto_login=self._cfg_auto_login.get(),
+            web_search_enabled=ow.web_search_enabled,
+            web_search_provider=ow.web_search_provider,
+            web_search_providers=ow.web_search_providers,
+            search_result_count=ow.search_result_count,
+            concurrent_requests=max(1, ow.concurrent_requests),
+            bypass_embedding_and_retrieval=ow.bypass_embedding_and_retrieval,
+            bypass_web_loader=ow.bypass_web_loader,
+            hf_token=self._cfg_hf.get().strip() or None,
+            openai_base_url_mode=self._cfg_url_mode.get().strip() or "llm_only",
+            openwebui_data_dir=self._cfg_data.get().strip() or None,
+            extra_env=ow.extra_env,
+            preferred_env_name=self._cfg_env_name.get().strip() or "omx-open-webui",
+            preferred_python=self._cfg_python.get().strip() or None,
+            preferred_command=self._cfg_command.get().strip() or None,
+            auto_discover=self._cfg_discover.get(),
+        )
+        save_openwebui_config(new_owui, self.config_path)
+        self._on_config_saved()
+        self._show_dashboard()
+
+    def _build_search_panel(self) -> None:
+        from .config import ExternalToolProviderConfig
+        ow = self._owui or OpenWebUIConfig()
+        panel = self._panel_card(self._content_area, "Web Search")
+        self._search_enabled = ctk.BooleanVar(value=ow.web_search_enabled)
+        self._search_provider = ctk.StringVar(value=ow.web_search_provider)
+        pcfg = ow.web_search_providers.get(ow.web_search_provider)
+        self._search_api_key = ctk.StringVar(value=pcfg.api_key if pcfg and pcfg.api_key else "")
+        self._search_count = ctk.StringVar(value=str(ow.search_result_count))
+        self._search_concurrent = ctk.StringVar(value=str(max(1, ow.concurrent_requests)))
+        self._search_bypass_embed = ctk.BooleanVar(value=ow.bypass_embedding_and_retrieval)
+        self._search_bypass_loader = ctk.BooleanVar(value=ow.bypass_web_loader)
+        self._search_provider_cls = ExternalToolProviderConfig
+
+        def row(label: str, build_widget: Any) -> None:
+            frame = ctk.CTkFrame(panel, fg_color="transparent")
+            frame.pack(fill="x", pady=5)
+            ctk.CTkLabel(frame, text=label, font=("Segoe UI", 10), text_color="#CBD5E1",
+                         width=150, anchor="w").pack(side="left")
+            widget = build_widget(frame)
+            widget.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkCheckBox(panel, text="Enable web search", variable=self._search_enabled,
+                        font=("Segoe UI", 10), height=30).pack(anchor="w", pady=(0, 6))
+        row("Provider", lambda parent: ctk.CTkComboBox(parent, variable=self._search_provider,
+                                                       values=list(VALID_SEARCH_PROVIDERS), state="readonly",
+                                                       font=("Segoe UI", 10)))
+        row("API Key", lambda parent: ctk.CTkEntry(parent, textvariable=self._search_api_key, show="*", font=("Segoe UI", 10)))
+        row("Result Count", lambda parent: ctk.CTkEntry(parent, textvariable=self._search_count, width=120, font=("Segoe UI", 10)))
+        row("Concurrent Requests", lambda parent: ctk.CTkEntry(parent, textvariable=self._search_concurrent, width=120, font=("Segoe UI", 10)))
+        ctk.CTkCheckBox(panel, text="Bypass embedding and retrieval", variable=self._search_bypass_embed,
+                        font=("Segoe UI", 10), height=30).pack(anchor="w", pady=(8, 2))
+        ctk.CTkCheckBox(panel, text="Bypass web loader", variable=self._search_bypass_loader,
+                        font=("Segoe UI", 10), height=30).pack(anchor="w", pady=2)
+
+        btn_row = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        btn_row.pack(fill="x", padx=4)
+        ctk.CTkButton(btn_row, text="Test Search", command=self._test_search_panel,
+                      font=("Segoe UI", 10), width=112, height=36,
+                      fg_color=("#555555", "#444444")).pack(side="left")
+        ctk.CTkButton(btn_row, text="Save", command=self._save_search_panel,
+                      font=("Segoe UI", 10, "bold"), width=112, height=36).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=112, height=36,
+                      fg_color=("#555555", "#444444")).pack(side="right")
+
+    def _test_search_panel(self) -> None:
+        provider = self._search_provider.get()
+        if provider == "disabled":
+            messagebox.showinfo("Test Search", "Web search is disabled.")
+            return
+        api_key = self._search_api_key.get().strip() or os.environ.get(f"{provider.upper()}_API_KEY")
+        if not api_key:
+            messagebox.showwarning("Test Search", f"No API key for {provider}.")
+            return
+        def run() -> None:
+            ok, msg = test_search_provider(provider, api_key, "Open WebUI test")
+            self.root.after(0, lambda: messagebox.showinfo("Test Search", f"Provider: {provider}\n\n{'OK' if ok else 'FAILED'}\n{msg}"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _save_search_panel(self) -> None:
+        ow = self._owui or OpenWebUIConfig()
+        provider = self._search_provider.get()
+        api_key = self._search_api_key.get().strip() or None
+        providers = {}
+        for prov in ("ollama", "tavily", "serpapi", "searchapi"):
+            existing = ow.web_search_providers.get(prov)
+            p_key = api_key if prov == provider else (existing.api_key if existing else None)
+            providers[prov] = self._search_provider_cls(
+                enabled=(existing.enabled if existing else True),
+                api_key=p_key,
+                base_url=(existing.base_url if existing else None),
+                defaults=(existing.defaults if existing else {}),
+            )
+        new_owui = OpenWebUIConfig(
+            enabled=ow.enabled, host=ow.host, port=ow.port,
+            bridge_tools_port=ow.bridge_tools_port,
+            bridge_llm_only_port=ow.bridge_llm_only_port,
+            auth_enabled=ow.auth_enabled, auto_login=ow.auto_login,
+            web_search_enabled=self._search_enabled.get(),
+            web_search_provider=provider,
+            web_search_providers=providers,
+            search_result_count=max(1, int(self._search_count.get().strip() or "3")),
+            concurrent_requests=max(1, int(self._search_concurrent.get().strip() or "1")),
+            bypass_embedding_and_retrieval=self._search_bypass_embed.get(),
+            bypass_web_loader=self._search_bypass_loader.get(),
+            hf_token=ow.hf_token,
+            openai_base_url_mode=ow.openai_base_url_mode,
+            openwebui_data_dir=ow.openwebui_data_dir,
+            extra_env=ow.extra_env,
+            preferred_env_name=ow.preferred_env_name,
+            preferred_python=ow.preferred_python,
+            preferred_command=ow.preferred_command,
+            auto_discover=ow.auto_discover,
+        )
+        save_openwebui_config(new_owui, self.config_path)
+        self._on_config_saved()
+        self._show_dashboard()
+
+    def _build_logs_panel(self) -> None:
+        panel = self._panel_card(self._content_area, "Logs")
+        self._logs_segment = ctk.CTkSegmentedButton(
+            panel,
+            values=["Open WebUI", "Bridge"],
+            command=self._switch_embedded_log,
+            height=30,
+            selected_color="#2563A5",
+            selected_hover_color="#2B6DB3",
+            unselected_color=PANEL_BG_SOFT,
+            unselected_hover_color="#203046",
+            text_color=TEXT,
+        )
+        self._logs_segment.pack(anchor="w", pady=(0, 10))
+        self._embedded_log_text = ctk.CTkTextbox(panel, font=("Consolas", 10), wrap="none", height=330)
+        self._embedded_log_text.pack(fill="both", expand=True)
+        self._logs_segment.set("Open WebUI")
+        self._switch_embedded_log("Open WebUI")
+
+    def _switch_embedded_log(self, value: str) -> None:
+        path = OPENWEBUI_LOG_PATH if value == "Open WebUI" else LLAMA_LOG_PATH
+        self._embedded_log_text.delete("0.0", "end")
+        try:
+            lines = follow_log(path, 220)
+            self._embedded_log_text.insert("0.0", "\n".join(lines) if lines else "(no log lines)")
+            self._embedded_log_text.see("end")
+        except Exception:
+            self._embedded_log_text.insert("0.0", "(log unavailable)")
+
+    def _build_details_panel(self) -> None:
+        panel = self._panel_card(self._content_area, "Details")
+        items = DetailsDialog._build_items(self, self._config, self._owui)
+        for item in items:
+            row = ctk.CTkFrame(panel, fg_color=PANEL_BG_SOFT, corner_radius=7)
+            row.pack(fill="x", pady=3)
+            ctk.CTkLabel(row, text=item.label, font=("Segoe UI", 10),
+                         text_color=MUTED, width=190, anchor="w").pack(side="left", padx=(10, 8), pady=7)
+            ctk.CTkLabel(row, text=item.display_value, font=("Segoe UI", 10, "bold"),
+                         text_color=TEXT, anchor="w").pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+    def _build_guide_panel(self) -> None:
+        panel = self._panel_card(self._content_area, "Install Checklist")
+        for key, label, icon in SetupGuideDialog.REQS:
+            ok = False
+            if key == "python":
+                ok = sys.version_info >= (3, 12)
+            elif key == "conda":
+                import shutil
+                ok = shutil.which("conda") is not None or get_conda_python_path() is not None
+            elif key == "ffmpeg":
+                import shutil
+                ok = shutil.which("ffmpeg") is not None
+            elif key == "hf_token":
+                ok = bool((self._owui and self._owui.hf_token) or os.environ.get("HF_TOKEN"))
+            row = ctk.CTkFrame(panel, fg_color=PANEL_BG_SOFT, corner_radius=7)
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(row, text=icon, width=28, font=("Segoe UI", 13)).pack(side="left", padx=(10, 4), pady=8)
+            ctk.CTkLabel(row, text=label, font=("Segoe UI", 10, "bold"),
+                         text_color=TEXT, anchor="w").pack(side="left", fill="x", expand=True)
+            ctk.CTkLabel(row, text="OK" if ok else "Needed", font=("Segoe UI", 9, "bold"),
+                         text_color=GREEN if ok else YELLOW).pack(side="right", padx=12)
+
+        commands = self._panel_card(self._content_area, "Install Commands")
+        for command, label in SetupGuideDialog.COMMANDS + SetupGuideDialog.ENV_COMMANDS:
+            ctk.CTkLabel(commands, text=label, font=("Segoe UI", 9, "bold"),
+                         text_color=MUTED, anchor="w").pack(fill="x", pady=(6, 0))
+            ctk.CTkEntry(commands, font=("Consolas", 10)).pack(fill="x", pady=(2, 0))
+            entry = commands.winfo_children()[-1]
+            entry.insert(0, command)
+
+    def _build_env_preview_panel(self) -> None:
+        panel = self._panel_card(self._content_area, "Environment Variables")
+        text = ctk.CTkTextbox(panel, font=("Consolas", 10), wrap="none", height=380)
+        text.pack(fill="both", expand=True)
+        if self._owui and self._config:
+            env = generate_openwebui_env(self._owui, self._config)
+            lines = []
+            for key, value in sorted(env.items()):
+                display = "****" if any(secret in key.lower() for secret in ("key", "token", "secret", "auth")) and value else value
+                lines.append(f"{key}={display}")
+            text.insert("0.0", "\n".join(lines) if lines else "(no env vars)")
+        else:
+            text.insert("0.0", "No configuration loaded.")
+        text.configure(state="disabled")
 
     def _build_footer(self, parent: ctk.CTkFrame) -> None:
         footer = ctk.CTkFrame(parent, fg_color="transparent")
@@ -271,24 +761,30 @@ class OpenWebUISetupCenter:
             "Preview Cmd": "Open environment variable preview dialog",
         }
         for col, (panel_title, buttons) in enumerate(sub_panels):
-            panel = ctk.CTkFrame(panels_frame, fg_color=("#e8e8e8", "#1e1e1e"), corner_radius=6)
-            panel.grid(row=0, column=col, sticky="nsew", padx=4, pady=2)
+            panel = ctk.CTkFrame(
+                panels_frame,
+                fg_color=PANEL_BG,
+                corner_radius=8,
+                border_width=1,
+                border_color=BORDER,
+            )
+            panel.grid(row=0, column=col, sticky="nsew", padx=6, pady=2)
             panel.columnconfigure(0, weight=1)
             panel.columnconfigure(1, weight=1)
 
             ctk.CTkLabel(panel, text=panel_title,
-                         font=("Segoe UI", 8, "bold"),
-                         text_color=("#666666", "#888888")).grid(
-                row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 0))
+                         font=("Segoe UI", 9, "bold"),
+                         text_color=MUTED).grid(
+                row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
 
             for i, (text, cmd) in enumerate(buttons):
                 btn = ctk.CTkButton(
                     panel, text=text, command=cmd,
-                    font=("Segoe UI", 9), height=26,
-                    fg_color=("#e0e0e0", "#2a2a2a"),
-                    text_color=("#333333", "#cccccc"),
-                    hover_color=("#d0d0d0", "#3a3a3a"),
-                    corner_radius=4,
+                    font=("Segoe UI", 9, "bold"), height=30,
+                    fg_color=PANEL_BG_SOFT,
+                    text_color=TEXT,
+                    hover_color="#203046",
+                    corner_radius=7,
                 )
                 r = 1 + i // 2
                 c = i % 2
@@ -303,8 +799,8 @@ class OpenWebUISetupCenter:
         self.primary_btn = ctk.CTkButton(
             action, text="Start Server", command=self._primary_action,
             font=("Segoe UI", 11, "bold"), height=40,
-            fg_color=("#1a4030", "#1a4030"), text_color=GREEN,
-            hover_color=("#153828", "#153828"), corner_radius=6,
+            fg_color="#123B2F", text_color=GREEN,
+            hover_color="#174A3A", corner_radius=8,
         )
         self.primary_btn.pack(side="right")
         ToolTip(self.primary_btn, "Start or stop the Open WebUI server")
@@ -313,38 +809,46 @@ class OpenWebUISetupCenter:
         if parent is None:
             parent = self.cards_area
         ok = card_data["ok"]
-        card_bg = "#0f2820" if ok else "#281414"
+        card_bg = CARD_OK_BG if ok else CARD_ERR_BG
         accent_color = GREEN if ok else RED
-        icon_text = "\u2713" if ok else "\u2717"
+        status_bg = "#123B2F" if ok else "#3B1C22"
 
-        card = ctk.CTkFrame(parent, fg_color=card_bg, corner_radius=10, height=LAYOUT["CARD_H"] + 4)
+        card = ctk.CTkFrame(
+            parent,
+            fg_color=card_bg,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+            height=LAYOUT["CARD_H"],
+        )
         card.grid_propagate(False)
 
         card.columnconfigure(0, weight=0)
-        card.columnconfigure(1, weight=0)
-        card.columnconfigure(2, weight=1)
-        card.columnconfigure(3, weight=0)
+        card.columnconfigure(1, weight=1)
+        card.columnconfigure(2, weight=0)
+        card.rowconfigure(0, weight=1)
+        card.rowconfigure(1, weight=1)
 
         accent = ctk.CTkFrame(card, fg_color=accent_color, width=5, corner_radius=0)
-        accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 10))
-
-        ctk.CTkLabel(card, text=icon_text,
-                     font=("Segoe UI", 14, "bold"),
-                     text_color=accent_color).grid(row=0, column=1, rowspan=2, padx=(0, 6))
+        accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 14))
 
         ctk.CTkLabel(card, text=card_data["title"],
-                     font=("Segoe UI", 11, "bold"), anchor="w").grid(
-            row=0, column=2, sticky="w", pady=(7, 0))
+                     font=("Segoe UI", 13, "bold"), text_color=TEXT,
+                     anchor="w").grid(row=0, column=1, sticky="sw", pady=(14, 0))
 
         ctk.CTkLabel(card, text=card_data.get("subtitle", ""),
                      font=("Segoe UI", 10),
-                     text_color=("#999999", "#999999"), anchor="w").grid(
-            row=1, column=2, sticky="w", pady=(0, 7))
+                     text_color="#A7B0BC", anchor="w").grid(
+            row=1, column=1, sticky="nw", pady=(2, 14))
 
         ctk.CTkLabel(card, text=card_data.get("status", ""),
-                     font=("Segoe UI", 10, "bold"),
-                     text_color=accent_color).grid(
-            row=0, column=3, rowspan=2, sticky="e", padx=(0, 18))
+                     font=("Segoe UI", 9, "bold"),
+                     fg_color=status_bg,
+                     text_color=accent_color,
+                     corner_radius=7,
+                     width=76,
+                     height=28).grid(
+            row=0, column=2, rowspan=2, sticky="e", padx=(12, 16))
 
         return card
 
@@ -506,13 +1010,13 @@ class OpenWebUISetupCenter:
                                        fg_color=("#444444", "#333333"),
                                        text_color=("#888888", "#888888"))
         elif self.phase == Phase.READY:
-            self.primary_btn.configure(text="Start Server", state="normal", fg_color="#1a4030", text_color=GREEN)
+            self.primary_btn.configure(text="Start Server", state="normal", fg_color="#123B2F", text_color=GREEN)
         elif self.phase == Phase.STARTING:
             self.primary_btn.configure(text="Starting\u2026", state="disabled", fg_color=("#444444", "#333333"), text_color=("#888888", "#888888"))
         elif self.phase == Phase.RUNNING:
-            self.primary_btn.configure(text="Stop Server", state="normal", fg_color="#281414", text_color=RED)
+            self.primary_btn.configure(text="Stop Server", state="normal", fg_color="#3B1C22", text_color=RED)
         elif self.phase == Phase.ERROR:
-            self.primary_btn.configure(text="Retry", state="normal", fg_color="#281414", text_color=YELLOW)
+            self.primary_btn.configure(text="Retry", state="normal", fg_color="#3B1C22", text_color=YELLOW)
 
     def _update_status_label(self) -> None:
         if not self.status_label:
@@ -535,7 +1039,7 @@ class OpenWebUISetupCenter:
 
         txt = "  |  ".join(parts) if parts else ""
         self.status_label.configure(text=txt,
-                                    text_color=GREEN if self.phase == Phase.RUNNING else ("#888888", "#888888"))
+                                    text_color=GREEN if self.phase == Phase.RUNNING else MUTED)
 
     def _update_cmd_preview(self) -> None:
         if not self._owui:
@@ -605,8 +1109,8 @@ class OpenWebUISetupCenter:
                         self.root.after(0, lambda u=url: self._on_start_ok(u))
                         return
                 self.root.after(0, lambda: self._on_start_failed(f"Port {ow_port} not responding after 20s"))
-            except Exception as e:
-                self.root.after(0, lambda: self._on_start_failed(str(e)))
+            except Exception as exc:
+                self.root.after(0, lambda msg=str(exc): self._on_start_failed(msg))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -647,6 +1151,7 @@ class OpenWebUISetupCenter:
         self._rebuild_cards()
         self._update_footer_buttons()
         self._update_status_label()
+        self._update_dashboard_summary()
 
     def _save_config(self) -> None:
         if self._owui:
@@ -685,7 +1190,7 @@ class OpenWebUISetupCenter:
         self._refresh_all()
 
     def _bind_shortcuts(self) -> None:
-        self.root.bind("<Control-l>", lambda e: self._open_logs_dialog())
+        self.root.bind("<Control-l>", lambda e: self._show_logs())
         self.root.bind("<Control-s>", lambda e: [self._save_config(), messagebox.showinfo("Saved", "Configuration saved.")])
         self.root.bind("<Control-r>", lambda e: self._action_stop() if self.phase == Phase.RUNNING else self._action_start())
         self.root.bind("<Escape>", lambda e: None)
@@ -998,7 +1503,6 @@ class ConfigDialog:
 
     def _save(self) -> None:
         try:
-            from .config import ExternalToolProviderConfig
             providers = {}
             if self.owui:
                 for k, v in self.owui.web_search_providers.items():

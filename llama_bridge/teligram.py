@@ -618,9 +618,10 @@ def build_system_prompt(
         ),
     ]
     if base:
+        escaped_base = base.replace("</base_config_prompt>", "<\\/base_config_prompt>")
         parts.append(
             "<base_config_prompt>\n"
-            f"{base.replace('</base_config_prompt>', '<\\/base_config_prompt>')}\n"
+            f"{escaped_base}\n"
             "</base_config_prompt>"
         )
     parts.extend(
@@ -1023,20 +1024,20 @@ class TeligramBot:
         updates = data.get("result") or []
         return updates if isinstance(updates, list) else []
 
-    async def handle_command(self, chat_id: str, text: str) -> bool:
+    async def handle_command(self, chat_id: str, text: str, username: str = "") -> bool:
         parsed = parse_command(text)
         if parsed is None:
             return False
         command, argument = parsed
 
         # Check command policy
-        role = self._chat_role(chat_id, "")
+        role = self._chat_role(chat_id, username)
         if command != "myid" and not self._command_allowed_for_role(command, role):
             await self.send_message(chat_id, "Unknown command. Send /help to see available commands.")
             return True
 
         if command in {"start", "help"}:
-            await self.send_message(chat_id, self.help_text(chat_id, ""))
+            await self.send_message(chat_id, self.help_text(chat_id, username))
             return True
         if command == "status":
             await self.send_message(chat_id, self.status_text())
@@ -1914,8 +1915,10 @@ class TeligramBot:
         if not isinstance(chat, dict) or chat.get("id") is None:
             return
         chat_id = str(chat["id"])
-        username = str(chat.get("username") or "").strip()
         from_user = message.get("from") or {}
+        chat_username = str(chat.get("username") or "").strip()
+        from_username = str(from_user.get("username") or "").strip() if isinstance(from_user, dict) else ""
+        username = from_username or chat_username
         user_id = str(from_user.get("id") or "") if isinstance(from_user, dict) else ""
 
         # Allow /myid for unauthorized users
@@ -1971,7 +1974,7 @@ class TeligramBot:
             LOGGER.info("Telegram route: natural_schedule_request")
             await self.handle_schedule_request(chat_id, text)
             return
-        if await self.handle_command(chat_id, text):
+        if await self.handle_command(chat_id, text, username):
             LOGGER.info("Telegram route: command/canned command=%s", parse_command(text)[0] if parse_command(text) else "-")
             return
 
@@ -2671,7 +2674,6 @@ class TeligramBot:
         self.write_telegram_state(payload)
 
     def status_text(self) -> str:
-        allowed = "all chats" if self.allow_all_chats else f"{len(self.allowed_chat_ids | self.owner_chat_ids | self.admin_chat_ids)} configured"
         docs = ", ".join(self.workspace_documents) or "none"
         tools_count = len(self.available_tool_names()) if self.tools else 0
         return (

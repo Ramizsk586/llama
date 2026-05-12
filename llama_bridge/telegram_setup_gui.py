@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 import threading
-import time
-import tkinter as tk
-from tkinter import ttk
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any
@@ -49,23 +45,29 @@ else:
         send_forced_message,
     )
 
-GREEN = "#4FD1A1"
-RED = "#FF6B6B"
-YELLOW = "#F2C66D"
-ACCENT = "#5BA4F5"
-DARK_BG = "#0D1117"
-SIDEBAR_BG = "#161B22"
-CARD_OK_BG = "#0f2820"
-CARD_ERR_BG = "#281414"
+GREEN = "#34D399"
+RED = "#FB7185"
+YELLOW = "#FBBF24"
+ACCENT = "#60A5FA"
+DARK_BG = "#0A0F16"
+SIDEBAR_BG = "#101720"
+PANEL_BG = "#121B26"
+PANEL_BG_SOFT = "#162231"
+BORDER = "#263241"
+MUTED = "#8B949E"
+TEXT = "#E6EDF3"
+CARD_OK_BG = "#0E2B22"
+CARD_ERR_BG = "#2A1519"
 
 MAX_LOG_LINES = 500
 
 LAYOUT = {
-    "PAD": 20,
-    "CARD_H": 68,
-    "CARD_GAP": 8,
-    "WIN_W": 640,
-    "WIN_H": 480,
+    "PAD": 24,
+    "CARD_H": 96,
+    "CARD_GAP": 14,
+    "WIN_W": 880,
+    "WIN_H": 560,
+    "SIDEBAR_W": 232,
 }
 PAD = LAYOUT["PAD"]
 
@@ -149,7 +151,7 @@ class TelegramSetupCenter:
         self.root = ctk.CTk()
         self.root.title("Llama Bridge - Telegram Bot Setup")
         _center_window(self.root, W, H)
-        self.root.minsize(520, 400)
+        self.root.minsize(760, 500)
         self.root.resizable(True, True)
 
         self.status = BotStatus.SETUP
@@ -181,24 +183,28 @@ class TelegramSetupCenter:
 
         self.root.configure(fg_color=DARK_BG)
 
-        sidebar = ctk.CTkFrame(self.root, width=200, fg_color=SIDEBAR_BG, corner_radius=0)
+        sidebar = ctk.CTkFrame(self.root, width=LAYOUT["SIDEBAR_W"], fg_color=SIDEBAR_BG, corner_radius=0)
         sidebar.pack(side="left", fill="y", padx=0, pady=0)
         sidebar.pack_propagate(False)
 
         ctk.CTkLabel(sidebar, text="Telegram Bot",
-                     font=("Segoe UI", 14, "bold"), anchor="w",
-                     fg_color=SIDEBAR_BG, text_color="#e6edf3").pack(
-            fill="x", padx=16, pady=(20, 8))
+                     font=("Segoe UI", 18, "bold"), anchor="w",
+                     fg_color=SIDEBAR_BG, text_color=TEXT).pack(
+            fill="x", padx=20, pady=(26, 0))
+        ctk.CTkLabel(sidebar, text="Setup Center",
+                     font=("Segoe UI", 10), anchor="w",
+                     fg_color=SIDEBAR_BG, text_color=MUTED).pack(
+            fill="x", padx=20, pady=(2, 16))
 
-        sep = ctk.CTkFrame(sidebar, fg_color="#30363d", height=1)
-        sep.pack(fill="x", padx=12, pady=(0, 12))
+        sep = ctk.CTkFrame(sidebar, fg_color=BORDER, height=1)
+        sep.pack(fill="x", padx=16, pady=(0, 14))
 
         self._sidebar_buttons: dict[str, ctk.CTkButton] = {}
         nav_items = [
             ("dashboard", "Dashboard", self._show_dashboard),
-            ("config", "Config", self._open_config),
-            ("access", "Access", self._open_access),
-            ("tools", "Tools", self._open_tools),
+            ("config", "Config", self._show_config),
+            ("access", "Access", self._show_access),
+            ("tools", "Tools", self._show_tools),
             ("force_msg", "Force Msg", self._show_force_message),
             ("logs", "Logs", self._show_logs),
             ("details", "Details", self._show_details),
@@ -206,12 +212,12 @@ class TelegramSetupCenter:
         for key, label, cmd in nav_items:
             btn = ctk.CTkButton(
                 sidebar, text=label, command=cmd,
-                font=("Segoe UI", 11), height=36,
-                fg_color="transparent", text_color="#c9d1d9",
-                hover_color="#21262d", corner_radius=6,
+                font=("Segoe UI", 11), height=38,
+                fg_color="transparent", text_color="#CBD5E1",
+                hover_color="#1C2734", corner_radius=8,
                 anchor="w",
             )
-            btn.pack(fill="x", padx=8, pady=1)
+            btn.pack(fill="x", padx=12, pady=2)
             self._sidebar_buttons[key] = btn
 
         self._active_nav = "dashboard"
@@ -219,15 +225,18 @@ class TelegramSetupCenter:
         main = ctk.CTkFrame(self.root, fg_color="transparent")
         main.pack(side="left", fill="both", expand=True)
 
-        sep = ctk.CTkFrame(main, fg_color=GREEN, height=2, corner_radius=0)
-        sep.pack(fill="x", padx=PAD, pady=(4, 0))
+        self._build_header(main)
 
         self.status_label = ctk.CTkLabel(main, text="", font=("Segoe UI", 9),
-                                          text_color=("#888888", "#888888"), anchor="w")
+                                          text_color=MUTED, anchor="w")
         self.status_label.pack(fill="x", padx=PAD, pady=(8, 0))
 
         self.cards_area = ctk.CTkFrame(main, fg_color="transparent")
-        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(8, 0))
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(18, 0))
+
+        self.dashboard_body = ctk.CTkFrame(main, fg_color="transparent")
+        self.dashboard_body.pack(fill="both", expand=True, padx=PAD, pady=(10, PAD))
+        self._build_dashboard_body()
 
         self._content_area = ctk.CTkScrollableFrame(main, fg_color="transparent")
         self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(8, 0))
@@ -238,25 +247,27 @@ class TelegramSetupCenter:
         self._footer_frame.pack_forget()
 
         self._cards_area_visible = True
-        self._build_header(main)
         self._show_dashboard()
 
     def _set_active_nav(self, key: str) -> None:
         for k, btn in self._sidebar_buttons.items():
             if k == key:
-                btn.configure(fg_color="#238636", text_color="#ffffff")
+                btn.configure(fg_color="#238636", text_color="#ffffff", hover_color="#2EA043")
             else:
-                btn.configure(fg_color="transparent", text_color="#c9d1d9")
+                btn.configure(fg_color="transparent", text_color="#CBD5E1", hover_color="#1C2734")
 
     def _show_dashboard(self) -> None:
         self._current_view = "home"
         self._nav_stack.clear()
         self._cards_area_visible = True
-        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(8, 0))
+        self._header_row.pack_configure(padx=PAD, pady=(PAD, 0))
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(18, 0))
+        self.dashboard_body.pack(fill="both", expand=True, padx=PAD, pady=(10, PAD))
         self._content_area.pack_forget()
         self._footer_frame.pack_forget()
         self._set_active_nav("dashboard")
         self.subtitle_label.configure(text=self._subtitle_text())
+        self._update_dashboard_summary()
 
     def _show_config(self) -> None:
         self._nav_stack.append("config")
@@ -288,6 +299,127 @@ class TelegramSetupCenter:
         self._set_active_nav("details")
         self._show_panel("details")
 
+    def _build_dashboard_body(self) -> None:
+        self.dashboard_body.columnconfigure(0, weight=3, uniform="dash")
+        self.dashboard_body.columnconfigure(1, weight=2, uniform="dash")
+
+        actions = ctk.CTkFrame(
+            self.dashboard_body,
+            fg_color=PANEL_BG,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+        )
+        actions.grid(row=0, column=0, sticky="nsew", padx=(0, 7), pady=0)
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            actions,
+            text="Quick Actions",
+            font=("Segoe UI", 12, "bold"),
+            text_color=TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 8))
+
+        action_buttons = [
+            ("Config", self._show_config),
+            ("Access", self._show_access),
+            ("Tools", self._show_tools),
+            ("Force Msg", self._show_force_message),
+            ("Logs", self._show_logs),
+            ("Details", self._show_details),
+        ]
+        for idx, (label, command) in enumerate(action_buttons):
+            btn = ctk.CTkButton(
+                actions,
+                text=label,
+                command=command,
+                height=34,
+                font=("Segoe UI", 10, "bold"),
+                fg_color=PANEL_BG_SOFT,
+                text_color=TEXT,
+                hover_color="#203046",
+                corner_radius=7,
+            )
+            btn.grid(
+                row=1 + idx // 2,
+                column=idx % 2,
+                sticky="ew",
+                padx=(16 if idx % 2 == 0 else 6, 16 if idx % 2 == 1 else 6),
+                pady=5,
+            )
+
+        snapshot = ctk.CTkFrame(
+            self.dashboard_body,
+            fg_color=PANEL_BG,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+        )
+        snapshot.grid(row=0, column=1, sticky="nsew", padx=(7, 0), pady=0)
+        snapshot.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            snapshot,
+            text="Bot Snapshot",
+            font=("Segoe UI", 12, "bold"),
+            text_color=TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 8))
+
+        self.dashboard_summary_labels: dict[str, ctk.CTkLabel] = {}
+        for row, (key, label) in enumerate([
+            ("token", "Token"),
+            ("model", "Model"),
+            ("access", "Access"),
+            ("tools", "Tools"),
+        ], start=1):
+            ctk.CTkLabel(
+                snapshot,
+                text=label,
+                font=("Segoe UI", 10),
+                text_color=MUTED,
+                anchor="w",
+            ).grid(row=row, column=0, sticky="w", padx=(16, 10), pady=4)
+
+            value = ctk.CTkLabel(
+                snapshot,
+                text="-",
+                font=("Segoe UI", 10, "bold"),
+                text_color=TEXT,
+                anchor="e",
+            )
+            value.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=4)
+            self.dashboard_summary_labels[key] = value
+
+    def _update_dashboard_summary(self) -> None:
+        labels = getattr(self, "dashboard_summary_labels", None)
+        if not labels:
+            return
+
+        telegram = self._config.telegram if self._config else None
+        if not telegram:
+            values = {
+                "token": "missing",
+                "model": "-",
+                "access": "-",
+                "tools": "-",
+            }
+        else:
+            token_set = bool(telegram.bot_token and not telegram.bot_token.startswith("${"))
+            tool_policy = telegram.tool_policy
+            tool_count = len(tool_policy.ai_auto_tools) + len(tool_policy.command_tools)
+            values = {
+                "token": "set" if token_set else "missing",
+                "model": f"{telegram.provider} / {telegram.model}" if telegram.provider and telegram.model else "missing",
+                "access": "all chats" if telegram.allow_all_chats else f"{len(telegram.allowed_chat_ids)} allowed",
+                "tools": f"{tool_count} enabled",
+            }
+
+        for key, value in values.items():
+            labels[key].configure(text=value)
+
     def _build_header(self, parent: ctk.CTkFrame) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
         header.pack(fill="x", padx=PAD, pady=(PAD, 0))
@@ -302,14 +434,16 @@ class TelegramSetupCenter:
         title_frame.grid(row=0, column=0, sticky="w")
 
         ctk.CTkLabel(title_frame, text="Telegram Bot Setup Center",
-                     font=("Segoe UI", 18, "bold"), anchor="w").pack(anchor="w")
+                     font=("Segoe UI", 22, "bold"), text_color=TEXT,
+                     anchor="w").pack(anchor="w")
         self.subtitle_label = ctk.CTkLabel(title_frame, text="",
                                             font=("Segoe UI", 10),
-                                            text_color=("#888888", "#888888"), anchor="w")
+                                            text_color=MUTED, anchor="w")
         self.subtitle_label.pack(anchor="w", pady=(2, 0))
 
         self.badge = ctk.CTkLabel(header, text="  SETUP  ",
-                                  font=("Segoe UI", 9, "bold"), corner_radius=4)
+                                  font=("Segoe UI", 9, "bold"), corner_radius=7,
+                                  width=86, height=32)
         self.badge.grid(row=0, column=1, sticky="ne", pady=(4, 0))
 
         self._update_header()
@@ -318,20 +452,22 @@ class TelegramSetupCenter:
         self.subtitle_label.configure(text=self._subtitle_text())
         badge_text, badge_color = self._get_badge_info()
         badge_bg = {
-            BotStatus.RUNNING: "#0a2a1a",
-            BotStatus.READY: "#0a2a1a",
-            BotStatus.SETUP: "#2a2a0a",
-            BotStatus.STARTING: "#2a2a0a",
-            BotStatus.ERROR: "#2a0a0a",
-        }.get(self.status, "#0a2a1a")
+            BotStatus.RUNNING: "#123B2F",
+            BotStatus.READY: "#123B2F",
+            BotStatus.SETUP: "#3B3218",
+            BotStatus.STARTING: "#3B3218",
+            BotStatus.ERROR: "#3B1C22",
+        }.get(self.status, "#123B2F")
         self.badge.configure(text=f"  {badge_text}  ",
                              fg_color=badge_bg, text_color=badge_color)
 
     def _show_panel(self, panel: str) -> None:
         self._current_view = panel
         self._cards_area_visible = False
+        self._header_row.pack_configure(padx=PAD, pady=(18, 0))
         self.cards_area.pack_forget()
-        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(8, 0))
+        self.dashboard_body.pack_forget()
+        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(8, PAD))
         for w in self._content_area.winfo_children():
             w.destroy()
         self._footer_frame.pack_forget()
@@ -385,70 +521,109 @@ class TelegramSetupCenter:
         self._telegram_raw = telegram_raw
 
         form = ctk.CTkFrame(self._content_area, fg_color="transparent")
-        form.pack(fill="x", padx=0, pady=(0, 16))
+        form.pack(fill="both", expand=True, padx=0, pady=(0, 16))
+        form.columnconfigure(0, weight=3, uniform="cfg")
+        form.columnconfigure(1, weight=2, uniform="cfg")
+
+        left = ctk.CTkFrame(form, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right = ctk.CTkFrame(form, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        def section(parent: ctk.CTkFrame, title: str) -> ctk.CTkFrame:
+            card = ctk.CTkFrame(
+                parent,
+                fg_color=PANEL_BG,
+                corner_radius=8,
+                border_width=1,
+                border_color=BORDER,
+            )
+            card.pack(fill="x", pady=(0, 12))
+            ctk.CTkLabel(
+                card,
+                text=title,
+                font=("Segoe UI", 12, "bold"),
+                text_color=TEXT,
+                anchor="w",
+            ).pack(fill="x", padx=16, pady=(14, 8))
+            body = ctk.CTkFrame(card, fg_color="transparent")
+            body.pack(fill="x", padx=16, pady=(0, 16))
+            return body
+
+        switches = section(left, "Bot Behavior")
+        credentials = section(left, "Credentials & Model")
+        limits = section(right, "Runtime Limits")
+        prompt_section = section(right, "System Prompt")
 
         self._cfg_enabled_var = ctk.BooleanVar(value=bool(telegram_raw.get("enabled", False)))
-        ctk.CTkCheckBox(form, text="Enable Telegram bot", variable=self._cfg_enabled_var,
-                        font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(switches, text="Enable Telegram bot", variable=self._cfg_enabled_var,
+                        font=("Segoe UI", 10), height=30).pack(anchor="w", pady=3)
 
         self._cfg_allow_all_var = ctk.BooleanVar(value=bool(telegram_raw.get("allow_all_chats", False)))
         self._cfg_allow_all_cb = ctk.CTkCheckBox(
-            form, text="Allow all chats (open to everyone)",
+            switches, text="Allow all chats (open to everyone)",
             variable=self._cfg_allow_all_var,
             font=("Segoe UI", 10),
             text_color=RED if self._cfg_allow_all_var.get() else None,
+            height=30,
         )
-        self._cfg_allow_all_cb.pack(anchor="w", pady=2)
+        self._cfg_allow_all_cb.pack(anchor="w", pady=3)
 
         def _on_allow_toggle():
             self._cfg_allow_all_cb.configure(text_color=RED if self._cfg_allow_all_var.get() else None)
         self._cfg_allow_all_var.trace_add("write", lambda *_: _on_allow_toggle())
 
         self._cfg_auto_var = ctk.BooleanVar(value=bool(telegram_raw.get("autonomous_enabled", False)))
-        ctk.CTkCheckBox(form, text="Autonomous mode (bot can initiate conversations)",
-                       variable=self._cfg_auto_var, font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+        ctk.CTkCheckBox(switches, text="Autonomous mode",
+                       variable=self._cfg_auto_var, font=("Segoe UI", 10), height=30).pack(anchor="w", pady=3)
+        ctk.CTkLabel(
+            switches,
+            text="Lets the bot initiate conversations when explicitly enabled.",
+            font=("Segoe UI", 9),
+            text_color=MUTED,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 2))
 
         provider_names = list(raw.get("providers", {}).keys())
         self._cfg_provider_var = ctk.StringVar(
             value=str(telegram_raw.get("provider", provider_names[0] if provider_names else "")))
 
-        fields = [
-            ("Bot Token", "token", telegram_raw.get("bot_token", ""), True),
-            ("Provider", None, provider_names[0] if provider_names else "", False),
-            ("Model", "model", telegram_raw.get("model", ""), False),
-            ("System Prompt", "prompt", telegram_raw.get("system_prompt", ""), False),
-        ]
         self._cfg_vars: dict[str, Any] = {}
-        for label, key, default, is_pwd in fields:
-            row = ctk.CTkFrame(form, fg_color="transparent")
-            row.pack(fill="x", pady=4)
-            ctk.CTkLabel(row, text=label, font=("Segoe UI", 10), width=120, anchor="w").pack(side="left")
-            if key == "prompt":
-                box = ctk.CTkTextbox(row, font=("Segoe UI", 10), height=80)
-                box.pack(side="left", fill="x", expand=True)
-                box.insert("0.0", str(default))
-                self._cfg_vars[key] = box
-            elif key == "token":
-                entry = ctk.CTkEntry(row, font=("Segoe UI", 10), show="*")
-                entry.pack(side="left", fill="x", expand=True)
-                entry.insert(0, str(default))
-                show_var = ctk.BooleanVar(value=False)
-                def _toggle(pw_entry=entry, sv=show_var):
-                    pw_entry.configure(show="" if sv.get() else "*")
-                ctk.CTkCheckBox(row, text="Show", variable=show_var,
-                                command=_toggle, font=("Segoe UI", 9)).pack(side="left", padx=(6, 0))
-                self._cfg_vars[key] = entry
-            elif key == "provider":
-                ctk.CTkComboBox(row, variable=self._cfg_provider_var, values=provider_names,
-                               state="readonly", font=("Segoe UI", 10), width=200).pack(side="left", fill="x", expand=True)
-            else:
-                entry = ctk.CTkEntry(row, font=("Segoe UI", 10))
-                entry.pack(side="left", fill="x", expand=True)
-                entry.insert(0, str(default))
-                self._cfg_vars[key] = entry
 
-        if key == "provider":
-            self._cfg_vars["provider"] = self._cfg_provider_var
+        def field(parent: ctk.CTkFrame, label: str) -> ctk.CTkFrame:
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", pady=5)
+            ctk.CTkLabel(row, text=label, font=("Segoe UI", 10),
+                         text_color="#CBD5E1", width=112, anchor="w").pack(side="left")
+            return row
+
+        token_row = field(credentials, "Bot Token")
+        token_entry = ctk.CTkEntry(token_row, font=("Segoe UI", 10), show="*")
+        token_entry.pack(side="left", fill="x", expand=True)
+        token_entry.insert(0, str(telegram_raw.get("bot_token", "")))
+        token_show_var = ctk.BooleanVar(value=False)
+        def _toggle_token() -> None:
+            token_entry.configure(show="" if token_show_var.get() else "*")
+        ctk.CTkCheckBox(token_row, text="Show", variable=token_show_var,
+                        command=_toggle_token, font=("Segoe UI", 9), width=70).pack(side="left", padx=(8, 0))
+        self._cfg_vars["token"] = token_entry
+
+        provider_row = field(credentials, "Provider")
+        provider_values = provider_names if provider_names else [self._cfg_provider_var.get()]
+        ctk.CTkComboBox(provider_row, variable=self._cfg_provider_var, values=provider_values,
+                        state="readonly", font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        self._cfg_vars["provider"] = self._cfg_provider_var
+
+        model_row = field(credentials, "Model")
+        model_entry = ctk.CTkEntry(model_row, font=("Segoe UI", 10))
+        model_entry.pack(side="left", fill="x", expand=True)
+        model_entry.insert(0, str(telegram_raw.get("model", "")))
+        self._cfg_vars["model"] = model_entry
+
+        prompt_box = ctk.CTkTextbox(prompt_section, font=("Segoe UI", 10), height=154)
+        prompt_box.pack(fill="x")
+        prompt_box.insert("0.0", str(telegram_raw.get("system_prompt", "")))
+        self._cfg_vars["prompt"] = prompt_box
 
         num_fields = [
             ("Max Input Chars", "max_input_chars", 4000),
@@ -457,25 +632,23 @@ class TelegramSetupCenter:
             ("Response Timeout (s)", "response_timeout_seconds", 180.0),
         ]
         for label, key, default_val in num_fields:
-            row = ctk.CTkFrame(form, fg_color="transparent")
-            row.pack(fill="x", pady=4)
-            ctk.CTkLabel(row, text=label, font=("Segoe UI", 10), width=120, anchor="w").pack(side="left")
+            row = field(limits, label)
             var = ctk.StringVar(value=str(telegram_raw.get(key, default_val)))
-            ctk.CTkEntry(row, textvariable=var, width=100, font=("Segoe UI", 10)).pack(side="left")
+            ctk.CTkEntry(row, textvariable=var, width=120, font=("Segoe UI", 10)).pack(side="left")
             self._cfg_vars[key] = var
 
         self._cfg_test_result = ctk.StringVar(value="")
 
         btn_row = ctk.CTkFrame(form, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(10, 0))
+        btn_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
         ctk.CTkButton(btn_row, text="Test Token", command=self._cfg_test_token,
-                      font=("Segoe UI", 9, "bold"), width=90).pack(side="left", padx=(0, 6))
+                      font=("Segoe UI", 9, "bold"), width=112, height=36).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(btn_row, textvariable=self._cfg_test_result,
-                     font=("Segoe UI", 9), text_color=("#888888", "#888888")).pack(side="left")
+                     font=("Segoe UI", 9), text_color=MUTED).pack(side="left")
         ctk.CTkButton(btn_row, text="Save", command=self._cfg_save,
-                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+                      font=("Segoe UI", 10, "bold"), width=112, height=36).pack(side="right", padx=(8, 0))
         ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
-                      font=("Segoe UI", 10), width=90,
+                      font=("Segoe UI", 10), width=112, height=36,
                       fg_color=("#555555", "#444444")).pack(side="right")
 
     def _cfg_test_token(self) -> None:
@@ -589,66 +762,98 @@ class TelegramSetupCenter:
         self._tools_cmd_policy = telegram_raw.setdefault("command_policy", {})
         self._tools_tool_policy = telegram_raw.setdefault("tool_policy", {})
 
-        scroll = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-        scroll._scrollbar.grid_remove()
+        form = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        form.pack(fill="both", expand=True)
 
-        tabview = ctk.CTkTabview(scroll)
-        tabview.pack(fill="both", expand=True)
+        panel = ctk.CTkFrame(
+            form,
+            fg_color=PANEL_BG,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+        )
+        panel.pack(fill="x", padx=4, pady=(0, 12))
 
-        cmd_tab = tabview.add("Commands")
-        tool_tab = tabview.add("AI Tools")
+        top_row = ctk.CTkFrame(panel, fg_color="transparent")
+        top_row.pack(fill="x", padx=16, pady=(14, 8))
+        ctk.CTkLabel(
+            top_row,
+            text="Command Policy",
+            font=("Segoe UI", 12, "bold"),
+            text_color=TEXT,
+            anchor="w",
+        ).pack(side="left")
 
-        self._build_tools_commands(cmd_tab)
-        self._build_tools_ai_tools(tool_tab)
+        self._tools_segment = ctk.CTkSegmentedButton(
+            top_row,
+            values=["Commands", "AI Tools"],
+            command=self._show_tools_tab,
+            height=30,
+            selected_color="#2563A5",
+            selected_hover_color="#2B6DB3",
+            unselected_color=PANEL_BG_SOFT,
+            unselected_hover_color="#203046",
+            text_color=TEXT,
+        )
+        self._tools_segment.pack(side="right")
 
-        btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(10, 0))
+        self._tools_content = ctk.CTkFrame(panel, fg_color="transparent")
+        self._tools_content.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self._tools_segment.set("Commands")
+        self._show_tools_tab("Commands")
+
+        btn_row = ctk.CTkFrame(form, fg_color="transparent")
+        btn_row.pack(fill="x", padx=4, pady=(0, 0))
         ctk.CTkButton(btn_row, text="Save", command=self._tools_save,
                       font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
         ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
                       font=("Segoe UI", 10), width=90,
                       fg_color=("#555555", "#444444")).pack(side="right")
 
-    def _build_tools_commands(self, parent: ctk.CTkFrame) -> None:
-        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-        scroll._scrollbar.grid_remove()
+    def _show_tools_tab(self, value: str) -> None:
+        for child in self._tools_content.winfo_children():
+            child.destroy()
+        if value == "AI Tools":
+            self._build_tools_ai_tools(self._tools_content)
+        else:
+            self._build_tools_commands(self._tools_content)
 
-        header_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        header_row.pack(fill="x", padx=4, pady=(4, 0))
+    def _build_tools_commands(self, parent: ctk.CTkFrame) -> None:
+        table = ctk.CTkFrame(parent, fg_color="transparent")
+        table.pack(fill="x")
+        table.columnconfigure(0, weight=1)
+
+        header_row = ctk.CTkFrame(table, fg_color="transparent")
+        header_row.pack(fill="x", pady=(2, 6))
         for i, h in enumerate(["Command", "Enabled", "Visible", "Permission"]):
             ctk.CTkLabel(header_row, text=h, font=("Segoe UI", 9, "bold"),
-                         anchor="w", width=90 if i == 0 else 60).pack(side="left", padx=4)
+                         text_color=TEXT,
+                         anchor="w", width=140 if i == 0 else 88).pack(side="left", padx=4)
 
         self._tools_cmd_widgets = {}
         for cmd in _COMMAND_LIST:
             policy = self._tools_cmd_policy.get(cmd, {})
             if not isinstance(policy, dict):
                 policy = {}
-            row = ctk.CTkFrame(scroll, fg_color="transparent")
-            row.pack(fill="x", padx=4, pady=1)
+            row = ctk.CTkFrame(table, fg_color=PANEL_BG_SOFT, corner_radius=7)
+            row.pack(fill="x", pady=3)
 
-            ctk.CTkLabel(row, text=f"/{cmd}", font=("Segoe UI", 9), anchor="w",
-                         width=90).pack(side="left", padx=4)
+            ctk.CTkLabel(row, text=f"/{cmd}", font=("Segoe UI", 10), text_color=TEXT,
+                         anchor="w", width=140).pack(side="left", padx=(10, 4), pady=6)
 
             en_var = ctk.BooleanVar(value=bool(policy.get("enabled", True)))
-            ctk.CTkCheckBox(row, variable=en_var, text="", width=20).pack(side="left", padx=4)
+            ctk.CTkCheckBox(row, variable=en_var, text="", width=42).pack(side="left", padx=(4, 46))
 
             vis_var = ctk.BooleanVar(value=bool(policy.get("visible", True)))
-            ctk.CTkCheckBox(row, variable=vis_var, text="", width=20).pack(side="left", padx=4)
+            ctk.CTkCheckBox(row, variable=vis_var, text="", width=42).pack(side="left", padx=(4, 46))
 
             perm_var = ctk.StringVar(value=str(policy.get("permission", "everyone")))
             ctk.CTkComboBox(row, variable=perm_var, values=_PERMISSION_LEVELS,
-                            state="readonly", font=("Segoe UI", 9), width=100).pack(side="left", padx=4)
+                            state="readonly", font=("Segoe UI", 9), width=150).pack(side="left", padx=4)
 
             self._tools_cmd_widgets[cmd] = (en_var, vis_var, perm_var)
 
     def _build_tools_ai_tools(self, parent: ctk.CTkFrame) -> None:
-        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-        scroll._scrollbar.grid_remove()
-
         tp_default = ToolPolicy()
         self._tools_ai_auto_var = ctk.StringVar(value=", ".join(self._tools_tool_policy.get("ai_auto_tools", tp_default.ai_auto_tools)))
         self._tools_cmd_tools_var = ctk.StringVar(value=", ".join(self._tools_tool_policy.get("command_tools", tp_default.command_tools)))
@@ -666,13 +871,13 @@ class TelegramSetupCenter:
             ("Require Owner", "These tools need owner role", self._tools_req_owner_var),
         ]
         for title, sub, var in sections:
-            section = ctk.CTkFrame(scroll, fg_color="transparent")
-            section.pack(fill="x", pady=4)
+            section = ctk.CTkFrame(parent, fg_color=PANEL_BG_SOFT, corner_radius=7)
+            section.pack(fill="x", pady=5)
             ctk.CTkLabel(section, text=title, font=("Segoe UI", 10, "bold"),
-                         anchor="w").pack(anchor="w")
+                         text_color=TEXT, anchor="w").pack(anchor="w", padx=10, pady=(8, 0))
             ctk.CTkLabel(section, text=sub, font=("Segoe UI", 8),
-                         text_color=("#888888", "#888888"), anchor="w").pack(anchor="w")
-            ctk.CTkEntry(section, textvariable=var, font=("Segoe UI", 9)).pack(fill="x", pady=(2, 0))
+                         text_color=MUTED, anchor="w").pack(anchor="w", padx=10)
+            ctk.CTkEntry(section, textvariable=var, font=("Segoe UI", 9)).pack(fill="x", padx=10, pady=(4, 10))
 
     def _tools_save(self) -> None:
         cmd_policy = {}
@@ -795,39 +1000,46 @@ class TelegramSetupCenter:
         if parent is None:
             parent = self.cards_area
         ok = card_data["ok"]
-        card_bg = "#0f2820" if ok else "#281414"
+        card_bg = CARD_OK_BG if ok else CARD_ERR_BG
         accent_color = GREEN if ok else RED
-        icon_text = "\u2713" if ok else "\u2717"
+        status_bg = "#123B2F" if ok else "#3B1C22"
 
-        card = ctk.CTkFrame(parent, fg_color=card_bg, corner_radius=8, height=LAYOUT["CARD_H"])
+        card = ctk.CTkFrame(
+            parent,
+            fg_color=card_bg,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+            height=LAYOUT["CARD_H"],
+        )
         card.grid_propagate(False)
 
         card.columnconfigure(0, weight=0)
-        card.columnconfigure(1, weight=0)
-        card.columnconfigure(2, weight=1)
-        card.columnconfigure(3, weight=0)
+        card.columnconfigure(1, weight=1)
+        card.columnconfigure(2, weight=0)
+        card.rowconfigure(0, weight=1)
+        card.rowconfigure(1, weight=1)
 
         card._accent = ctk.CTkFrame(card, fg_color=accent_color, width=5, corner_radius=0)
-        card._accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 10))
-
-        card._icon_lbl = ctk.CTkLabel(card, text=icon_text,
-                                      font=("Segoe UI", 14, "bold"),
-                                      text_color=accent_color)
-        card._icon_lbl.grid(row=0, column=1, rowspan=2, padx=(0, 6))
+        card._accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 14))
 
         ctk.CTkLabel(card, text=card_data["title"],
-                     font=("Segoe UI", 10, "bold"), anchor="w").grid(
-            row=0, column=2, sticky="w", pady=(6, 0))
+                     font=("Segoe UI", 13, "bold"), text_color=TEXT,
+                     anchor="w").grid(row=0, column=1, sticky="sw", pady=(14, 0))
 
         card._subtitle_lbl = ctk.CTkLabel(card, text=card_data.get("subtitle", ""),
-                                          font=("Segoe UI", 9),
-                                          text_color=("#888888", "#888888"), anchor="w")
-        card._subtitle_lbl.grid(row=1, column=2, sticky="w", pady=(0, 6))
+                                          font=("Segoe UI", 10),
+                                          text_color="#A7B0BC", anchor="w")
+        card._subtitle_lbl.grid(row=1, column=1, sticky="nw", pady=(2, 14))
 
         card._status_lbl = ctk.CTkLabel(card, text=card_data.get("status", ""),
                                         font=("Segoe UI", 9, "bold"),
-                                        text_color=accent_color)
-        card._status_lbl.grid(row=0, column=3, rowspan=2, sticky="e", padx=(0, 16))
+                                        fg_color=status_bg,
+                                        text_color=accent_color,
+                                        corner_radius=7,
+                                        width=76,
+                                        height=28)
+        card._status_lbl.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 16))
 
         return card
 
@@ -835,11 +1047,11 @@ class TelegramSetupCenter:
         for widget, data in zip(self._card_widgets, self._card_data):
             ok = data["ok"]
             color = GREEN if ok else RED
+            status_bg = "#123B2F" if ok else "#3B1C22"
             widget._subtitle_lbl.configure(text=data.get("subtitle", ""))
-            widget._status_lbl.configure(text=data.get("status", ""), text_color=color)
-            widget._icon_lbl.configure(text="\u2713" if ok else "\u2717", text_color=color)
+            widget._status_lbl.configure(text=data.get("status", ""), fg_color=status_bg, text_color=color)
             widget._accent.configure(fg_color=color)
-            widget.configure(fg_color="#0f2820" if ok else "#281414")
+            widget.configure(fg_color=CARD_OK_BG if ok else CARD_ERR_BG)
 
     def _rebuild_cards(self) -> None:
         for w in self._card_widgets:
@@ -895,8 +1107,6 @@ class TelegramSetupCenter:
         model_present = bool(telegram and telegram.provider and telegram.model)
         model_label = f"{telegram.provider} / {telegram.model}" if model_present else ""
         allowed_count = len(telegram.allowed_chat_ids) if telegram else 0
-        owner_count = len(telegram.owner_chat_ids) if telegram else 0
-        admin_count = len(telegram.admin_chat_ids) if telegram else 0
         tp = telegram.tool_policy if telegram else None
         tool_count = (len(tp.ai_auto_tools) + len(tp.command_tools)) if tp else 0
         access_label = f"Allowed: {allowed_count} \u2022 Tools: {tool_count}"
@@ -957,6 +1167,7 @@ class TelegramSetupCenter:
         else:
             self._update_cards()
         self._update_header()
+        self._update_dashboard_summary()
 
     def _append_log(self, line: str) -> None:
         self._log_lines.append(line)
@@ -1629,7 +1840,6 @@ class DetailsDialog:
         self.dialog.grab_set()
         self.dialog.resizable(True, True)
 
-        import tkinter as tk
         from tkinter import ttk
 
         main = ctk.CTkFrame(self.dialog, fg_color="transparent")

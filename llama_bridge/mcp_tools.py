@@ -2351,8 +2351,8 @@ def _provider_pool_entry(provider: Any, model: str, alias_name: str | None) -> d
 
 def _rank_provider_candidates(pool: list[dict[str, Any]], *, role: str, used_counts: dict[str, int]) -> list[dict[str, Any]]:
     preferences = {
-        "web": {"haiku", "small_fast", "sonnet"},
-        "wiki": {"haiku", "small_fast", "sonnet"},
+        "web": {"haiku", "sonnet"},
+        "wiki": {"haiku", "sonnet"},
         "verify": {"sonnet", "opus", "haiku"},
         "fixer": {"opus", "sonnet", "haiku"},
         "general": {"sonnet", "haiku", "opus"},

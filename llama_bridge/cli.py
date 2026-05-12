@@ -34,13 +34,11 @@ from .config import (
     load_config,
     codex_model_error,
     copilot_cli_model_error,
-    kilo_model_error,
     openclaw_model_error,
     opencode_model_error,
     pi_model_error,
     resolve_codex_model,
     resolve_copilot_cli_model,
-    resolve_kilo_model,
     resolve_openclaw_model,
     resolve_opencode_model,
     resolve_pi_model,
@@ -581,6 +579,7 @@ def main() -> None:
                 model_override=args.model,
                 pi_args=args.pi_args,
                 install_pi=not args.no_install_pi,
+                dev=args.dev,
             )
             return
         if args.command == "claude":
@@ -591,6 +590,7 @@ def main() -> None:
                 _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
                 args.claude_args,
                 install_claude=not args.no_install_claude,
+                dev=args.dev,
             )
             return
         if args.command == "codex":
@@ -603,6 +603,7 @@ def main() -> None:
                 model_override=args.model,
                 codex_args=args.codex_args,
                 install_codex=not args.no_install_codex,
+                dev=args.dev,
             )
             return
         if args.command == "copilot":
@@ -615,6 +616,7 @@ def main() -> None:
                 model_override=args.model,
                 copilot_args=args.copilot_args,
                 install_copilot=not args.no_install_copilot,
+                dev=args.dev,
             )
             return
         if args.command == "opencode":
@@ -628,6 +630,7 @@ def main() -> None:
                 opencode_args=args.opencode_args,
                 install_opencode=not args.no_install_opencode,
                 project_config=args.project_config,
+                dev=args.dev,
             )
             return
         if args.command == "openclaw":
@@ -656,6 +659,7 @@ def main() -> None:
                 provider_override=args.provider,
                 model_override=args.model,
                 install_poolside=not args.no_install_poolside,
+                dev=args.dev,
             )
             return
         if args.command == "poolside-acp-proxy":
@@ -967,6 +971,11 @@ def _build_parser() -> argparse.ArgumentParser:
     pi_cmd.add_argument("--provider", help="provider name from env.yml to use for Pi")
     pi_cmd.add_argument("--model", help="model name to use for Pi")
     pi_cmd.add_argument(
+        "--dev",
+        action="store_true",
+        help="show llama bridge launcher setup and server startup details",
+    )
+    pi_cmd.add_argument(
         "--no-install-pi",
         action="store_true",
         help="do not install Pi automatically if it is missing",
@@ -984,6 +993,11 @@ def _build_parser() -> argparse.ArgumentParser:
     claude_cmd.add_argument("--config")
     claude_cmd.add_argument("--pid-file")
     claude_cmd.add_argument("--log-file")
+    claude_cmd.add_argument(
+        "--dev",
+        action="store_true",
+        help="show llama bridge launcher setup and server startup details",
+    )
     claude_cmd.add_argument(
         "--no-install-claude",
         action="store_true",
@@ -1005,6 +1019,11 @@ def _build_parser() -> argparse.ArgumentParser:
     codex_cmd.add_argument("--provider", help="provider name from env.yml to use for Codex")
     codex_cmd.add_argument("--model", help="model name to use for Codex")
     codex_cmd.add_argument(
+        "--dev",
+        action="store_true",
+        help="show llama bridge launcher setup and server startup details",
+    )
+    codex_cmd.add_argument(
         "--no-install-codex",
         action="store_true",
         help="do not install Codex automatically if it is missing",
@@ -1025,6 +1044,11 @@ def _build_parser() -> argparse.ArgumentParser:
     copilot_cmd.add_argument("--provider", help="provider name from env.yml to use for Copilot CLI")
     copilot_cmd.add_argument("--model", help="model name to use for Copilot CLI")
     copilot_cmd.add_argument(
+        "--dev",
+        action="store_true",
+        help="show llama bridge launcher setup and server startup details",
+    )
+    copilot_cmd.add_argument(
         "--no-install-copilot",
         action="store_true",
         help="do not install Copilot CLI automatically if it is missing",
@@ -1044,6 +1068,11 @@ def _build_parser() -> argparse.ArgumentParser:
     opencode_cmd.add_argument("--log-file")
     opencode_cmd.add_argument("--provider", help="provider name from env.yml to use for OpenCode")
     opencode_cmd.add_argument("--model", help="model name to use for OpenCode")
+    opencode_cmd.add_argument(
+        "--dev",
+        action="store_true",
+        help="show llama bridge launcher setup and server startup details",
+    )
     opencode_cmd.add_argument(
         "--no-install-opencode",
         action="store_true",
@@ -1111,6 +1140,11 @@ def _build_parser() -> argparse.ArgumentParser:
     poolside_cmd.add_argument("--config")
     poolside_cmd.add_argument("--provider", help="provider name from env.yml to use for Poolside")
     poolside_cmd.add_argument("--model", help="model name to use for Poolside")
+    poolside_cmd.add_argument(
+        "--dev",
+        action="store_true",
+        help="show llama bridge launcher setup and server startup details",
+    )
     poolside_cmd.add_argument(
         "--no-install-poolside",
         action="store_true",
@@ -1252,7 +1286,6 @@ def _cmd_setup(config_path: Path, install_system: bool = False) -> None:
 def _cmd_configure(config_path: Path) -> None:
     import yaml
 
-    merge_missing_config_fields(config_path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
 
     _title("llama configure")
@@ -1293,7 +1326,7 @@ def _cmd_configure(config_path: Path) -> None:
 
     if _prompt_yes_no("Point Claude-style aliases to this provider/model?", default=True):
         aliases = raw.setdefault("anthropic_models", {})
-        for alias_name in ("haiku", "sonnet", "opus", "small_fast"):
+        for alias_name in ("haiku", "sonnet", "opus"):
             aliases[alias_name] = {"provider": selected_provider, "model": model_value}
 
     for section_name in ("pi", "codex", "copilot_cli", "opencode", "openclaw", "poolside", "telegram"):
@@ -1369,7 +1402,6 @@ def _cmd_configure(config_path: Path) -> None:
 def _cmd_bot_setup(config_path: Path) -> None:
     import yaml
 
-    merge_missing_config_fields(config_path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     providers = raw.setdefault("providers", {})
     provider_names = list(providers.keys())
@@ -1812,6 +1844,7 @@ def _cmd_start(
     log_path: Path,
     idle_timeout_seconds: int = 0,
     idle_after_file: Path | None = None,
+    verbose: bool = True,
 ) -> None:
     ensure_default_dirs(pid_path.parent)
     ensure_default_dirs(log_path.parent)
@@ -1819,18 +1852,21 @@ def _cmd_start(
     cfg = load_config(config_path)
     already_running, running_url = _server_is_running(config_path, pid_path)
     if _is_running(pid_path):
-        _print_state("run", f"llama server is already running with pid {pid_path.read_text().strip()}", "32")
+        if verbose:
+            _print_state("run", f"llama server is already running with pid {pid_path.read_text().strip()}", "32")
         _write_active_server_state(config_path, pid_path, log_path)
         return
     if already_running and running_url is not None:
-        _print_state("run", f"llama server is already running at {running_url}", "32")
+        if verbose:
+            _print_state("run", f"llama server is already running at {running_url}", "32")
         _write_active_server_state(config_path, pid_path, log_path)
         return
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("", encoding="utf-8")
     (config_path.parent / "llama.dev.log").write_text("", encoding="utf-8")
-    _title("llama start")
+    if verbose:
+        _title("llama start")
     if os.name == "nt":
         process_id = _start_windows_background(
             config_path,
@@ -1838,21 +1874,25 @@ def _cmd_start(
             idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
         )
-        _pause_with_spinner("starting background server", 1)
+        if verbose:
+            _pause_with_spinner("starting background server", 1)
+        else:
+            time.sleep(1)
         if not _pid_alive(process_id):
             _print_state("fail", f"llama failed to start, see log: {log_path}", "31")
             return
         pid_path.write_text(str(process_id), encoding="utf-8")
         _write_active_server_state(config_path, pid_path, log_path)
-        _print_state("ok", f"llama started in background on pid {process_id}", "32")
-        _kv_rows([("log", str(log_path)), ("logs", "llama logs")])
-        if idle_timeout_seconds == 0:
-            _print_note("Server will stay up until you run `llama stop`.")
-        else:
-            _print_note(f"Server will stop after {_format_idle_duration(idle_timeout_seconds)} of inactivity.")
-        openwebui_port = _try_openwebui_port(config_path)
-        if openwebui_port is not None:
-            _print_note(f"LLM-only (no tools) server on {_server_url(cfg.server.host, openwebui_port)} for Open Web UI")
+        if verbose:
+            _print_state("ok", f"llama started in background on pid {process_id}", "32")
+            _kv_rows([("log", str(log_path)), ("logs", "llama logs")])
+            if idle_timeout_seconds == 0:
+                _print_note("Server will stay up until you run `llama stop`.")
+            else:
+                _print_note(f"Server will stop after {_format_idle_duration(idle_timeout_seconds)} of inactivity.")
+            openwebui_port = _try_openwebui_port(config_path)
+            if openwebui_port is not None:
+                _print_note(f"LLM-only (no tools) server on {_server_url(cfg.server.host, openwebui_port)} for Open Web UI")
         return
 
     with log_path.open("a", encoding="utf-8") as handle:
@@ -1867,21 +1907,25 @@ def _cmd_start(
             start_new_session=True,
             env=env,
         )
-    _pause_with_spinner("starting background server", 1)
+    if verbose:
+        _pause_with_spinner("starting background server", 1)
+    else:
+        time.sleep(1)
     if process.poll() is not None:
         _print_state("fail", f"llama failed to start, see log: {log_path}", "31")
         return
     pid_path.write_text(str(process.pid), encoding="utf-8")
     _write_active_server_state(config_path, pid_path, log_path)
-    _print_state("ok", f"llama started in background on pid {process.pid}", "32")
-    _kv_rows([("log", str(log_path)), ("logs", "llama logs")])
-    if idle_timeout_seconds == 0:
-        _print_note("Server will stay up until you run `llama stop`.")
-    else:
-        _print_note(f"Server will stop after {_format_idle_duration(idle_timeout_seconds)} of inactivity.")
-    openwebui_port = _try_openwebui_port(config_path)
-    if openwebui_port is not None:
-        _print_note(f"LLM-only (no tools) server on {_server_url(cfg.server.host, openwebui_port)} for Open Web UI")
+    if verbose:
+        _print_state("ok", f"llama started in background on pid {process.pid}", "32")
+        _kv_rows([("log", str(log_path)), ("logs", "llama logs")])
+        if idle_timeout_seconds == 0:
+            _print_note("Server will stay up until you run `llama stop`.")
+        else:
+            _print_note(f"Server will stop after {_format_idle_duration(idle_timeout_seconds)} of inactivity.")
+        openwebui_port = _try_openwebui_port(config_path)
+        if openwebui_port is not None:
+            _print_note(f"LLM-only (no tools) server on {_server_url(cfg.server.host, openwebui_port)} for Open Web UI")
 
 
 def _try_openwebui_port(config_path: Path) -> int | None:
@@ -2128,7 +2172,7 @@ def _cmd_openapi_validate(config_path: Path) -> None:
             print(f"  {_style('*', '31')} {err}")
     else:
         path_count = len(spec["paths"])
-        _print_state("ok", f"OpenAPI spec is valid", "32")
+        _print_state("ok", "OpenAPI spec is valid", "32")
         _kv_rows([
             ("version", spec.get("openapi", "unknown")),
             ("title", spec.get("info", {}).get("title", "unknown")),
@@ -3446,6 +3490,7 @@ def _cmd_pi(
     model_override: str | None,
     pi_args: list[str],
     install_pi: bool = True,
+    dev: bool = False,
 ) -> None:
     _ensure_setup(config_path)
     config = load_config(config_path)
@@ -3454,7 +3499,8 @@ def _cmd_pi(
     if not server_running:
         idle_after_file = pid_path.parent / "llama.pi.closed"
         idle_after_file.unlink(missing_ok=True)
-        _print_state("start", "llama server is not running, starting it for Pi", "36")
+        if dev:
+            _print_state("start", "llama server is not running, starting it for Pi", "36")
         idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
@@ -3462,14 +3508,17 @@ def _cmd_pi(
             log_path,
             idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
+            verbose=dev,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note(_idle_timeout_note("Pi", idle_timeout_seconds))
+        if dev:
+            _print_note(_idle_timeout_note("Pi", idle_timeout_seconds))
     else:
         idle_after_file = None
-        _print_state("run", "using existing llama server", "32")
+        if dev:
+            _print_state("run", "using existing llama server", "32")
 
     provider_name = provider_override or config.pi.provider
     if provider_name not in config.providers:
@@ -3483,19 +3532,20 @@ def _cmd_pi(
     pi_executable = _ensure_pi(install=install_pi, package=config.pi.install_package)
     shell_path = _ensure_pi_shell(install=install_pi)
     models_path, settings_path = _write_pi_settings(config, provider_name, model, shell_path)
-    _ensure_pi_extensions(config)
+    _ensure_pi_extensions(config, verbose=dev)
 
-    _title("llama pi")
-    _print_state("ok", "Pi configuration is ready", "32")
-    _kv_rows(
-        [
-            ("provider", provider_name),
-            ("model", model),
-            ("models", str(models_path)),
-            ("settings", str(settings_path)),
-            *([("shell", shell_path)] if shell_path else []),
-        ]
-    )
+    if dev:
+        _title("llama pi")
+        _print_state("ok", "Pi configuration is ready", "32")
+        _kv_rows(
+            [
+                ("provider", provider_name),
+                ("model", model),
+                ("models", str(models_path)),
+                ("settings", str(settings_path)),
+                *([("shell", shell_path)] if shell_path else []),
+            ]
+        )
 
     passthrough_args = pi_args
     if passthrough_args and passthrough_args[0] == "--":
@@ -3573,27 +3623,29 @@ def _write_json(path: Path, data: dict) -> None:
         ) from exc
 
 
-def _ensure_claude_tool_plugin(config, config_path: Path) -> Path:
+def _ensure_claude_tool_plugin(config, config_path: Path, verbose: bool = True) -> Path:
     plugin_dir = config_path.parent / "plugins" / "llama_bridge_tools_claude"
     _write_claude_tool_plugin(plugin_dir, config)
     short_commands_dir = _write_claude_short_commands()
-    _print_state("ok", f"Claude Code llama bridge tools plugin: {plugin_dir}", "32")
-    _print_state("ok", f"Claude Code short slash commands: {short_commands_dir}", "32")
+    if verbose:
+        _print_state("ok", f"Claude Code llama bridge tools plugin: {plugin_dir}", "32")
+        _print_state("ok", f"Claude Code short slash commands: {short_commands_dir}", "32")
     return plugin_dir
 
 
-def _ensure_codex_tool_extension(config) -> tuple[Path, Path]:
+def _ensure_codex_tool_extension(config, verbose: bool = True) -> tuple[Path, Path]:
     codex_config_path = Path(os.path.expanduser(config.codex.config_path))
     codex_config_path.parent.mkdir(parents=True, exist_ok=True)
     plugin_dir = codex_config_path.parent / "plugins" / "llama_bridge_tools"
     _write_codex_tool_plugin(plugin_dir, config)
     _write_codex_mcp_config(codex_config_path, config)
-    _print_state("ok", f"Codex llama bridge tools plugin: {plugin_dir}", "32")
-    _print_state("ok", f"Codex MCP tools config: {codex_config_path}", "32")
+    if verbose:
+        _print_state("ok", f"Codex llama bridge tools plugin: {plugin_dir}", "32")
+        _print_state("ok", f"Codex MCP tools config: {codex_config_path}", "32")
     return plugin_dir, codex_config_path
 
 
-def _ensure_copilot_tool_extension(config) -> Path:
+def _ensure_copilot_tool_extension(config, verbose: bool = True) -> Path:
     config_path = Path(os.path.expanduser("~/.copilot/mcp-config.json"))
     config_path.parent.mkdir(parents=True, exist_ok=True)
     data = _read_json_object(config_path)
@@ -3611,8 +3663,9 @@ def _ensure_copilot_tool_extension(config) -> Path:
     }
     data["mcpServers"] = servers
     _write_json(config_path, data)
-    _print_state("ok", f"Copilot CLI MCP tools config: {config_path}", "32")
-    _verify_mcp_server_tools(config)
+    if verbose:
+        _print_state("ok", f"Copilot CLI MCP tools config: {config_path}", "32")
+        _verify_mcp_server_tools(config)
     return config_path
 
 
@@ -3945,7 +3998,7 @@ def _write_claude_command_file(
 def _bridge_command_body(input_label: str, action: str) -> str:
     return "\n".join(
         [
-            f"User input: $ARGUMENTS",
+            "User input: $ARGUMENTS",
             "",
             f"If the user input is empty, ask the user for the {input_label} in one short question and wait for their answer. Do not call tools yet.",
             "",
@@ -3969,6 +4022,7 @@ def _cmd_claude(
     log_path: Path,
     claude_args: list[str],
     install_claude: bool = True,
+    dev: bool = False,
 ) -> None:
     _ensure_setup(config_path)
     config = load_config(config_path)
@@ -3979,7 +4033,8 @@ def _cmd_claude(
     if not server_running:
         idle_after_file = pid_path.parent / "llama.claude.closed"
         idle_after_file.unlink(missing_ok=True)
-        _print_state("start", "llama server is not running, starting it for Claude Code", "36")
+        if dev:
+            _print_state("start", "llama server is not running, starting it for Claude Code", "36")
         idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
@@ -3987,20 +4042,23 @@ def _cmd_claude(
             log_path,
             idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
+            verbose=dev,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note(_idle_timeout_note("Claude Code", idle_timeout_seconds))
+        if dev:
+            _print_note(_idle_timeout_note("Claude Code", idle_timeout_seconds))
     else:
         idle_after_file = None
-        _print_state("run", "using existing llama server", "32")
+        if dev:
+            _print_state("run", "using existing llama server", "32")
 
     passthrough_args = claude_args
     if passthrough_args and passthrough_args[0] == "--":
         passthrough_args = passthrough_args[1:]
 
-    plugin_dir = _ensure_claude_tool_plugin(config, config_path)
+    plugin_dir = _ensure_claude_tool_plugin(config, config_path, verbose=dev)
 
     command = [
         claude_executable,
@@ -4024,6 +4082,7 @@ def _cmd_codex(
     model_override: str | None,
     codex_args: list[str],
     install_codex: bool = True,
+    dev: bool = False,
 ) -> None:
     _ensure_setup(config_path)
     config = load_config(config_path)
@@ -4032,7 +4091,8 @@ def _cmd_codex(
     if not server_running:
         idle_after_file = pid_path.parent / "llama.codex.closed"
         idle_after_file.unlink(missing_ok=True)
-        _print_state("start", "llama server is not running, starting it for Codex", "36")
+        if dev:
+            _print_state("start", "llama server is not running, starting it for Codex", "36")
         idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
@@ -4040,14 +4100,17 @@ def _cmd_codex(
             log_path,
             idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
+            verbose=dev,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note(_idle_timeout_note("Codex", idle_timeout_seconds))
+        if dev:
+            _print_note(_idle_timeout_note("Codex", idle_timeout_seconds))
     else:
         idle_after_file = None
-        _print_state("run", "using existing llama server", "32")
+        if dev:
+            _print_state("run", "using existing llama server", "32")
 
     provider_name = provider_override or config.codex.provider
     if provider_name not in config.providers:
@@ -4064,21 +4127,22 @@ def _cmd_codex(
 
     codex_executable = _ensure_codex(install=install_codex, package=config.codex.install_package)
     codex_config_path, model_catalog_path = _write_codex_config(config, provider_name, model)
-    codex_plugin_dir, codex_mcp_config_path = _ensure_codex_tool_extension(config)
+    codex_plugin_dir, codex_mcp_config_path = _ensure_codex_tool_extension(config, verbose=dev)
 
-    _title("llama codex")
-    _print_state("ok", "Codex configuration is ready", "32")
-    _kv_rows(
-        [
-            ("provider", provider_name),
-            ("model", model),
-            ("profile", config.codex.profile),
-            ("config", str(codex_config_path)),
-            ("models", str(model_catalog_path)),
-            ("tools plugin", str(codex_plugin_dir)),
-            ("mcp tools", str(codex_mcp_config_path)),
-        ]
-    )
+    if dev:
+        _title("llama codex")
+        _print_state("ok", "Codex configuration is ready", "32")
+        _kv_rows(
+            [
+                ("provider", provider_name),
+                ("model", model),
+                ("profile", config.codex.profile),
+                ("config", str(codex_config_path)),
+                ("models", str(model_catalog_path)),
+                ("tools plugin", str(codex_plugin_dir)),
+                ("mcp tools", str(codex_mcp_config_path)),
+            ]
+        )
 
     passthrough_args = codex_args
     if passthrough_args and passthrough_args[0] == "--":
@@ -4101,6 +4165,7 @@ def _cmd_copilot(
     model_override: str | None,
     copilot_args: list[str],
     install_copilot: bool = True,
+    dev: bool = False,
 ) -> None:
     _ensure_setup(config_path)
     config = load_config(config_path)
@@ -4109,7 +4174,8 @@ def _cmd_copilot(
     if not server_running:
         idle_after_file = pid_path.parent / "llama.copilot.closed"
         idle_after_file.unlink(missing_ok=True)
-        _print_state("start", "llama server is not running, starting it for Copilot CLI", "36")
+        if dev:
+            _print_state("start", "llama server is not running, starting it for Copilot CLI", "36")
         idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
@@ -4117,14 +4183,17 @@ def _cmd_copilot(
             log_path,
             idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
+            verbose=dev,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note(_idle_timeout_note("Copilot CLI", idle_timeout_seconds))
+        if dev:
+            _print_note(_idle_timeout_note("Copilot CLI", idle_timeout_seconds))
     else:
         idle_after_file = None
-        _print_state("run", "using existing llama server", "32")
+        if dev:
+            _print_state("run", "using existing llama server", "32")
 
     provider_name = provider_override or config.copilot_cli.provider
     if provider_name not in config.providers:
@@ -4145,21 +4214,22 @@ def _cmd_copilot(
         install=install_copilot,
         package=config.copilot_cli.install_package,
     )
-    copilot_mcp_config_path = _ensure_copilot_tool_extension(config)
+    copilot_mcp_config_path = _ensure_copilot_tool_extension(config, verbose=dev)
 
-    _title("llama copilot")
-    _print_state("ok", "Copilot CLI environment is ready", "32")
-    _kv_rows(
-        [
-            ("provider", provider_name),
-            ("model", model),
-            ("base url", f"{_server_url(config.server.host, config.server.port)}/v1"),
-            ("wire api", config.copilot_cli.wire_api),
-            ("prompt tokens", config.copilot_cli.max_prompt_tokens),
-            ("output tokens", config.copilot_cli.max_output_tokens),
-            ("mcp tools", str(copilot_mcp_config_path)),
-        ]
-    )
+    if dev:
+        _title("llama copilot")
+        _print_state("ok", "Copilot CLI environment is ready", "32")
+        _kv_rows(
+            [
+                ("provider", provider_name),
+                ("model", model),
+                ("base url", f"{_server_url(config.server.host, config.server.port)}/v1"),
+                ("wire api", config.copilot_cli.wire_api),
+                ("prompt tokens", config.copilot_cli.max_prompt_tokens),
+                ("output tokens", config.copilot_cli.max_output_tokens),
+                ("mcp tools", str(copilot_mcp_config_path)),
+            ]
+        )
 
     passthrough_args = copilot_args
     if passthrough_args and passthrough_args[0] == "--":
@@ -4191,6 +4261,7 @@ def _cmd_opencode(
     opencode_args: list[str],
     install_opencode: bool = True,
     project_config: bool = False,
+    dev: bool = False,
 ) -> None:
     _ensure_setup(config_path)
     config = load_config(config_path)
@@ -4199,7 +4270,8 @@ def _cmd_opencode(
     if not server_running:
         idle_after_file = pid_path.parent / "llama.opencode.closed"
         idle_after_file.unlink(missing_ok=True)
-        _print_state("start", "llama server is not running, starting it for OpenCode", "36")
+        if dev:
+            _print_state("start", "llama server is not running, starting it for OpenCode", "36")
         idle_timeout_seconds = _configured_idle_timeout_seconds(config)
         _cmd_start(
             config_path,
@@ -4207,14 +4279,17 @@ def _cmd_opencode(
             log_path,
             idle_timeout_seconds=idle_timeout_seconds,
             idle_after_file=idle_after_file,
+            verbose=dev,
         )
         server_running, _running_url = _server_is_running(config_path, pid_path)
         if not server_running:
             raise SystemExit(f"llama server failed to start, see log: {log_path}")
-        _print_note(_idle_timeout_note("OpenCode", idle_timeout_seconds))
+        if dev:
+            _print_note(_idle_timeout_note("OpenCode", idle_timeout_seconds))
     else:
         idle_after_file = None
-        _print_state("run", "using existing llama server", "32")
+        if dev:
+            _print_state("run", "using existing llama server", "32")
 
     provider_name = provider_override or config.opencode.provider
     if provider_name not in config.providers:
@@ -4236,15 +4311,16 @@ def _cmd_opencode(
         package=config.opencode.install_package,
     )
 
-    _title("llama opencode")
-    _print_state("ok", "OpenCode environment is ready", "32")
-    _kv_rows(
-        [
-            ("provider", provider_name),
-            ("model", model),
-            ("base url", f"{_server_url(config.server.host, config.server.port)}/v1"),
-        ]
-    )
+    if dev:
+        _title("llama opencode")
+        _print_state("ok", "OpenCode environment is ready", "32")
+        _kv_rows(
+            [
+                ("provider", provider_name),
+                ("model", model),
+                ("base url", f"{_server_url(config.server.host, config.server.port)}/v1"),
+            ]
+        )
 
     passthrough_args = opencode_args
     if passthrough_args and passthrough_args[0] == "--":
@@ -4395,6 +4471,7 @@ def _cmd_poolside(
     provider_override: str | None = None,
     model_override: str | None = None,
     install_poolside: bool = True,
+    dev: bool = False,
 ) -> None:
     _ensure_setup(config_path)
     config = load_config(config_path)
@@ -4425,7 +4502,8 @@ def _cmd_poolside(
         if not server_running:
             idle_after_file = pid_path.parent / "llama.poolside.closed"
             idle_after_file.unlink(missing_ok=True)
-            _print_state("start", "llama server is not running, starting it for Poolside", "36")
+            if dev:
+                _print_state("start", "llama server is not running, starting it for Poolside", "36")
             idle_timeout_seconds = _configured_idle_timeout_seconds(config)
             _cmd_start(
                 config_path,
@@ -4433,14 +4511,17 @@ def _cmd_poolside(
                 log_path,
                 idle_timeout_seconds=idle_timeout_seconds,
                 idle_after_file=idle_after_file,
+                verbose=dev,
             )
             server_running, _running_url = _server_is_running(config_path, pid_path)
             if not server_running:
                 raise SystemExit(f"llama server failed to start, see log: {log_path}")
-            _print_note(_idle_timeout_note("Poolside", idle_timeout_seconds))
+            if dev:
+                _print_note(_idle_timeout_note("Poolside", idle_timeout_seconds))
         else:
             idle_after_file = None
-            _print_state("run", "using existing llama server", "32")
+            if dev:
+                _print_state("run", "using existing llama server", "32")
     else:
         idle_after_file = None
 
@@ -4453,20 +4534,21 @@ def _cmd_poolside(
     poolside_settings_path = _write_poolside_config(config)
     poolside_skill_path = _write_poolside_bridge_skill(config)
 
-    _title("llama poolside")
-    _print_state("ok", "Poolside environment is ready", "32")
-    _kv_rows(
-        [
-            ("provider", provider_name),
-            ("model", model),
-            ("api url", poolside_api_url or standalone_base_url or "poolside default"),
-            ("auth", "configured" if poolside_api_key else "stored login or interactive setup"),
-            ("agent config", str(poolside_agent_config_path)),
-            ("config", str(poolside_settings_path)),
-            ("skill", str(poolside_skill_path)),
-            ("command", poolside_executable),
-        ]
-    )
+    if dev:
+        _title("llama poolside")
+        _print_state("ok", "Poolside environment is ready", "32")
+        _kv_rows(
+            [
+                ("provider", provider_name),
+                ("model", model),
+                ("api url", poolside_api_url or standalone_base_url or "poolside default"),
+                ("auth", "configured" if poolside_api_key else "stored login or interactive setup"),
+                ("agent config", str(poolside_agent_config_path)),
+                ("config", str(poolside_settings_path)),
+                ("skill", str(poolside_skill_path)),
+                ("command", poolside_executable),
+            ]
+        )
 
     passthrough_args = poolside_args
     if passthrough_args and passthrough_args[0] == "--":
@@ -5268,18 +5350,18 @@ def _ensure_copilot_cli(install: bool = True, package: str = "@github/copilot") 
     return copilot_executable
 
 
-def _ensure_pi_extensions(config) -> list[Path]:
+def _ensure_pi_extensions(config, verbose: bool = True) -> list[Path]:
     paths: list[Path] = []
-    web_tools = _ensure_pi_web_tools(config)
+    web_tools = _ensure_pi_web_tools(config, verbose=verbose)
     if web_tools is not None:
         paths.append(web_tools)
-    deep_research = _ensure_pi_deep_research(config)
+    deep_research = _ensure_pi_deep_research(config, verbose=verbose)
     if deep_research is not None:
         paths.append(deep_research)
     return paths
 
 
-def _ensure_pi_web_tools(config) -> Path | None:
+def _ensure_pi_web_tools(config, verbose: bool = True) -> Path | None:
     if not config.pi.web_search:
         return
     config_dir = Path(os.path.expanduser(config.pi.config_dir))
@@ -5300,11 +5382,12 @@ def _ensure_pi_web_tools(config) -> Path | None:
     else:
         settings_data.pop("packages", None)
     _write_json(settings_path, settings_data)
-    _print_state("ok", f"Pi web search tools: {extension_path}", "32")
+    if verbose:
+        _print_state("ok", f"Pi web search tools: {extension_path}", "32")
     return extension_path
 
 
-def _ensure_pi_deep_research(config) -> Path | None:
+def _ensure_pi_deep_research(config, verbose: bool = True) -> Path | None:
     if not config.pi.web_search:
         return
     config_dir = Path(os.path.expanduser(config.pi.config_dir))
@@ -5314,7 +5397,8 @@ def _ensure_pi_deep_research(config) -> Path | None:
     content = _pi_deep_research_extension(config)
     if not extension_path.exists() or extension_path.read_text(encoding="utf-8") != content:
         extension_path.write_text(content, encoding="utf-8")
-    _print_state("ok", f"Pi deep research extension: {extension_path}", "32")
+    if verbose:
+        _print_state("ok", f"Pi deep research extension: {extension_path}", "32")
     return extension_path
 
 
@@ -5873,7 +5957,6 @@ def _pi_deep_research_extension(config) -> str:
     api_key = config.server.auth_token
     timeout_seconds = _deep_research_timeout_seconds(config)
     timeout_ms = int(timeout_seconds * 1000)
-    search_timeout = _deep_research_timeout_seconds(config, "search_agent_timeout_seconds")
     verify_timeout = int(_deep_research_timeout_seconds(config, "verify_agent_timeout_seconds"))
     return f"""import type {{ ExtensionAPI }} from "@mariozechner/pi-coding-agent";
 import {{ Type }} from "typebox";
@@ -7542,7 +7625,6 @@ def _cmd_openwebui_test_search(config_path: Path, query: str) -> None:
 def _cmd_openwebui_configure(config_path: Path) -> None:
     import yaml
     from .openwebui_config import VALID_SEARCH_PROVIDERS
-    merge_missing_config_fields(config_path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     owui_raw = raw.setdefault("openwebui", {})
 

@@ -26,3 +26,5 @@ llama.telegram.pid
 .vscode
 .claude
 llama.claude.closed
+uv.lock
+.ruff_cache

@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import os
 import json
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import yaml
 
 from .config import (
     BridgeConfig,
     OpenWebUIConfig,
-    ExternalToolProviderConfig,
     DEFAULT_CONFIG_PATH,
     load_config,
 )
@@ -455,9 +455,6 @@ def get_conda_python_path() -> str | None:
 
 
 # ── Open WebUI Discovery ─────────────────────────────────────────────────
-
-from dataclasses import dataclass, field
-
 
 @dataclass
 class OpenWebUIDiscovery:

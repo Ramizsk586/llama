@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import importlib.util
 import os
 import re
 import shutil
@@ -242,9 +243,6 @@ anthropic_models:
     provider: ollama_cloud
     model: gemma4:31b
   opus:
-    provider: ollama_cloud
-    model: gemma4:31b
-  small_fast:
     provider: ollama_cloud
     model: gemma4:31b
 
@@ -800,7 +798,7 @@ def resolve_pi_model(
     if provider.default_model:
         return provider.default_model
 
-    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    preferred_aliases = ("sonnet", "opus", "haiku")
     for alias_name in preferred_aliases:
         alias = config.anthropic_models.get(alias_name)
         if alias and alias.provider == selected_provider and alias.model:
@@ -837,7 +835,7 @@ def resolve_codex_model(
     if provider.default_model:
         return provider.default_model
 
-    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    preferred_aliases = ("sonnet", "opus", "haiku")
     for alias_name in preferred_aliases:
         alias = config.anthropic_models.get(alias_name)
         if alias and alias.provider == selected_provider and alias.model:
@@ -874,7 +872,7 @@ def resolve_copilot_cli_model(
     if provider.default_model:
         return provider.default_model
 
-    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    preferred_aliases = ("sonnet", "opus", "haiku")
     for alias_name in preferred_aliases:
         alias = config.anthropic_models.get(alias_name)
         if alias and alias.provider == selected_provider and alias.model:
@@ -913,7 +911,7 @@ def resolve_opencode_model(
     if provider.default_model:
         return provider.default_model
 
-    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    preferred_aliases = ("sonnet", "opus", "haiku")
     for alias_name in preferred_aliases:
         alias = config.anthropic_models.get(alias_name)
         if alias and alias.provider == selected_provider and alias.model:
@@ -950,7 +948,7 @@ def resolve_openclaw_model(
     if provider.default_model:
         return provider.default_model
 
-    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    preferred_aliases = ("sonnet", "opus", "haiku")
     for alias_name in preferred_aliases:
         alias = config.anthropic_models.get(alias_name)
         if alias and alias.provider == selected_provider and alias.model:
@@ -987,7 +985,7 @@ def resolve_kilo_model(
     if provider.default_model:
         return provider.default_model
 
-    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    preferred_aliases = ("sonnet", "opus", "haiku")
     for alias_name in preferred_aliases:
         alias = config.anthropic_models.get(alias_name)
         if alias and alias.provider == selected_provider and alias.model:
@@ -1024,7 +1022,7 @@ def resolve_openai_model(
     if provider.default_model:
         return provider.default_model
 
-    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    preferred_aliases = ("sonnet", "opus", "haiku")
     for alias_name in preferred_aliases:
         alias = config.anthropic_models.get(alias_name)
         if alias and alias.provider == selected_provider and alias.model:
@@ -1078,20 +1076,19 @@ def write_claude_api_settings(
 
     server = server or ServerConfig()
     aliases = aliases or {}
-    small_fast_model = "small_fast" if "small_fast" in aliases else "haiku"
-    haiku_model = "haiku" if "haiku" in aliases else small_fast_model
+    haiku_model = "haiku"
     sonnet_model = "sonnet" if "sonnet" in aliases else haiku_model
     opus_model = "opus" if "opus" in aliases else sonnet_model
 
     settings = _read_json_object(path) if path.exists() else {}
     env = dict(settings.get("env") or {})
+    env.pop("ANTHROPIC_SMALL_FAST_MODEL", None)
     env.update(
         {
             "ANTHROPIC_BASE_URL": f"http://{server.host}:{server.port}",
             "ANTHROPIC_AUTH_TOKEN": server.auth_token,
             "API_TIMEOUT_MS": "3000000",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "ANTHROPIC_SMALL_FAST_MODEL": small_fast_model,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model,
@@ -1173,9 +1170,8 @@ def write_default_config(
 
 def merge_missing_config_fields(path: Path) -> tuple[Path, bool]:
     try:
-        from ruamel.yaml import YAML
-        from ruamel.yaml.comments import CommentedMap
-
+        if importlib.util.find_spec("ruamel.yaml") is None:
+            raise ImportError
         _merge_missing_config_fields_ruamel(path)
         return path, True
     except ImportError:
@@ -1279,8 +1275,6 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             f"Missing {config_path.name}. Created {example_path.name}; edit it, "
             f"add your API keys/models, then rename it to {config_path.name}."
         )
-    # Merge any new fields from the template into existing config
-    merge_missing_config_fields(config_path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     raw = _expand_env(raw)
 
@@ -1704,7 +1698,7 @@ def _default_vs_copilot_models(
         ]
     if pi.model:
         return [{"name": pi.model, "provider": pi.provider, "model": pi.model}]
-    for alias_name in ("sonnet", "opus", "haiku", "small_fast"):
+    for alias_name in ("sonnet", "opus", "haiku"):
         alias = aliases.get(alias_name)
         if alias and alias.model:
             return [{"name": alias.model, "provider": alias.provider, "model": alias.model}]

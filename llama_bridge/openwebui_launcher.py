@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_PATH, load_config, BridgeConfig
+from .config import DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_PATH, load_config
 from .openwebui_config import (
     OpenWebUIConfig,
     OpenWebUIDiscovery,
@@ -20,10 +20,8 @@ from .openwebui_config import (
     write_pid,
     clear_pid,
     pid_alive,
-    check_openwebui_installed,
     discover_openwebui,
     get_effective_ports,
-    save_openwebui_config,
     get_conda_python_path,
 )
 
