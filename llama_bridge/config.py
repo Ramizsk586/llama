@@ -1202,6 +1202,18 @@ def _merge_missing_config_fields_ruamel(path: Path) -> None:
 
         if existing_data is None:
             existing_data = CommentedMap()
+        if template_data is None:
+            template_data = CommentedMap()
+
+        comment_line_count = sum(
+            1 for line in existing_text.splitlines() if line.lstrip().startswith("#")
+        )
+        if comment_line_count < 10:
+            _overlay_config_values(template_data, existing_data)
+            output = io.StringIO()
+            yaml_parser.dump(template_data, output)
+            path.write_text(output.getvalue(), encoding="utf-8")
+            return
 
         _merge_commented_maps(existing_data, template_data)
 
@@ -1222,6 +1234,19 @@ def _merge_commented_maps(existing: Any, template: Any) -> None:
             existing[key] = template_value
         elif isinstance(template_value, dict) and isinstance(existing.get(key), dict):
             _merge_commented_maps(existing[key], template_value)
+
+
+def _overlay_config_values(template: Any, existing: Any) -> Any:
+    """Overlay existing values onto the commented template, keeping template comments."""
+    if not isinstance(template, dict) or not isinstance(existing, dict):
+        return existing
+
+    for key, existing_value in existing.items():
+        if key in template and isinstance(template.get(key), dict) and isinstance(existing_value, dict):
+            _overlay_config_values(template[key], existing_value)
+        else:
+            template[key] = existing_value
+    return template
 
 
 def _merge_missing_config_fields_yaml(path: Path) -> None:

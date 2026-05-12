@@ -1497,11 +1497,14 @@ def _with_bridge_tools(
     """
     if registry is None:
         return payload
+    if payload.get("tools"):
+        # Client-supplied tools belong to the caller (for example Claude Agent
+        # SDK MCP tools). Do not merge or execute bridge tools into that request:
+        # the bridge should translate the model's tool_calls back to Anthropic
+        # tool_use blocks so the caller can run them.
+        return _with_streaming_client_tool_instructions(payload)
     query = _latest_user_text(payload.get("messages", []))[:500]
     request_profile = _request_tool_profile(config, provider_config, payload.get("model"), query)
-
-    if bool(payload.get("stream")) and payload.get("tools"):
-        return _with_streaming_client_tool_instructions(payload)
 
     if tool_manager and config and config.tools.management_enabled:
         return _with_managed_tools(payload, registry, config, tool_manager, request_profile)
@@ -2030,6 +2033,20 @@ async def _chat_completion_with_bridge_tools(
                 bridge_calls.append(call)
             else:
                 other_calls.append(call)
+
+        if other_calls:
+            _write_dev_log(
+                config,
+                "client_tool_calls_passthrough",
+                {
+                    "round": _round,
+                    "tools": [
+                        (call.get("function") or {}).get("name") or ""
+                        for call in other_calls
+                    ],
+                },
+            )
+            return data
 
         # Handle management tools internally
         if management_calls:
