@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -26,6 +26,11 @@ except ImportError:
 GREEN = "#4FD1A1"
 RED = "#FF6B6B"
 YELLOW = "#F2C66D"
+ACCENT = "#5BA4F5"
+DARK_BG = "#0D1117"
+SIDEBAR_BG = "#161B22"
+CARD_OK_BG = "#0f2820"
+CARD_ERR_BG = "#281414"
 
 LAYOUT = {
     "PAD": 20,
@@ -160,18 +165,386 @@ class LlamaControlCenter:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
-        main = ctk.CTkFrame(self.root, fg_color="transparent")
-        main.pack(fill="both", expand=True)
+        self._nav_stack: list[str] = []
+        self._current_view: str = "home"
 
-        self._build_header(main)
+        self.root.configure(fg_color=DARK_BG)
+
+        sidebar = ctk.CTkFrame(self.root, width=200, fg_color=SIDEBAR_BG, corner_radius=0)
+        sidebar.pack(side="left", fill="y", padx=0, pady=0)
+        sidebar.pack_propagate(False)
+
+        ctk.CTkLabel(sidebar, text="Llama Bridge",
+                     font=("Segoe UI", 14, "bold"), anchor="w",
+                     fg_color=SIDEBAR_BG, text_color="#e6edf3").pack(
+            fill="x", padx=16, pady=(20, 8))
+
+        sep = ctk.CTkFrame(sidebar, fg_color="#30363d", height=1)
+        sep.pack(fill="x", padx=12, pady=(0, 12))
+
+        self._sidebar_buttons: dict[str, ctk.CTkButton] = {}
+        nav_items = [
+            ("dashboard", "Dashboard", self._show_dashboard),
+            ("server", "Server", self._show_server),
+            ("providers", "Providers", self._show_providers),
+            ("cli_tools", "CLI Tools", self._show_cli_tools),
+            ("models", "Models", self._show_models),
+            ("logs", "Logs", self._show_logs),
+            ("details", "Details", self._show_details),
+            ("api_spec", "API Spec", self._show_api_spec),
+        ]
+        for key, label, cmd in nav_items:
+            btn = ctk.CTkButton(
+                sidebar, text=label, command=cmd,
+                font=("Segoe UI", 11), height=36,
+                fg_color="transparent", text_color="#c9d1d9",
+                hover_color="#21262d", corner_radius=6,
+                anchor="w",
+            )
+            btn.pack(fill="x", padx=8, pady=1)
+            self._sidebar_buttons[key] = btn
+
+        self._active_nav = "dashboard"
+
+        main = ctk.CTkFrame(self.root, fg_color="transparent")
+        main.pack(side="left", fill="both", expand=True)
 
         sep = ctk.CTkFrame(main, fg_color=GREEN, height=2, corner_radius=0)
         sep.pack(fill="x", padx=PAD, pady=(4, 0))
 
-        self._build_footer(main)
-
         self.cards_area = ctk.CTkFrame(main, fg_color="transparent")
         self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(PAD // 2, 0))
+
+        self._content_area = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(PAD // 2, 0))
+        self._content_area._scrollbar.grid_remove()
+        self._content_area.pack_forget()
+
+        self._footer_frame = ctk.CTkFrame(main, fg_color="transparent")
+        self._footer_frame.pack_forget()
+
+        self._cards_area_visible = True
+        self._build_header(main)
+        self._show_dashboard()
+
+    def _set_active_nav(self, key: str) -> None:
+        for k, btn in self._sidebar_buttons.items():
+            if k == key:
+                btn.configure(fg_color="#238636", text_color="#ffffff")
+            else:
+                btn.configure(fg_color="transparent", text_color="#c9d1d9")
+
+    def _show_dashboard(self) -> None:
+        self._current_view = "home"
+        self._nav_stack.clear()
+        self._cards_area_visible = True
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(PAD // 2, 0))
+        self._content_area.pack_forget()
+        self._footer_frame.pack_forget()
+        self._set_active_nav("dashboard")
+        self.subtitle_label.configure(text=self._subtitle_text())
+
+    def _show_panel(self, panel: str) -> None:
+        self._current_view = panel
+        self._cards_area_visible = False
+        self.cards_area.pack_forget()
+        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(PAD // 2, 0))
+        for w in self._content_area.winfo_children():
+            w.destroy()
+        self._footer_frame.pack_forget()
+
+        if panel == "logs":
+            self.subtitle_label.configure(text="Server Logs")
+            from llama_bridge.telegram_launcher import follow_telegram_log
+            log_lines = follow_telegram_log(self.config_path)
+            text = ctk.CTkTextbox(self._content_area, font=("Consolas", 10), wrap="none")
+            text.pack(fill="both", expand=True)
+            for line in log_lines[-200:]:
+                text.insert("end", line + "\n")
+            text.see("end")
+        elif panel == "details":
+            self.subtitle_label.configure(text="Server Details")
+            from llama_bridge.telegram_launcher import follow_telegram_log
+            text = ctk.CTkTextbox(self._content_area, font=("Segoe UI", 10), wrap="word")
+            text.pack(fill="both", expand=True)
+            lines = follow_telegram_log(self.config_path)
+            for line in lines[-50:]:
+                text.insert("end", line + "\n")
+        elif panel == "api_spec":
+            self.subtitle_label.configure(text="OpenAPI Specification")
+            text = ctk.CTkTextbox(self._content_area, font=("Consolas", 10), wrap="none")
+            text.pack(fill="both", expand=True)
+            try:
+                from llama_bridge.cli import _generate_openapi_spec
+                from .config import load_config
+                config = load_config(self.config_path)
+                import json
+                spec = _generate_openapi_spec(config)
+                text.insert("0.0", json.dumps(spec, indent=2, ensure_ascii=False))
+            except Exception as exc:
+                text.insert("0.0", f"Error: {exc}")
+
+    def _show_server(self) -> None:
+        self._nav_stack.append("server")
+        self._set_active_nav("server")
+        self._show_panel("server")
+        self._build_server_form()
+
+    def _build_server_form(self) -> None:
+        import yaml
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        server_raw = raw.setdefault("server", {})
+
+        form = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        form.pack(fill="x", padx=0, pady=(0, 16))
+
+        fields = [
+            ("host", "Host", str(server_raw.get("host", "127.0.0.1"))),
+            ("port", "Port", str(server_raw.get("port", 8089))),
+            ("auth_token", "Auth Token", str(server_raw.get("auth_token", ""))),
+            ("idle_timeout", "Idle Timeout (s)", str(server_raw.get("idle_timeout_seconds", 180))),
+            ("openwebui_port", "Open WebUI Port", str(server_raw.get("openwebui_port", ""))),
+        ]
+        self._server_vars = {}
+        for key, label, default in fields:
+            row = ctk.CTkFrame(form, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(row, text=label, font=("Segoe UI", 10), width=140, anchor="w").pack(side="left")
+            var = ctk.StringVar(value=default)
+            entry = ctk.CTkEntry(row, textvariable=var, font=("Segoe UI", 10))
+            entry.pack(side="left", fill="x", expand=True)
+            if key == "auth_token":
+                entry.configure(show="*")
+            self._server_vars[key] = var
+        self._server_raw_ref = server_raw
+        self._server_raw_top = raw
+
+        btn_row = ctk.CTkFrame(form, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(12, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._save_server,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right")
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444")).pack(side="right", padx=(8, 0))
+
+    def _save_server(self) -> None:
+        import yaml
+        self._server_raw_ref["host"] = self._server_vars["host"].get().strip()
+        self._server_raw_ref["port"] = int(self._server_vars["port"].get())
+        token = self._server_vars["auth_token"].get().strip()
+        if token:
+            self._server_raw_ref["auth_token"] = token
+        self._server_raw_ref["idle_timeout_seconds"] = int(self._server_vars["idle_timeout"].get())
+        ow = self._server_vars["openwebui_port"].get().strip()
+        if ow:
+            self._server_raw_ref["openwebui_port"] = int(ow)
+        self.config_path.write_text(yaml.safe_dump(self._server_raw_top, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self._on_config_saved()
+
+    def _show_providers(self) -> None:
+        self._nav_stack.append("providers")
+        self._set_active_nav("providers")
+        self._show_panel("providers")
+        self._build_providers_form()
+
+    def _build_providers_form(self) -> None:
+        import yaml
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        self._prov_raw = raw.setdefault("providers", {})
+
+        scroll = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
+
+        TYPE_OPTIONS = [
+            "openai", "ollama_cloud", "ollama_local", "lm_studio",
+            "groq", "gemini", "cohere", "mistral", "deepseek",
+            "openrouter", "openai_compatible", "nvidia_nim", "sarvamai",
+        ]
+
+        self._prov_vars: dict[str, dict[str, Any]] = {}
+        for name, prov in sorted(self._prov_raw.items()):
+            card = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            card.pack(fill="x", pady=6, padx=4)
+            ctk.CTkLabel(card, text=name, font=("Segoe UI", 12, "bold"), anchor="w").pack(anchor="w", padx=12, pady=(8, 4))
+            ctk.CTkFrame(card, fg_color="#333333", height=1).pack(fill="x", padx=12, pady=(0, 6))
+
+            entries: dict[str, Any] = {}
+            for label in ["type", "base_url", "api_key", "default_model"]:
+                row = ctk.CTkFrame(card, fg_color="transparent")
+                row.pack(fill="x", padx=12, pady=2)
+                ctk.CTkLabel(row, text=label.replace("_", " ").title(), font=("Segoe UI", 9), anchor="w", width=100).pack(side="left")
+                if label == "type":
+                    var = ctk.StringVar(value=str(prov.get(label, TYPE_OPTIONS[0])))
+                    ctk.CTkComboBox(row, variable=var, values=TYPE_OPTIONS, state="readonly", font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True)
+                else:
+                    var = ctk.StringVar(value=str(prov.get(label, "")))
+                    show = "*" if label == "api_key" else ""
+                    ctk.CTkEntry(row, textvariable=var, font=("Segoe UI", 9), show=show).pack(side="left", fill="x", expand=True)
+                entries[label] = var
+            self._prov_vars[name] = entries
+
+        btn_row = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._save_providers,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right")
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444")).pack(side="right", padx=(8, 0))
+
+    def _save_providers(self) -> None:
+        import yaml
+        for name, entries in self._prov_vars.items():
+            prov = self._prov_raw.setdefault(name, {})
+            for label, var in entries.items():
+                val = var.get().strip()
+                if val:
+                    prov[label] = val
+        self.config_path.write_text(yaml.safe_dump(self._prov_raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self._on_config_saved()
+
+    def _show_cli_tools(self) -> None:
+        self._nav_stack.append("cli_tools")
+        self._set_active_nav("cli_tools")
+        self._show_panel("cli_tools")
+        self._build_cli_tools_form()
+
+    def _build_cli_tools_form(self) -> None:
+        import yaml
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        provider_names = list(raw.get("providers", {}).keys())
+        self._cli_raw = raw
+
+        scroll = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
+
+        tool_keys = [
+            ("Pi", "pi", ["provider", "model"]),
+            ("Codex", "codex", ["provider", "model", "config_path"]),
+            ("Copilot CLI", "copilot_cli", ["provider", "model"]),
+            ("OpenCode", "opencode", ["provider", "model"]),
+            ("OpenClaw", "openclaw", ["provider", "model"]),
+            ("Poolside", "poolside", ["provider", "model"]),
+        ]
+        self._cli_vars: dict[str, dict[str, Any]] = {}
+        for tool_name, section_key, fields in tool_keys:
+            section = raw.get(section_key, {}) or {}
+            card = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            card.pack(fill="x", pady=6, padx=4)
+            ctk.CTkLabel(card, text=tool_name, font=("Segoe UI", 12, "bold"), anchor="w").pack(anchor="w", padx=12, pady=(8, 4))
+
+            entries = {}
+            for field in fields:
+                row = ctk.CTkFrame(card, fg_color="transparent")
+                row.pack(fill="x", padx=12, pady=2)
+                ctk.CTkLabel(row, text=field.replace("_", " ").title(), font=("Segoe UI", 9), anchor="w", width=100).pack(side="left")
+                if field == "provider":
+                    var = ctk.StringVar(value=str(section.get(field, provider_names[0] if provider_names else "")))
+                    ctk.CTkComboBox(row, variable=var, values=provider_names, state="readonly", font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True)
+                else:
+                    var = ctk.StringVar(value=str(section.get(field, "")))
+                    ctk.CTkEntry(row, textvariable=var, font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True)
+                entries[field] = var
+            self._cli_vars[section_key] = entries
+
+        btn_row = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._save_cli_tools,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right")
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444")).pack(side="right", padx=(8, 0))
+
+    def _save_cli_tools(self) -> None:
+        import yaml
+        for section_key, entries in self._cli_vars.items():
+            section = self._cli_raw.setdefault(section_key, {})
+            for field, var in entries.items():
+                val = var.get().strip()
+                if val:
+                    section[field] = val
+        self.config_path.write_text(yaml.safe_dump(self._cli_raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self._on_config_saved()
+
+    def _show_models(self) -> None:
+        self._nav_stack.append("models")
+        self._set_active_nav("models")
+        self._show_panel("models")
+        self._build_models_form()
+
+    def _build_models_form(self) -> None:
+        import yaml
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        provider_names = list(raw.get("providers", {}).keys())
+        self._models_raw = raw.setdefault("anthropic_models", {})
+
+        scroll = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
+
+        self._models_vars: dict[str, tuple[ctk.StringVar, ctk.StringVar]] = {}
+        for alias, value in sorted(self._models_raw.items()):
+            if not isinstance(value, dict):
+                value = {}
+            row = ctk.CTkFrame(scroll, fg_color=("#1a1a1a", "#1a1a1a"), corner_radius=8)
+            row.pack(fill="x", pady=4, padx=4)
+            ctk.CTkLabel(row, text=alias, font=("Segoe UI", 10, "bold"), width=90, anchor="w").pack(side="left", padx=(10, 4), pady=8)
+            prov_var = ctk.StringVar(value=str(value.get("provider", provider_names[0] if provider_names else "")))
+            ctk.CTkComboBox(row, variable=prov_var, values=provider_names, state="readonly", font=("Segoe UI", 9), width=150).pack(side="left", padx=(4, 6), pady=8)
+            model_var = ctk.StringVar(value=str(value.get("model", "")))
+            ctk.CTkEntry(row, textvariable=model_var, font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True, padx=4, pady=8)
+            self._models_vars[alias] = (prov_var, model_var)
+
+        btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(8, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._save_models,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right")
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444")).pack(side="right", padx=(8, 0))
+
+    def _save_models(self) -> None:
+        import yaml
+        for alias, (prov_var, model_var) in self._models_vars.items():
+            entry = self._models_raw.setdefault(alias, {})
+            entry["provider"] = prov_var.get()
+            model = model_var.get().strip()
+            if model:
+                entry["model"] = model
+        self.config_path.write_text(yaml.safe_dump(self._models_raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self._on_config_saved()
+
+    def _on_config_saved(self) -> None:
+        self._refresh_all()
+        self._show_dashboard()
+
+    def _open_server_config(self) -> None:
+        self._show_server()
+
+    def _open_providers(self) -> None:
+        self._show_providers()
+
+    def _open_cli_tools(self) -> None:
+        self._show_cli_tools()
+
+    def _open_models(self) -> None:
+        self._show_models()
+
+    def _open_logs(self) -> None:
+        self._nav_stack.append("logs")
+        self._set_active_nav("logs")
+        self._show_panel("logs")
+
+    def _open_details(self) -> None:
+        self._nav_stack.append("details")
+        self._set_active_nav("details")
+        self._show_panel("details")
+
+    def _open_api_spec(self) -> None:
+        self._nav_stack.append("api_spec")
+        self._set_active_nav("api_spec")
+        self._show_panel("api_spec")
 
     def _build_header(self, parent: ctk.CTkFrame) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -179,6 +552,9 @@ class LlamaControlCenter:
 
         header.columnconfigure(0, weight=1)
         header.columnconfigure(1, weight=0)
+        header.columnconfigure(2, weight=0)
+
+        self._header_row = header
 
         title_frame = ctk.CTkFrame(header, fg_color="transparent")
         title_frame.grid(row=0, column=0, sticky="w")
@@ -210,6 +586,7 @@ class LlamaControlCenter:
 
     def _build_footer(self, parent: ctk.CTkFrame) -> None:
         footer = ctk.CTkFrame(parent, fg_color="transparent")
+        self._footer_frame = footer
         footer.pack(fill="x", side="bottom", pady=(6, 12), padx=PAD)
 
         for col in range(3):
@@ -220,8 +597,9 @@ class LlamaControlCenter:
                         ("\U0001f310 Providers", self._open_providers)]),
             ("Tools", [("\U0001f528 CLI Tools", self._open_cli_tools),
                        ("\U0001f916 Models", self._open_models)]),
-            ("Info", [("\U0001f4cb Logs", self._open_logs),
-                      ("\u2139 Details", self._open_details)]),
+            ("Info", [("\U0001f4cb Logs", self._show_logs),
+                      ("\u2139 Details", self._show_details),
+                      ("\U0001f511 API Spec", self._show_api_spec)]),
         ]
         self.util_btns: dict[str, ctk.CTkButton] = {}
         for col, (panel_title, buttons) in enumerate(sub_panels):
@@ -242,6 +620,7 @@ class LlamaControlCenter:
                 "\U0001f916 Models": "Manage anthropic model aliases",
                 "\U0001f4cb Logs": "View server logs",
                 "\u2139 Details": "Show full technical details",
+                "\U0001f511 API Spec": "View and export OpenAPI specification",
             }
             for i, (text, cmd) in enumerate(buttons):
                 btn = ctk.CTkButton(
@@ -405,33 +784,55 @@ class LlamaControlCenter:
     def _on_close(self) -> None:
         self._stopped.set()
         try:
-            self.root.destroy()
+            if self.status == AppStatus.RUNNING:
+                self.root.withdraw()
+            else:
+                self.root.destroy()
         except Exception:
             pass
 
     def run(self) -> None:
         self.root.mainloop()
 
-    def _open_server_config(self) -> None:
-        ServerConfigDialog(self.root, self.config_path, self._on_config_saved)
+    def _go_home(self) -> None:
+        self._current_view = "home"
+        self._nav_stack.clear()
+        self._back_btn.pack_forget()
+        self._footer_frame.pack(fill="x", side="bottom", pady=(6, 12), padx=PAD)
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(PAD // 2, 0))
+        self._content_area.pack_forget()
+        self._set_active_nav("dashboard")
 
-    def _open_providers(self) -> None:
-        ProvidersDialog(self.root, self.config_path, self._on_config_saved)
+    def _show_logs(self) -> None:
+        self._nav_stack.append("logs")
+        self._show_panel("logs")
+        self._set_active_nav("logs")
 
-    def _open_cli_tools(self) -> None:
-        CliToolsDialog(self.root, self.config_path, self._on_config_saved)
+    def _show_details(self) -> None:
+        self._nav_stack.append("details")
+        self._show_panel("details")
+        self._set_active_nav("details")
 
-    def _open_models(self) -> None:
-        ModelsDialog(self.root, self.config_path, self._on_config_saved)
+    def _show_api_spec(self) -> None:
+        self._nav_stack.append("api_spec")
+        self._show_panel("api_spec")
+        self._set_active_nav("api_spec")
 
     def _on_config_saved(self) -> None:
         self._refresh_all()
 
     def _open_logs(self) -> None:
-        LogsDialog(self.root, self.config_path)
+        self._nav_stack.append("logs")
+        self._show_panel("logs")
+        self._set_active_nav("logs")
 
-    def _open_details(self) -> None:
-        DetailsDialog(self.root, self.config_path)
+
+def launch_gui(config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+    if not HAS_TK:
+        print("customtkinter is not available.")
+        sys.exit(1)
+    app = LlamaControlCenter(config_path)
+    app.run()
 
 
 class ServerConfigDialog:
@@ -442,6 +843,7 @@ class ServerConfigDialog:
         self.dialog.title("Server Config")
         self.dialog.geometry("420x300")
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self._load()
@@ -544,6 +946,7 @@ class ProvidersDialog:
         self.dialog.title("Providers")
         self.dialog.geometry("820x580")
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self._load()
@@ -565,7 +968,7 @@ class ProvidersDialog:
         TYPE_OPTIONS = [
             "openai", "ollama_cloud", "ollama_local", "lm_studio",
             "groq", "gemini", "cohere", "mistral", "deepseek",
-            "openrouter", "openai_compatible", "nvidia_nim",
+            "openrouter", "openai_compatible", "nvidia_nim", "sarvamai",
         ]
 
         self._entries: dict[str, dict[str, Any]] = {}
@@ -662,6 +1065,7 @@ class CliToolsDialog:
         self.dialog.title("CLI Tools")
         self.dialog.geometry("820x580")
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self._load()
@@ -769,6 +1173,7 @@ class ModelsDialog:
         self.dialog.title("Anthropic Models")
         self.dialog.geometry("600x440")
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self._load()
@@ -845,7 +1250,7 @@ class LogsDialog:
         self.dialog.geometry("740x540")
         self.dialog.minsize(580, 380)
         self.dialog.resizable(True, True)
-        self.dialog.transient(parent)
+
         self._poll_id = None
         self._build()
 
@@ -940,6 +1345,7 @@ class DetailsDialog:
         self.dialog.title("Details")
         self.dialog.geometry("780x540")
         self.dialog.minsize(640, 440)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self.dialog.resizable(True, True)
@@ -1072,3 +1478,132 @@ class DetailsDialog:
         lines = [f"{item.label}: {item.full_value}" for item in items]
         self.dialog.clipboard_clear()
         self.dialog.clipboard_append("\n".join(lines))
+
+
+class ApiSpecDialog:
+    def __init__(self, parent: ctk.CTk, config_path: Path) -> None:
+        self.config_path = config_path
+        self.dialog = ctk.CTkToplevel(parent)
+        self.dialog.title("OpenAPI Specification")
+        self.dialog.geometry("900x620")
+        self.dialog.minsize(700, 400)
+
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        self.dialog.resizable(True, True)
+
+        from tkinter import ttk
+
+        main = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=16, pady=16)
+
+        title_row = ctk.CTkFrame(main, fg_color="transparent")
+        title_row.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(title_row, text="OpenAPI Specification",
+                     font=("Segoe UI", 14, "bold"), anchor="w").pack(side="left")
+        self.status_label = ctk.CTkLabel(title_row, text="",
+                                         font=("Segoe UI", 10),
+                                         text_color=("#888888", "#888888"))
+        self.status_label.pack(side="right")
+
+        self._build_spec()
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        dark_bg = "#1a1a1a"
+        dark_fg = "#e0e0e0"
+        sel_bg = "#2a2a2a"
+        heading_bg = "#222222"
+        heading_fg = "#fafafa"
+        style.configure("Spec.Treeview",
+                        background=dark_bg, foreground=dark_fg,
+                        fieldbackground=dark_bg,
+                        font=("Consolas", 9), rowheight=22, borderwidth=0)
+        style.configure("Spec.Treeview.Heading",
+                        background=heading_bg, foreground=heading_fg,
+                        font=("Segoe UI", 9, "bold"), borderwidth=0)
+        style.map("Spec.Treeview",
+                  background=[("selected", sel_bg)],
+                  foreground=[("selected", dark_fg)])
+        style.layout("Spec.Treeview", [("Spec.Treeview.treearea", {"sticky": "nswe"})])
+
+        tree_frame = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(tree_frame, columns=("method", "path", "summary"), show="headings",
+                                 selectmode="browse", style="Spec.Treeview")
+        self.tree.heading("method", text="Method", anchor="w")
+        self.tree.heading("path", text="Path", anchor="w")
+        self.tree.heading("summary", text="Summary", anchor="w")
+        self.tree.column("method", width=90, minwidth=70, stretch=False)
+        self.tree.column("path", width=250, minwidth=150, stretch=False)
+        self.tree.column("summary", width=400, minwidth=200, stretch=True)
+        self.tree.pack(fill="both", expand=True)
+
+        self._populate_tree()
+
+        btn_row = ctk.CTkFrame(self.dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkButton(btn_row, text="Copy Spec JSON", command=self._copy_spec,
+                      font=("Segoe UI", 9), height=30).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Copy as YAML", command=self._copy_yaml,
+                      font=("Segoe UI", 9), height=30).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Export to File", command=self._export_file,
+                      font=("Segoe UI", 9), height=30).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Close", command=self.dialog.destroy,
+                      font=("Segoe UI", 9), height=30,
+                      fg_color=("#555555", "#444444"),
+                      hover_color=("#666666", "#555555")).pack(side="right", padx=4)
+        self.dialog.bind("<Escape>", lambda e: self.dialog.destroy())
+
+    def _build_spec(self) -> None:
+        try:
+            from llama_bridge.cli import _generate_openapi_spec
+            config = load_config(self.config_path)
+            self.spec = _generate_openapi_spec(config)
+            self.status_label.configure(text="Valid spec", text_color=GREEN)
+        except Exception as exc:
+            self.spec = {}
+            self.status_label.configure(text=f"Error: {exc}", text_color=RED)
+
+    def _populate_tree(self) -> None:
+        paths = self.spec.get("paths", {})
+        for path, methods in sorted(paths.items()):
+            if isinstance(methods, dict):
+                for method, details in methods.items():
+                    if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+                        summary = details.get("summary", "") if isinstance(details, dict) else ""
+                        self.tree.insert("", "end", values=(method.upper(), path, summary))
+
+    def _copy_spec(self) -> None:
+        import json
+        self.dialog.clipboard_clear()
+        self.dialog.clipboard_append(json.dumps(self.spec, indent=2, ensure_ascii=False))
+
+    def _copy_yaml(self) -> None:
+        import yaml
+        self.dialog.clipboard_clear()
+        self.dialog.clipboard_append(yaml.safe_dump(self.spec, sort_keys=False, allow_unicode=False))
+
+    def _export_file(self) -> None:
+        import json
+        import tkinter as tk
+        from tkinter import filedialog
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export OpenAPI Spec",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("YAML files", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if file_path:
+            try:
+                if file_path.endswith((".yaml", ".yml")):
+                    import yaml
+                    content = yaml.safe_dump(self.spec, sort_keys=False, allow_unicode=False)
+                else:
+                    content = json.dumps(self.spec, indent=2, ensure_ascii=False)
+                Path(file_path).write_text(content, encoding="utf-8")
+                self.status_label.configure(text=f"Saved to {Path(file_path).name}", text_color=GREEN)
+            except Exception as exc:
+                self.status_label.configure(text=f"Export error: {exc}", text_color=RED)
+

@@ -2,16 +2,14 @@
   "mcpServers": {
     "llama_bridge_tools": {
       "type": "stdio",
-      "command": "C:\\Users\\skabd\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+      "command": "C:\\Users\\skabd\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
       "args": [
         "-m",
         "llama_bridge.mcp_tools"
       ],
       "env": {
         "LLAMA_BRIDGE_BASE_URL": "http://127.0.0.1:8089",
-        "LLAMA_BRIDGE_API_KEY": "llama",
-        "ANTHROPIC_BASE_URL": "http://127.0.0.1:8089",
-        "ANTHROPIC_API_KEY": "ollama"
+        "LLAMA_BRIDGE_API_KEY": "change-me"
       }
     }
   }

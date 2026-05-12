@@ -66,12 +66,19 @@ def start_telegram_bot(
     log_path = _log_path(config_path)
     log_file = log_path.open("a", encoding="utf-8")
 
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+
     proc = subprocess.Popen(
         cmd,
         stdout=log_file,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        startupinfo=startupinfo,
     )
 
     pid_path = _pid_path(config_path)

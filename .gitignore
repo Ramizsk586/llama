@@ -21,3 +21,8 @@ llama.telegram.active.json
 llama.telegram.log
 openwebui.log
 openwebui_install.log
+llama.telegram.pid
+.venv
+.vscode
+.claude
+llama.claude.closed

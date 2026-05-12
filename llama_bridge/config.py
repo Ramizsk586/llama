@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import re
 import shutil
@@ -16,9 +17,17 @@ def _default_data_dir() -> Path:
         return Path(sys.executable).resolve().parent
 
     package_root = Path(__file__).resolve().parent.parent
-    if (package_root / "pyproject.toml").exists() and (package_root / "env.yml").exists():
+
+    # Prefer CWD if it's the project root (has pyproject.toml)
+    cwd = Path.cwd().resolve()
+    if (cwd / "pyproject.toml").exists():
+        return cwd
+
+    # Use package root if it's the project root (has pyproject.toml)
+    if (package_root / "pyproject.toml").exists():
         return package_root
 
+    # Fallback: launcher directory (pip-installed script)
     if sys.argv and sys.argv[0]:
         launcher_path = Path(sys.argv[0])
         if launcher_path.name.lower() in {"llama", "llama.exe"}:
@@ -40,17 +49,62 @@ DEFAULT_API_SETTINGS_PATH = DEFAULT_CONFIG_DIR / "Api.json"
 DEFAULT_PID_PATH = DEFAULT_CONFIG_DIR / "llama.pid"
 DEFAULT_LOG_PATH = DEFAULT_CONFIG_DIR / "llama.log"
 
-DEFAULT_CONFIG_TEMPLATE = """server:
+DEFAULT_CONFIG_TEMPLATE = """# =============================================================================
+#                       llama -- config.example.yml
+# =============================================================================
+#  Copy this file to env.yml and customize it for your setup:
+#
+#      cp config.example.yml env.yml
+#
+#  Rules:
+#    - Lines starting with # are comments (ignored)
+#    - Values with ${VAR_NAME} are read from environment variables
+#    - Use ${VAR_NAME} for API keys and secrets (never hardcode them)
+#    - Indentation uses 2 spaces (YAML standard)
+# =============================================================================
+
+
+# =============================================================================
+#                           SERVER CONFIG
+# =============================================================================
+#  The bridge HTTP server that proxies AI requests.
+# =============================================================================
+
+server:
+  # Listen address (use 0.0.0.0 to accept remote connections)
   host: 127.0.0.1
+
+  # Listen port
   port: 8089
+
+  # Bearer token required by clients (Authorization: Bearer <token>)
   auth_token: change-me
-  # Auto-started llama servers stop after this many idle seconds.
-  # Set to 0 to keep them running until `llama stop`.
+
+  # Auto-started servers stop after this many idle seconds.
+  # Set to 0 to keep running until `llama stop`.
   idle_timeout_seconds: 180
-  # Optional second port without built-in tools for use with Open Web UI etc.
+
+  # Optional second port without built-in tools (for Open Web UI etc.)
   # openwebui_port: 8090
 
+
+# =============================================================================
+#                          AI PROVIDERS
+# =============================================================================
+#  Each block defines a connection to an AI model backend.
+#  The "type" field selects the API protocol:
+#
+#    openai | ollama_local | ollama_cloud | groq | gemini | cohere
+#    mistral | deepseek | openrouter | lm_studio | nvidia_nim
+#    openai_compatible | sarvamai | kilo | opencode
+#
+#  Use ${VAR_NAME} for sensitive values (API keys, tokens).
+# =============================================================================
+
 providers:
+
+  # -- Local Providers (no API key needed) --------------------------------
+
   ollama_local:
     type: ollama_local
     base_url: http://127.0.0.1:11434/v1
@@ -64,6 +118,8 @@ providers:
     api_key: lm-studio
     supports_tools: true
     default_model: local-model
+
+  # -- Cloud Providers (API key via environment variable) -----------------
 
   ollama_cloud:
     type: ollama_cloud
@@ -140,12 +196,43 @@ providers:
     supports_tools: true
     default_model: openrouter/auto
 
+  # -- Generic / Custom Providers ----------------------------------------
+
   openai_compatible:
     type: openai_compatible
     base_url: https://your-provider.example.com/v1
     api_key: ${CUSTOM_PROVIDER_API_KEY}
     supports_tools: true
     default_model: your-model
+
+  sarvamai:
+    type: sarvamai
+    base_url: https://api.sarvam.ai/v1
+    api_key: ${SARVAM_API_KEY}
+    supports_tools: true
+    default_model: sarvam-30b
+
+  kilo:
+    type: kilo
+    base_url: https://api.kilo.ai/api/gateway
+    api_key: ${KILO_API_KEY}
+    supports_tools: true
+    default_model: kilo-auto/free
+
+  opencode:
+    type: opencode
+    base_url: https://opencode.ai/zen
+    api_key: ${OPENCODE_API_KEY}
+    supports_tools: true
+    default_model: opencode/auto
+
+
+# =============================================================================
+#                       ANTHROPIC MODEL ALIASES
+# =============================================================================
+#  Maps Anthropic-style model names to bridge providers/models.
+#  Used by clients that request Anthropic model names.
+# =============================================================================
 
 anthropic_models:
   haiku:
@@ -161,6 +248,13 @@ anthropic_models:
     provider: ollama_cloud
     model: gemma4:31b
 
+
+# =============================================================================
+#                        INTEGRATION: PI
+# =============================================================================
+#  Configuration for the Pi coding agent.
+# =============================================================================
+
 pi:
   provider: ollama_cloud
   model: gemma4:31b
@@ -169,12 +263,26 @@ pi:
   install_package: "@mariozechner/pi-coding-agent"
   web_search: true
 
+
+# =============================================================================
+#                       INTEGRATION: CODEX
+# =============================================================================
+#  Configuration for OpenAI Codex CLI.
+# =============================================================================
+
 codex:
   provider: ollama_cloud
   model: gemma4:31b
   config_path: ~/.codex/config.toml
   profile: llama_bridge
   install_package: "@openai/codex"
+
+
+# =============================================================================
+#                     INTEGRATION: COPILOT CLI
+# =============================================================================
+#  Configuration for GitHub Copilot CLI (@github/copilot).
+# =============================================================================
 
 copilot_cli:
   provider: ollama_cloud
@@ -184,10 +292,24 @@ copilot_cli:
   max_output_tokens: 2048
   install_package: "@github/copilot"
 
+
+# =============================================================================
+#                      INTEGRATION: OPENCODE
+# =============================================================================
+#  Configuration for the opencode-ai CLI tool.
+# =============================================================================
+
 opencode:
   provider: ollama_cloud
   model: gemma4:31b
   install_package: "opencode-ai"
+
+
+# =============================================================================
+#                      INTEGRATION: OPENCLAW
+# =============================================================================
+#  Configuration for the OpenClaw sandboxed agent.
+# =============================================================================
 
 openclaw:
   provider: ollama_cloud
@@ -198,6 +320,13 @@ openclaw:
   sandbox_backend: docker
   install_package: "openclaw"
 
+
+# =============================================================================
+#                      INTEGRATION: POOLSIDE
+# =============================================================================
+#  Configuration for Poolside AI assistant.
+# =============================================================================
+
 poolside:
   provider: ollama_cloud
   model: gemma4:31b
@@ -207,6 +336,14 @@ poolside:
   config_path: ~/.config/poolside/settings.yaml
   install_command: "curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh"
   windows_install_command: "irm https://downloads.poolside.ai/pool/install.ps1 | iex"
+
+
+# =============================================================================
+#                        TELEGRAM BOT
+# =============================================================================
+#  Optional Telegram bot integration. When enabled, the bridge can
+#  receive and respond to messages via Telegram.
+# =============================================================================
 
 telegram:
   enabled: false
@@ -226,6 +363,8 @@ telegram:
   autonomous_interval_seconds: 1800
   self_evolution_enabled: true
   self_evolution_min_events: 3
+
+  # -- Command permissions ------------------------------------------------
   command_policy:
     help:
       enabled: true
@@ -251,6 +390,8 @@ telegram:
       enabled: true
       visible: false
       permission: admin
+
+  # -- AI tool policy ----------------------------------------------------
   tool_policy:
     ai_auto_tools:
       - datetime_now
@@ -273,16 +414,28 @@ telegram:
       - manim_render
     require_owner_for:
       - shell.execute
+
+  # -- Help menu settings ------------------------------------------------
   telegram_help:
     show_disabled_commands: false
     show_tool_list: false
     show_admin_commands_to_admins_only: true
+
+
+# =============================================================================
+#                            TOOL SYSTEM
+# =============================================================================
+#  Controls the built-in tool management system.
+#  Tools allow AI models to perform actions (web search, file ops, etc.).
+# =============================================================================
 
 tools:
   enabled: true
   expose_http: true
   require_auth: true
   country: India
+
+  # -- Available tool list ------------------------------------------------
   include:
     - shell.execute
     - datetime_now
@@ -295,20 +448,22 @@ tools:
     - source_research
     - image_research
     - verify_sources
-    - master_review
-  # Tool selection and filtering (NEW)
-  max_exposed: 8  # Limit tools in request (after filtering)
-  relevance_filter: true  # Enable relevance-based filtering
-  force_for_keywords: true  # Strongly prefer obvious tools for weather/time/latest/source queries
-  confidence_threshold: 0.5  # Minimum relevance score (0-10)
-  log_outputs: false  # Log tool arguments and results
-  default_search_provider: tavily  # Prefer "tavily" or "serpapi"
+
+  # -- Tool selection & filtering ----------------------------------------
+  max_exposed: 8
+  relevance_filter: true
+  force_for_keywords: true
+  confidence_threshold: 0.5
+  log_outputs: false
+  default_search_provider: tavily
   cache_enabled: true
   cache_ttl_seconds: 300
   tool_system_instructions: null
-  # Pi CLI specific (NEW)
-  pi_system_instructions: null  # Optional custom system instructions
-  # External tool providers
+  pi_system_instructions: null
+
+  # -- External tool providers -------------------------------------------
+
+  # SerpAPI (web search via Google)
   serpapi:
     enabled: false
     api_key: ${SERPAPI_API_KEY}
@@ -316,6 +471,8 @@ tools:
     defaults:
       engine: google
       num: 5
+
+  # Tavily (AI-native search)
   tavily:
     enabled: false
     api_key: ${TAVILY_API_KEY}
@@ -323,110 +480,21 @@ tools:
     defaults:
       search_depth: basic
       max_results: 5
+
+  # Weather (free, no API key needed)
   weather:
     enabled: true
     provider: open_meteo
     base_url: https://api.open-meteo.com/v1/forecast
     geocoding_url: https://geocoding-api.open-meteo.com/v1/search
+
+  # Wikipedia
   wikipedia:
     enabled: true
     language: en
     base_url: https://en.wikipedia.org
-  deep_research:
-    tool_timeout_seconds: 10
-    search_agent_timeout_seconds: 10
-    verify_agent_timeout_seconds: 10
-    source_research_timeout_seconds: 10
-    image_research_timeout_seconds: 10
-    manim_timeout_seconds: 10
 
-master_review:
-  enabled: true
-  run_after_deep_research: true
-  mode: balanced
-  groq:
-    enabled: true
-    base_url: https://api.groq.com/openai/v1
-    model: llama-3.3-70b-versatile
-    api_keys:
-      - ${GROQ_API_KEY_1}
-      - ${GROQ_API_KEY_2}
-      - ${GROQ_API_KEY_3}
-    timeout_seconds: 45
-    max_retries_per_key: 2
-    cooldown_seconds_after_429: 60
-    cooldown_seconds_after_5xx: 20
-    max_parallel_agents: 1
-    requests_per_minute_per_key: 30
-    tokens_per_minute_per_key: 12000
-    requests_per_day_per_key: 1000
-    tokens_per_day_per_key: 100000
-    rate_limit_wait_seconds: 45
-  sub_agents:
-    spelling_grammar: true
-    evidence_validity: true
-    evidence_reliability: true
-    citation_coverage: true
-    neutrality_bias: true
-    logic_consistency: true
-    format_quality: true
-    final_synthesis: true
-  debate:
-    enabled: true
-    rounds: 2
-    require_disagreement: true
-    max_points_per_agent: 8
-  output:
-    return_review_trace: true
-    return_revised_draft: true
-    return_final_llm_instructions: true
-    max_instruction_tokens: 1800
 
-vs_copilot:
-  models:
-    - name: gemma4:31b
-      provider: ollama_cloud
-      model: gemma4:31b
-      context_size: 65536
-      modified_at: "2026-04-02T09:00:00-08:00"
-      size: 1000000000
-      digest: dummy-qwen35-cloud
-    - name: local-llama
-      provider: ollama_local
-      model: llama3.1:8b
-      context_size: 32768
-      modified_at: "2026-04-02T09:00:00-08:00"
-      size: 1000000000
-      digest: dummy-local-llama
-    - name: custom-openai-compatible
-      provider: openai_compatible
-      model: your-model
-      context_size: 65536
-      modified_at: "2026-04-02T09:00:00-08:00"
-      size: 1000000000
-      digest: dummy-custom-model
-
-openwebui:
-  enabled: true
-  host: 127.0.0.1
-  port: 8080
-  bridge_tools_port: null
-  bridge_llm_only_port: null
-  auth_enabled: false
-  auto_login: true
-  hf_token: null
-  openai_base_url_mode: llm_only
-  openwebui_data_dir: null
-  web_search_enabled: true
-  web_search_provider: ollama
-  search_result_count: 3
-  concurrent_requests: 1
-  bypass_embedding_and_retrieval: false
-  bypass_web_loader: false
-  preferred_env_name: omx-open-webui
-  preferred_python: null
-  preferred_command: null
-  auto_discover: true
 """
 
 
@@ -637,16 +705,6 @@ class ExternalToolProviderConfig:
 
 
 @dataclass(slots=True)
-class DeepResearchToolConfig:
-    tool_timeout_seconds: float = 10.0
-    search_agent_timeout_seconds: float = 10.0
-    verify_agent_timeout_seconds: float = 10.0
-    source_research_timeout_seconds: float = 10.0
-    image_research_timeout_seconds: float = 10.0
-    manim_timeout_seconds: float = 10.0
-
-
-@dataclass(slots=True)
 class ToolConfig:
     enabled: bool = True
     expose_http: bool = True
@@ -657,7 +715,6 @@ class ToolConfig:
     tavily: ExternalToolProviderConfig = field(default_factory=ExternalToolProviderConfig)
     weather: ExternalToolProviderConfig = field(default_factory=ExternalToolProviderConfig)
     wikipedia: ExternalToolProviderConfig = field(default_factory=ExternalToolProviderConfig)
-    deep_research: DeepResearchToolConfig = field(default_factory=DeepResearchToolConfig)
     # Tool selection and filtering options
     max_exposed: int = 8  # Maximum tools to expose in a single request (after filtering)
     relevance_filter: bool = True  # Enable relevance-based tool filtering
@@ -682,63 +739,6 @@ class ToolConfig:
     compact_summary_max_chars: int = 160
     full_schema_token_budget: int = 5000
     fallback_to_full_schemas_for_unsupported_clients: bool = True
-
-
-@dataclass(slots=True)
-class MasterGroqConfig:
-    enabled: bool = True
-    base_url: str = "https://api.groq.com/openai/v1"
-    model: str = "llama-3.3-70b-versatile"
-    api_keys: list[str] = field(default_factory=list)
-    timeout_seconds: float = 45.0
-    max_retries_per_key: int = 2
-    cooldown_seconds_after_429: int = 60
-    cooldown_seconds_after_5xx: int = 20
-    max_parallel_agents: int = 1
-    requests_per_minute_per_key: int = 30
-    tokens_per_minute_per_key: int = 12000
-    requests_per_day_per_key: int = 1000
-    tokens_per_day_per_key: int = 100000
-    rate_limit_wait_seconds: int = 45
-
-
-@dataclass(slots=True)
-class MasterSubAgentsConfig:
-    spelling_grammar: bool = True
-    evidence_validity: bool = True
-    evidence_reliability: bool = True
-    citation_coverage: bool = True
-    neutrality_bias: bool = True
-    logic_consistency: bool = True
-    format_quality: bool = True
-    final_synthesis: bool = True
-
-
-@dataclass(slots=True)
-class MasterDebateConfig:
-    enabled: bool = True
-    rounds: int = 2
-    require_disagreement: bool = True
-    max_points_per_agent: int = 8
-
-
-@dataclass(slots=True)
-class MasterOutputConfig:
-    return_review_trace: bool = True
-    return_revised_draft: bool = True
-    return_final_llm_instructions: bool = True
-    max_instruction_tokens: int = 1800
-
-
-@dataclass(slots=True)
-class MasterReviewConfig:
-    enabled: bool = True
-    run_after_deep_research: bool = True
-    mode: str = "balanced"
-    groq: MasterGroqConfig = field(default_factory=MasterGroqConfig)
-    sub_agents: MasterSubAgentsConfig = field(default_factory=MasterSubAgentsConfig)
-    debate: MasterDebateConfig = field(default_factory=MasterDebateConfig)
-    output: MasterOutputConfig = field(default_factory=MasterOutputConfig)
 
 
 @dataclass(slots=True)
@@ -782,7 +782,6 @@ class BridgeConfig:
     telegram: TelegramBotConfig
     vs_copilot_models: list[VsCopilotModel]
     tools: ToolConfig
-    master_review: MasterReviewConfig
     openwebui: OpenWebUIConfig
     source_path: Path
 
@@ -974,6 +973,43 @@ def openclaw_model_error(config: BridgeConfig, provider_name: str | None = None)
     )
 
 
+def resolve_kilo_model(
+    config: BridgeConfig,
+    provider_name: str | None = None,
+    model_override: str | None = None,
+) -> str | None:
+    selected_provider = provider_name or "kilo"
+    provider = config.providers.get(selected_provider)
+    if not provider:
+        return None
+    if model_override:
+        return model_override
+    if provider.default_model:
+        return provider.default_model
+
+    preferred_aliases = ("sonnet", "opus", "haiku", "small_fast")
+    for alias_name in preferred_aliases:
+        alias = config.anthropic_models.get(alias_name)
+        if alias and alias.provider == selected_provider and alias.model:
+            return alias.model
+
+    for alias in config.anthropic_models.values():
+        if alias.provider == selected_provider and alias.model:
+            return alias.model
+
+    return "kilo-auto/free"
+
+
+def kilo_model_error(config: BridgeConfig, provider_name: str | None = None) -> str:
+    selected_provider = provider_name or "kilo"
+    return (
+        "Kilo model is not configured. "
+        f"Config: {config.source_path}. Provider: {selected_provider}. "
+        "Set the provider's default_model in env.yml, configure a model alias "
+        "for that provider, or pass `--model kilo-auto/free` (or any other Kilo model)."
+    )
+
+
 def resolve_openai_model(
     config: BridgeConfig,
     provider_name: str | None = None,
@@ -1136,6 +1172,64 @@ def write_default_config(
 
 
 def merge_missing_config_fields(path: Path) -> tuple[Path, bool]:
+    try:
+        from ruamel.yaml import YAML
+        from ruamel.yaml.comments import CommentedMap
+
+        _merge_missing_config_fields_ruamel(path)
+        return path, True
+    except ImportError:
+        _merge_missing_config_fields_yaml(path)
+        return path, True
+
+
+def _merge_missing_config_fields_ruamel(path: Path) -> None:
+    """Merge missing config fields while preserving comments using ruamel.yaml."""
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap
+
+    ensure_default_dirs(path.parent)
+
+    try:
+        template_text = _default_config_template_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        template_text = DEFAULT_CONFIG_TEMPLATE
+
+    yaml_parser = YAML()
+    yaml_parser.preserve_quotes = True
+    yaml_parser.default_flow_style = False
+
+    if path.exists():
+        existing_text = path.read_text(encoding="utf-8")
+        existing_data = yaml_parser.load(existing_text)
+        template_data = yaml_parser.load(template_text)
+
+        if existing_data is None:
+            existing_data = CommentedMap()
+
+        _merge_commented_maps(existing_data, template_data)
+
+        output = io.StringIO()
+        yaml_parser.dump(existing_data, output)
+        path.write_text(output.getvalue(), encoding="utf-8")
+    else:
+        path.write_text(template_text, encoding="utf-8")
+
+
+def _merge_commented_maps(existing: Any, template: Any) -> None:
+    """Recursively merge template values into existing, preserving existing keys and comments."""
+    if not isinstance(existing, dict) or not isinstance(template, dict):
+        return
+
+    for key, template_value in template.items():
+        if key not in existing:
+            existing[key] = template_value
+        elif isinstance(template_value, dict) and isinstance(existing.get(key), dict):
+            _merge_commented_maps(existing[key], template_value)
+
+
+def _merge_missing_config_fields_yaml(path: Path) -> None:
+    """Fallback merge using standard pyyaml (loses comments)."""
     import yaml
 
     ensure_default_dirs(path.parent)
@@ -1154,13 +1248,12 @@ def merge_missing_config_fields(path: Path) -> tuple[Path, bool]:
                 yaml.safe_dump(merged, sort_keys=False, allow_unicode=False),
                 encoding="utf-8",
             )
-        return path, changed
+        return
 
     path.write_text(
         yaml.safe_dump(template_raw, sort_keys=False, allow_unicode=False),
         encoding="utf-8",
     )
-    return path, True
 
 
 def _merge_missing_values(existing: Any, template: Any) -> Any:
@@ -1186,6 +1279,8 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             f"Missing {config_path.name}. Created {example_path.name}; edit it, "
             f"add your API keys/models, then rename it to {config_path.name}."
         )
+    # Merge any new fields from the template into existing config
+    merge_missing_config_fields(config_path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     raw = _expand_env(raw)
 
@@ -1419,7 +1514,6 @@ def load_config(path: Path | None = None) -> BridgeConfig:
 
     vs_copilot_models = _load_vs_copilot_models(raw, providers, aliases, pi, codex)
     tools = _load_tool_config(raw)
-    master_review = _load_master_review_config(raw)
     openwebui = _load_openwebui_config(raw, server, tools)
 
     bridge_config = BridgeConfig(
@@ -1435,7 +1529,6 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         telegram=telegram,
         vs_copilot_models=vs_copilot_models,
         tools=tools,
-        master_review=master_review,
         openwebui=openwebui,
         source_path=config_path,
     )
@@ -1446,87 +1539,6 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         force=True,
     )
     return bridge_config
-
-
-def _load_master_review_config(raw: dict[str, Any]) -> MasterReviewConfig:
-    review_raw = raw.get("master_review", {}) or {}
-    mode = str(review_raw.get("mode", "balanced")).lower()
-    if mode not in {"fast", "balanced", "strict"}:
-        warnings.warn(
-            "master_review.mode must be one of: fast, balanced, strict; using balanced.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        mode = "balanced"
-
-    groq_raw = review_raw.get("groq", {}) or {}
-    api_keys = [
-        str(key).strip()
-        for key in (groq_raw.get("api_keys") or [])
-        if str(key or "").strip() and not str(key).strip().startswith("${")
-    ]
-    enabled = bool(review_raw.get("enabled", True))
-    groq_enabled = bool(groq_raw.get("enabled", True))
-    if enabled and groq_enabled and not api_keys:
-        warnings.warn(
-            "master_review.enabled is true but no real Groq keys are configured; local fallback review will be used.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    groq = MasterGroqConfig(
-        enabled=groq_enabled,
-        base_url=str(groq_raw.get("base_url", "https://api.groq.com/openai/v1")).rstrip("/"),
-        model=str(groq_raw.get("model", "llama-3.3-70b-versatile")),
-        api_keys=api_keys,
-        timeout_seconds=float(groq_raw.get("timeout_seconds", 45.0)),
-        max_retries_per_key=max(0, int(groq_raw.get("max_retries_per_key", 2))),
-        cooldown_seconds_after_429=max(0, int(groq_raw.get("cooldown_seconds_after_429", 60))),
-        cooldown_seconds_after_5xx=max(0, int(groq_raw.get("cooldown_seconds_after_5xx", 20))),
-        max_parallel_agents=max(1, int(groq_raw.get("max_parallel_agents", 1))),
-        requests_per_minute_per_key=max(1, int(groq_raw.get("requests_per_minute_per_key", 30))),
-        tokens_per_minute_per_key=max(1000, int(groq_raw.get("tokens_per_minute_per_key", 12000))),
-        requests_per_day_per_key=max(1, int(groq_raw.get("requests_per_day_per_key", 1000))),
-        tokens_per_day_per_key=max(1000, int(groq_raw.get("tokens_per_day_per_key", 100000))),
-        rate_limit_wait_seconds=max(0, int(groq_raw.get("rate_limit_wait_seconds", 45))),
-    )
-
-    sub_raw = review_raw.get("sub_agents", {}) or {}
-    sub_agents = MasterSubAgentsConfig(
-        spelling_grammar=bool(sub_raw.get("spelling_grammar", True)),
-        evidence_validity=bool(sub_raw.get("evidence_validity", True)),
-        evidence_reliability=bool(sub_raw.get("evidence_reliability", True)),
-        citation_coverage=bool(sub_raw.get("citation_coverage", True)),
-        neutrality_bias=bool(sub_raw.get("neutrality_bias", True)),
-        logic_consistency=bool(sub_raw.get("logic_consistency", True)),
-        format_quality=bool(sub_raw.get("format_quality", True)),
-        final_synthesis=bool(sub_raw.get("final_synthesis", True)),
-    )
-
-    debate_raw = review_raw.get("debate", {}) or {}
-    debate = MasterDebateConfig(
-        enabled=bool(debate_raw.get("enabled", True)),
-        rounds=max(0, min(2, int(debate_raw.get("rounds", 2)))),
-        require_disagreement=bool(debate_raw.get("require_disagreement", True)),
-        max_points_per_agent=max(1, int(debate_raw.get("max_points_per_agent", 8))),
-    )
-
-    output_raw = review_raw.get("output", {}) or {}
-    output = MasterOutputConfig(
-        return_review_trace=bool(output_raw.get("return_review_trace", True)),
-        return_revised_draft=bool(output_raw.get("return_revised_draft", True)),
-        return_final_llm_instructions=bool(output_raw.get("return_final_llm_instructions", True)),
-        max_instruction_tokens=max(200, int(output_raw.get("max_instruction_tokens", 1800))),
-    )
-
-    return MasterReviewConfig(
-        enabled=enabled,
-        run_after_deep_research=bool(review_raw.get("run_after_deep_research", True)),
-        mode=mode,
-        groq=groq,
-        sub_agents=sub_agents,
-        debate=debate,
-        output=output,
-    )
 
 
 def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
@@ -1545,7 +1557,6 @@ def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
         raise ValueError("tools.cache_ttl_seconds must be non-negative")
     serpapi = _external_tool_provider(tools_raw.get("serpapi"), "https://serpapi.com/search")
     tavily = _external_tool_provider(tools_raw.get("tavily"), "https://api.tavily.com/search")
-    deep_research = _deep_research_tool_config(tools_raw.get("deep_research"))
     if default_search_provider == "tavily" and not tavily.enabled and serpapi.enabled:
         default_search_provider = "serpapi"
     elif default_search_provider == "serpapi" and not serpapi.enabled and tavily.enabled:
@@ -1568,7 +1579,6 @@ def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
             "https://en.wikipedia.org",
             enabled=True,
         ),
-        deep_research=deep_research,
         max_exposed=max_exposed,
         relevance_filter=bool(tools_raw.get("relevance_filter", True)),
         force_for_keywords=bool(tools_raw.get("force_for_keywords", True)),
@@ -1593,26 +1603,6 @@ def _load_tool_config(raw: dict[str, Any]) -> ToolConfig:
         fallback_to_full_schemas_for_unsupported_clients=bool(
             tools_raw.get("fallback_to_full_schemas_for_unsupported_clients", True)
         ),
-    )
-
-
-def _deep_research_tool_config(value: Any) -> DeepResearchToolConfig:
-    raw = value if isinstance(value, dict) else {}
-
-    def seconds(key: str, default: float = 10.0) -> float:
-        try:
-            result = float(raw.get(key, default))
-        except (TypeError, ValueError):
-            result = default
-        return max(1.0, result)
-
-    return DeepResearchToolConfig(
-        tool_timeout_seconds=seconds("tool_timeout_seconds"),
-        search_agent_timeout_seconds=seconds("search_agent_timeout_seconds"),
-        verify_agent_timeout_seconds=seconds("verify_agent_timeout_seconds"),
-        source_research_timeout_seconds=seconds("source_research_timeout_seconds"),
-        image_research_timeout_seconds=seconds("image_research_timeout_seconds"),
-        manim_timeout_seconds=seconds("manim_timeout_seconds"),
     )
 
 

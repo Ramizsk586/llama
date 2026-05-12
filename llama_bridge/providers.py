@@ -170,6 +170,48 @@ class OllamaCloudProvider(OpenAICompatibleProvider):
             yield f"{line}\n\n"
 
 
+class AnthropicCompatibleProvider(OpenAICompatibleProvider):
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        if self.config.api_key and not self.config.api_key.startswith("${"):
+            headers["x-api-key"] = self.config.api_key
+        headers.update(self.config.headers)
+        return headers
+
+    def _anthropic_base_url(self) -> str:
+        if self.config.base_url.endswith("/v1"):
+            return self.config.base_url
+        return f"{self.config.base_url}/v1"
+
+    def _messages_url(self) -> str:
+        return f"{self._anthropic_base_url()}/messages"
+
+    def _anthropic_payload(self, body: dict[str, Any], model: str) -> dict[str, Any]:
+        return {**body, **self.config.extra_body, "model": model}
+
+    async def create_anthropic_message(
+        self, body: dict[str, Any], model: str
+    ) -> httpx.Response:
+        return await self._post(
+            self._messages_url(),
+            self._anthropic_payload(body, model),
+        )
+
+    async def stream_anthropic_message(
+        self, body: dict[str, Any], model: str
+    ) -> AsyncIterator[str]:
+        async for line in self._stream(
+            self._messages_url(),
+            self._anthropic_payload({**body, "stream": True}, model),
+        ):
+            if not line:
+                continue
+            yield f"{line}\n\n"
+
+
 def build_provider(config: ProviderConfig) -> OpenAICompatibleProvider:
     if config.type not in {
         "openai_compatible",
@@ -185,8 +227,13 @@ def build_provider(config: ProviderConfig) -> OpenAICompatibleProvider:
         "mistral",
         "deepseek",
         "openrouter",
+        "sarvamai",
+        "kilo",
+        "opencode",
     }:
         raise ValueError(f"Unsupported provider type: {config.type}")
+    if config.type == "opencode":
+        return AnthropicCompatibleProvider(config)
     if config.type == "ollama_cloud":
         return OllamaCloudProvider(config)
     return OpenAICompatibleProvider(config)

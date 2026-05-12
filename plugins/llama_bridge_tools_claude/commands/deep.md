@@ -9,13 +9,4 @@ User input: $ARGUMENTS
 
 If the user input is empty, ask the user for the research topic in one short question and wait for their answer. Do not call tools yet.
 
-If the user input is not empty, run the staged deep workflow instead of one long research call:
-
-1. Call `mcp__llama_bridge_tools__deep_plan_agent` first and save the returned `session_id`.
-2. Call `mcp__llama_bridge_tools__deep_collect_agent` with that `session_id`. This stage must stay fixed at 2 Tavily agents, 2 SerpAPI agents, and 3 Wikipedia agents.
-3. Write the returned `collect_markdown` to `temp/ad.md`.
-4. Call `mcp__llama_bridge_tools__deep_review_agent` with the same `session_id`.
-5. Overwrite `temp/ad.md` with the returned `reviewed_markdown`.
-6. Write the final `report.md` only after the review stage returns its final handoff.
-
-Prefer official or primary sources for key facts, use reputable news for developments and reactions, treat Wikipedia/background sources as context only, and label uncertainty clearly. If visuals would materially help, use `mcp__llama_bridge_tools__image_research` for 2-3 sourced images. Do not downgrade to `source_research` unless the staged deep tools are truly unavailable.
+If the user input is not empty, Start the deep workflow by calling a llama bridge tool whose name contains `deep`, preferably `mcp__llama_bridge_tools__deep` or `mcp__llama_bridge_tools__deep_plan_agent`. For `/deep`, you are only allowed to call tools with `deep` in the tool name; do not call normal search, source, image, Wikipedia, weather, or time tools. Follow the returned staged workflow: plan, collect with deep collector tools, review with deep reviewer tools, then produce the final cited brief.

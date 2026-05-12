@@ -1360,7 +1360,9 @@ def create_app(
                 "body": body,
             },
         )
-        if hasattr(provider, "create_anthropic_message") and stream:
+        if hasattr(provider, "create_anthropic_message") and (
+            stream or resolved.provider.type == "opencode"
+        ):
             if stream:
                 _write_dev_log(
                     config,
@@ -1374,6 +1376,22 @@ def create_app(
                     _safe_stream(_stream_anthropic_response(provider, body, resolved.upstream_model)),
                     media_type="text/event-stream",
                 )
+            try:
+                response = await provider.create_anthropic_message(body, resolved.upstream_model)
+            except httpx.HTTPStatusError as exc:
+                _write_dev_log(
+                    config,
+                    "anthropic_messages_error",
+                    {
+                        "status_code": exc.response.status_code,
+                        "body": _safe_response_text(exc.response),
+                    },
+                )
+                return _upstream_error(exc.response)
+            except httpx.RequestError as exc:
+                _write_dev_log(config, "anthropic_messages_error", {"message": str(exc)})
+                return _request_error(exc)
+            return JSONResponse(response.json())
 
         payload = _with_bridge_tools(
             anthropic_request_to_openai(body, resolved.upstream_model),

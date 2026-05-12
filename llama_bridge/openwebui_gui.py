@@ -693,7 +693,10 @@ class OpenWebUISetupCenter:
     def _on_close(self) -> None:
         self._stopped.set()
         try:
-            self.root.destroy()
+            if self.phase == Phase.RUNNING:
+                self.root.withdraw()
+            else:
+                self.root.destroy()
         except Exception:
             pass
 
@@ -708,6 +711,7 @@ class DetailsDialog:
         self.dialog.title("Details")
         self.dialog.geometry("780x540")
         self.dialog.minsize(640, 440)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self.dialog.resizable(True, True)
@@ -909,6 +913,7 @@ class ConfigDialog:
         self.dialog.geometry("480x448")
         self.dialog.minsize(420, 336)
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
@@ -1042,6 +1047,7 @@ class WebSearchDialog:
         self.dialog.geometry("480x432")
         self.dialog.minsize(420, 320)
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
@@ -1201,6 +1207,7 @@ class LogsDialog:
         self.dialog.title("Logs")
         self.dialog.geometry("740x540")
         self.dialog.minsize(500, 340)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self.dialog.resizable(True, True)
@@ -1337,6 +1344,7 @@ class CmdPreviewDialog:
         self.dialog.geometry("520x480")
         self.dialog.minsize(420, 320)
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
@@ -1406,6 +1414,7 @@ class SetupGuideDialog:
         self.dialog.geometry("560x580")
         self.dialog.minsize(480, 480)
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
 

@@ -2,22 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
+import tkinter as tk
+from tkinter import ttk
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_CONFIG_PATH, load_config
-from .telegram_launcher import (
-    start_telegram_bot,
-    stop_telegram_bot,
-    restart_telegram_bot,
-    telegram_bot_status,
-    follow_telegram_log,
-    test_telegram_token,
-    send_forced_message,
-)
+import yaml
 
 try:
     import customtkinter as ctk
@@ -30,9 +24,41 @@ except ImportError:
                 raise RuntimeError("customtkinter not available")
     ctk = _FakeCTk()
 
+# Allow running as standalone script or as part of a package
+if __package__ is None or __package__ == "":
+    _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _pkg_dir not in sys.path:
+        sys.path.insert(0, _pkg_dir)
+    _this_pkg = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+    from importlib import import_module
+    _mod = import_module(f"{_this_pkg}.config")
+    DEFAULT_CONFIG_PATH = _mod.DEFAULT_CONFIG_PATH
+    load_config = _mod.load_config
+    ToolPolicy = _mod.ToolPolicy
+    _tl = import_module(f"{_this_pkg}.telegram_launcher")
+    telegram_bot_status = _tl.telegram_bot_status
+    follow_telegram_log = _tl.follow_telegram_log
+    test_telegram_token = _tl.test_telegram_token
+    send_forced_message = _tl.send_forced_message
+else:
+    from .config import DEFAULT_CONFIG_PATH, load_config, ToolPolicy
+    from .telegram_launcher import (
+        telegram_bot_status,
+        follow_telegram_log,
+        test_telegram_token,
+        send_forced_message,
+    )
+
 GREEN = "#4FD1A1"
 RED = "#FF6B6B"
 YELLOW = "#F2C66D"
+ACCENT = "#5BA4F5"
+DARK_BG = "#0D1117"
+SIDEBAR_BG = "#161B22"
+CARD_OK_BG = "#0f2820"
+CARD_ERR_BG = "#281414"
+
+MAX_LOG_LINES = 500
 
 LAYOUT = {
     "PAD": 20,
@@ -57,10 +83,17 @@ class ToolTip:
         self.widget = widget
         self.text = text
         self.tip: ctk.CTkToplevel | None = None
+        self._after_id: str | None = None
         widget.bind("<Enter>", self._enter, add=True)
         widget.bind("<Leave>", self._leave, add=True)
 
     def _enter(self, _event: Any = None) -> None:
+        if self._after_id:
+            return
+        self._after_id = self.widget.after(400, self._show)
+
+    def _show(self) -> None:
+        self._after_id = None
         if self.tip or not self.text:
             return
         x = self.widget.winfo_rootx() + 20
@@ -68,10 +101,12 @@ class ToolTip:
         self.tip = ctk.CTkToplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f"+{x}+{y}")
-        lbl = ctk.CTkLabel(self.tip, text=self.text, font=("Segoe UI", 9), padx=8, pady=4)
-        lbl.pack()
+        ctk.CTkLabel(self.tip, text=self.text, font=("Segoe UI", 9), padx=8, pady=4).pack()
 
     def _leave(self, _event: Any = None) -> None:
+        if self._after_id:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
         if self.tip:
             try:
                 self.tip.destroy()
@@ -135,16 +170,54 @@ class TelegramSetupCenter:
 
         self._build_ui()
         self._load_config()
-        self._refresh_all()
+        self._refresh_all(reload_config=False)
         self.root.after(100, self._auto_test_token)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(2000, self._poll_status)
 
     def _build_ui(self) -> None:
-        main = ctk.CTkFrame(self.root, fg_color="transparent")
-        main.pack(fill="both", expand=True)
+        self._nav_stack: list[str] = []
+        self._current_view: str = "home"
 
-        self._build_header(main)
+        self.root.configure(fg_color=DARK_BG)
+
+        sidebar = ctk.CTkFrame(self.root, width=200, fg_color=SIDEBAR_BG, corner_radius=0)
+        sidebar.pack(side="left", fill="y", padx=0, pady=0)
+        sidebar.pack_propagate(False)
+
+        ctk.CTkLabel(sidebar, text="Telegram Bot",
+                     font=("Segoe UI", 14, "bold"), anchor="w",
+                     fg_color=SIDEBAR_BG, text_color="#e6edf3").pack(
+            fill="x", padx=16, pady=(20, 8))
+
+        sep = ctk.CTkFrame(sidebar, fg_color="#30363d", height=1)
+        sep.pack(fill="x", padx=12, pady=(0, 12))
+
+        self._sidebar_buttons: dict[str, ctk.CTkButton] = {}
+        nav_items = [
+            ("dashboard", "Dashboard", self._show_dashboard),
+            ("config", "Config", self._open_config),
+            ("access", "Access", self._open_access),
+            ("tools", "Tools", self._open_tools),
+            ("force_msg", "Force Msg", self._show_force_message),
+            ("logs", "Logs", self._show_logs),
+            ("details", "Details", self._show_details),
+        ]
+        for key, label, cmd in nav_items:
+            btn = ctk.CTkButton(
+                sidebar, text=label, command=cmd,
+                font=("Segoe UI", 11), height=36,
+                fg_color="transparent", text_color="#c9d1d9",
+                hover_color="#21262d", corner_radius=6,
+                anchor="w",
+            )
+            btn.pack(fill="x", padx=8, pady=1)
+            self._sidebar_buttons[key] = btn
+
+        self._active_nav = "dashboard"
+
+        main = ctk.CTkFrame(self.root, fg_color="transparent")
+        main.pack(side="left", fill="both", expand=True)
 
         sep = ctk.CTkFrame(main, fg_color=GREEN, height=2, corner_radius=0)
         sep.pack(fill="x", padx=PAD, pady=(4, 0))
@@ -153,10 +226,67 @@ class TelegramSetupCenter:
                                           text_color=("#888888", "#888888"), anchor="w")
         self.status_label.pack(fill="x", padx=PAD, pady=(8, 0))
 
-        self._build_footer(main)
-
         self.cards_area = ctk.CTkFrame(main, fg_color="transparent")
         self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(8, 0))
+
+        self._content_area = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(8, 0))
+        self._content_area._scrollbar.grid_remove()
+        self._content_area.pack_forget()
+
+        self._footer_frame = ctk.CTkFrame(main, fg_color="transparent")
+        self._footer_frame.pack_forget()
+
+        self._cards_area_visible = True
+        self._build_header(main)
+        self._show_dashboard()
+
+    def _set_active_nav(self, key: str) -> None:
+        for k, btn in self._sidebar_buttons.items():
+            if k == key:
+                btn.configure(fg_color="#238636", text_color="#ffffff")
+            else:
+                btn.configure(fg_color="transparent", text_color="#c9d1d9")
+
+    def _show_dashboard(self) -> None:
+        self._current_view = "home"
+        self._nav_stack.clear()
+        self._cards_area_visible = True
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(8, 0))
+        self._content_area.pack_forget()
+        self._footer_frame.pack_forget()
+        self._set_active_nav("dashboard")
+        self.subtitle_label.configure(text=self._subtitle_text())
+
+    def _show_config(self) -> None:
+        self._nav_stack.append("config")
+        self._set_active_nav("config")
+        self._show_panel("config")
+
+    def _show_access(self) -> None:
+        self._nav_stack.append("access")
+        self._set_active_nav("access")
+        self._show_panel("access")
+
+    def _show_tools(self) -> None:
+        self._nav_stack.append("tools")
+        self._set_active_nav("tools")
+        self._show_panel("tools")
+
+    def _show_force_message(self) -> None:
+        self._nav_stack.append("force_msg")
+        self._set_active_nav("force_msg")
+        self._show_panel("force_msg")
+
+    def _show_logs(self) -> None:
+        self._nav_stack.append("logs")
+        self._set_active_nav("logs")
+        self._show_panel("logs")
+
+    def _show_details(self) -> None:
+        self._nav_stack.append("details")
+        self._set_active_nav("details")
+        self._show_panel("details")
 
     def _build_header(self, parent: ctk.CTkFrame) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -164,6 +294,9 @@ class TelegramSetupCenter:
 
         header.columnconfigure(0, weight=1)
         header.columnconfigure(1, weight=0)
+        header.columnconfigure(2, weight=0)
+
+        self._header_row = header
 
         title_frame = ctk.CTkFrame(header, fg_color="transparent")
         title_frame.grid(row=0, column=0, sticky="w")
@@ -171,8 +304,8 @@ class TelegramSetupCenter:
         ctk.CTkLabel(title_frame, text="Telegram Bot Setup Center",
                      font=("Segoe UI", 18, "bold"), anchor="w").pack(anchor="w")
         self.subtitle_label = ctk.CTkLabel(title_frame, text="",
-                                           font=("Segoe UI", 10),
-                                           text_color=("#888888", "#888888"), anchor="w")
+                                            font=("Segoe UI", 10),
+                                            text_color=("#888888", "#888888"), anchor="w")
         self.subtitle_label.pack(anchor="w", pady=(2, 0))
 
         self.badge = ctk.CTkLabel(header, text="  SETUP  ",
@@ -194,72 +327,469 @@ class TelegramSetupCenter:
         self.badge.configure(text=f"  {badge_text}  ",
                              fg_color=badge_bg, text_color=badge_color)
 
-    def _build_footer(self, parent: ctk.CTkFrame) -> None:
-        footer = ctk.CTkFrame(parent, fg_color="transparent")
-        footer.pack(fill="x", side="bottom", pady=(4, 12), padx=PAD)
+    def _show_panel(self, panel: str) -> None:
+        self._current_view = panel
+        self._cards_area_visible = False
+        self.cards_area.pack_forget()
+        self._content_area.pack(fill="both", expand=True, padx=PAD, pady=(8, 0))
+        for w in self._content_area.winfo_children():
+            w.destroy()
+        self._footer_frame.pack_forget()
 
-        util = ctk.CTkFrame(footer, fg_color="transparent")
-        util.pack(fill="x")
+        if panel == "config":
+            self.subtitle_label.configure(text="Telegram Config")
+            self._build_config_form()
+        elif panel == "access":
+            self.subtitle_label.configure(text="Access Control")
+            self._build_access_form()
+        elif panel == "tools":
+            self.subtitle_label.configure(text="Command & Tool Policy")
+            self._build_tools_form()
+        elif panel == "force_msg":
+            self.subtitle_label.configure(text="Force Message")
+            self._build_force_message_form()
+        elif panel == "logs":
+            self.subtitle_label.configure(text="Telegram Bot Logs")
+            log_lines = follow_telegram_log(self.config_path)
+            text = ctk.CTkTextbox(self._content_area, font=("Consolas", 10), wrap="none")
+            text.pack(fill="both", expand=True)
+            for line in log_lines[-200:]:
+                text.insert("end", line + "\n")
+            text.see("end")
+        elif panel == "details":
+            self.subtitle_label.configure(text="Telegram Bot Details")
+            import yaml
+            text = ctk.CTkTextbox(self._content_area, font=("Segoe UI", 10), wrap="word")
+            text.pack(fill="both", expand=True)
+            try:
+                raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                raw = {}
+            telegram_raw = raw.get("telegram", {}) or {}
+            lines = [
+                f"Bot Token: {'set' if telegram_raw.get('bot_token') else 'missing'}",
+                f"Provider: {telegram_raw.get('provider', '-')}",
+                f"Model: {telegram_raw.get('model', '-')}",
+                f"Allow all chats: {telegram_raw.get('allow_all_chats', False)}",
+                f"Allowed IDs: {len(telegram_raw.get('allowed_chat_ids', []))}",
+                f"Owner IDs: {len(telegram_raw.get('owner_chat_ids', []))}",
+                f"Admin IDs: {len(telegram_raw.get('admin_chat_ids', []))}",
+            ]
+            for line in lines:
+                text.insert("end", line + "\n")
 
-        util_items = [
-            ("btn_config", "\u2699 Config", self._open_config),
-            ("btn_access", "\U0001f511 Access", self._open_access),
-            ("btn_tools", "\U0001f527 Tools", self._open_tools),
-            ("btn_force", "\U0001f4e9 Force Msg", self._open_force_message),
-            ("btn_logs", "\U0001f4cb Logs", self._open_logs),
-            ("btn_details", "\u2139 Details", self._open_details),
+    def _build_config_form(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        self._cfg_raw = raw
+        telegram_raw = raw.setdefault("telegram", {})
+        self._telegram_raw = telegram_raw
+
+        form = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        form.pack(fill="x", padx=0, pady=(0, 16))
+
+        self._cfg_enabled_var = ctk.BooleanVar(value=bool(telegram_raw.get("enabled", False)))
+        ctk.CTkCheckBox(form, text="Enable Telegram bot", variable=self._cfg_enabled_var,
+                        font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+
+        self._cfg_allow_all_var = ctk.BooleanVar(value=bool(telegram_raw.get("allow_all_chats", False)))
+        self._cfg_allow_all_cb = ctk.CTkCheckBox(
+            form, text="Allow all chats (open to everyone)",
+            variable=self._cfg_allow_all_var,
+            font=("Segoe UI", 10),
+            text_color=RED if self._cfg_allow_all_var.get() else None,
+        )
+        self._cfg_allow_all_cb.pack(anchor="w", pady=2)
+
+        def _on_allow_toggle():
+            self._cfg_allow_all_cb.configure(text_color=RED if self._cfg_allow_all_var.get() else None)
+        self._cfg_allow_all_var.trace_add("write", lambda *_: _on_allow_toggle())
+
+        self._cfg_auto_var = ctk.BooleanVar(value=bool(telegram_raw.get("autonomous_enabled", False)))
+        ctk.CTkCheckBox(form, text="Autonomous mode (bot can initiate conversations)",
+                       variable=self._cfg_auto_var, font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+
+        provider_names = list(raw.get("providers", {}).keys())
+        self._cfg_provider_var = ctk.StringVar(
+            value=str(telegram_raw.get("provider", provider_names[0] if provider_names else "")))
+
+        fields = [
+            ("Bot Token", "token", telegram_raw.get("bot_token", ""), True),
+            ("Provider", None, provider_names[0] if provider_names else "", False),
+            ("Model", "model", telegram_raw.get("model", ""), False),
+            ("System Prompt", "prompt", telegram_raw.get("system_prompt", ""), False),
         ]
-        self.util_btns: dict[str, ctk.CTkButton] = {}
-        for key, text, cmd in util_items:
-            btn = ctk.CTkButton(
-                util, text=text, command=cmd,
-                font=("Segoe UI", 10), height=30,
-                fg_color=("#e0e0e0", "#2a2a2a"),
-                text_color=("#333333", "#cccccc"),
-                hover_color=("#d0d0d0", "#3a3a3a"),
-                corner_radius=4,
-            )
-            btn.pack(side="left", padx=(0, 8))
-            self.util_btns[key] = btn
-            tooltip_map = {
-                "btn_config": "Open configuration dialog",
-                "btn_access": "Manage chat access control",
-                "btn_tools": "Configure commands and AI tool policy",
-                "btn_force": "Force-send a message to a chat",
-                "btn_logs": "View Telegram bot logs",
-                "btn_details": "Show full technical details",
+        self._cfg_vars: dict[str, Any] = {}
+        for label, key, default, is_pwd in fields:
+            row = ctk.CTkFrame(form, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(row, text=label, font=("Segoe UI", 10), width=120, anchor="w").pack(side="left")
+            if key == "prompt":
+                box = ctk.CTkTextbox(row, font=("Segoe UI", 10), height=80)
+                box.pack(side="left", fill="x", expand=True)
+                box.insert("0.0", str(default))
+                self._cfg_vars[key] = box
+            elif key == "token":
+                entry = ctk.CTkEntry(row, font=("Segoe UI", 10), show="*")
+                entry.pack(side="left", fill="x", expand=True)
+                entry.insert(0, str(default))
+                show_var = ctk.BooleanVar(value=False)
+                def _toggle(pw_entry=entry, sv=show_var):
+                    pw_entry.configure(show="" if sv.get() else "*")
+                ctk.CTkCheckBox(row, text="Show", variable=show_var,
+                                command=_toggle, font=("Segoe UI", 9)).pack(side="left", padx=(6, 0))
+                self._cfg_vars[key] = entry
+            elif key == "provider":
+                ctk.CTkComboBox(row, variable=self._cfg_provider_var, values=provider_names,
+                               state="readonly", font=("Segoe UI", 10), width=200).pack(side="left", fill="x", expand=True)
+            else:
+                entry = ctk.CTkEntry(row, font=("Segoe UI", 10))
+                entry.pack(side="left", fill="x", expand=True)
+                entry.insert(0, str(default))
+                self._cfg_vars[key] = entry
+
+        if key == "provider":
+            self._cfg_vars["provider"] = self._cfg_provider_var
+
+        num_fields = [
+            ("Max Input Chars", "max_input_chars", 4000),
+            ("Max Output Tokens", "max_output_tokens", 512),
+            ("Poll Interval (s)", "poll_interval_seconds", 2.0),
+            ("Response Timeout (s)", "response_timeout_seconds", 180.0),
+        ]
+        for label, key, default_val in num_fields:
+            row = ctk.CTkFrame(form, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(row, text=label, font=("Segoe UI", 10), width=120, anchor="w").pack(side="left")
+            var = ctk.StringVar(value=str(telegram_raw.get(key, default_val)))
+            ctk.CTkEntry(row, textvariable=var, width=100, font=("Segoe UI", 10)).pack(side="left")
+            self._cfg_vars[key] = var
+
+        self._cfg_test_result = ctk.StringVar(value="")
+
+        btn_row = ctk.CTkFrame(form, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Test Token", command=self._cfg_test_token,
+                      font=("Segoe UI", 9, "bold"), width=90).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(btn_row, textvariable=self._cfg_test_result,
+                     font=("Segoe UI", 9), text_color=("#888888", "#888888")).pack(side="left")
+        ctk.CTkButton(btn_row, text="Save", command=self._cfg_save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444")).pack(side="right")
+
+    def _cfg_test_token(self) -> None:
+        token = self._cfg_vars.get("token")
+        if token:
+            token = token.get().strip()
+        if not token or token.startswith("${"):
+            self._cfg_test_result.set("Token not configured")
+            return
+        t = threading.Thread(target=self._cfg_test_token_thread, args=(token,), daemon=True)
+        t.start()
+
+    def _cfg_test_token_thread(self, token: str) -> None:
+        result = test_telegram_token(token)
+        if result.get("ok"):
+            bot_info = result["result"]
+            username = bot_info.get("username", "?")
+            bot_id = bot_info.get("id", "?")
+            self.root.after(0, lambda: self._cfg_test_result.set(f"OK @{username} (id={bot_id})"))
+            self._bot_username = username
+            self._bot_id = bot_id
+            self._test_ok = True
+        else:
+            self.root.after(0, lambda: self._cfg_test_result.set(f"FAIL: {result.get('error', 'unknown')}"))
+
+    def _cfg_save(self) -> None:
+        self._telegram_raw["enabled"] = bool(self._cfg_enabled_var.get())
+        self._telegram_raw["allow_all_chats"] = bool(self._cfg_allow_all_var.get())
+        self._telegram_raw["autonomous_enabled"] = bool(self._cfg_auto_var.get())
+        token = self._cfg_vars.get("token")
+        if token:
+            token = token.get().strip()
+            if token:
+                self._telegram_raw["bot_token"] = token
+        self._telegram_raw["provider"] = self._cfg_provider_var.get()
+        model = self._cfg_vars.get("model")
+        if model:
+            self._telegram_raw["model"] = model.get().strip()
+        prompt = self._cfg_vars.get("prompt")
+        if prompt:
+            self._telegram_raw["system_prompt"] = prompt.get("0.0", "end-1c").strip()
+        for key in ("max_input_chars", "max_output_tokens", "poll_interval_seconds", "response_timeout_seconds"):
+            var = self._cfg_vars.get(key)
+            if var:
+                try:
+                    val = var.get()
+                    self._telegram_raw[key] = int(float(val)) if key in ("max_input_chars", "max_output_tokens") else float(val)
+                except ValueError:
+                    pass
+        self.config_path.write_text(yaml.safe_dump(self._cfg_raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        self._on_config_saved()
+
+    def _build_access_form(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        self._acc_raw = raw
+        telegram_raw = raw.setdefault("telegram", {})
+        self._acc_telegram_raw = telegram_raw
+
+        form = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        form.pack(fill="x", padx=0, pady=(0, 16))
+
+        self._acc_allow_all_var = ctk.BooleanVar(value=bool(telegram_raw.get("allow_all_chats", False)))
+        ctk.CTkCheckBox(form, text="Allow all chats (WARNING: open to everyone)",
+                        variable=self._acc_allow_all_var, font=("Segoe UI", 10),
+                        text_color=RED).pack(anchor="w", pady=4)
+
+        ctk.CTkLabel(form, text="Allowed Chat IDs", font=("Segoe UI", 10, "bold"), anchor="w").pack(anchor="w", pady=(8, 0))
+        self._acc_allowed = ctk.CTkTextbox(form, font=("Segoe UI", 10), height=60)
+        self._acc_allowed.pack(fill="x", pady=2)
+        self._acc_allowed.insert("0.0", "\n".join(str(x) for x in (telegram_raw.get("allowed_chat_ids") or [])))
+
+        ctk.CTkLabel(form, text="Owner Chat IDs", font=("Segoe UI", 10, "bold"), anchor="w").pack(anchor="w", pady=(8, 0))
+        self._acc_owner = ctk.CTkTextbox(form, font=("Segoe UI", 10), height=50)
+        self._acc_owner.pack(fill="x", pady=2)
+        self._acc_owner.insert("0.0", "\n".join(str(x) for x in (telegram_raw.get("owner_chat_ids") or [])))
+
+        ctk.CTkLabel(form, text="Admin Chat IDs", font=("Segoe UI", 10, "bold"), anchor="w").pack(anchor="w", pady=(8, 0))
+        self._acc_admin = ctk.CTkTextbox(form, font=("Segoe UI", 10), height=50)
+        self._acc_admin.pack(fill="x", pady=2)
+        self._acc_admin.insert("0.0", "\n".join(str(x) for x in (telegram_raw.get("admin_chat_ids") or [])))
+
+        ctk.CTkLabel(form, text="To get your chat ID, send /myid to the bot in Telegram.",
+                     font=("Segoe UI", 9), text_color=("#888888", "#888888")).pack(anchor="w", pady=4)
+
+        self._acc_core_var = ctk.BooleanVar(value=bool(telegram_raw.get("core_editing_enabled", False)))
+        ctk.CTkCheckBox(form, text="Core editing enabled", variable=self._acc_core_var,
+                        font=("Segoe UI", 10)).pack(anchor="w", pady=4)
+
+        btn_row = ctk.CTkFrame(form, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._acc_save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444")).pack(side="right")
+
+    def _acc_save(self) -> None:
+        self._acc_telegram_raw["allow_all_chats"] = bool(self._acc_allow_all_var.get())
+        self._acc_telegram_raw["allowed_chat_ids"] = [x.strip() for x in self._acc_allowed.get("0.0", "end-1c").split("\n") if x.strip()]
+        self._acc_telegram_raw["owner_chat_ids"] = [x.strip() for x in self._acc_owner.get("0.0", "end-1c").split("\n") if x.strip()]
+        self._acc_telegram_raw["admin_chat_ids"] = [x.strip() for x in self._acc_admin.get("0.0", "end-1c").split("\n") if x.strip()]
+        self._acc_telegram_raw["core_editing_enabled"] = bool(self._acc_core_var.get())
+        self.config_path.write_text(yaml.safe_dump(self._acc_raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        self._on_config_saved()
+
+    def _build_tools_form(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        self._tools_raw = raw
+        telegram_raw = raw.setdefault("telegram", {})
+        self._tools_telegram_raw = telegram_raw
+        self._tools_cmd_policy = telegram_raw.setdefault("command_policy", {})
+        self._tools_tool_policy = telegram_raw.setdefault("tool_policy", {})
+
+        scroll = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
+
+        tabview = ctk.CTkTabview(scroll)
+        tabview.pack(fill="both", expand=True)
+
+        cmd_tab = tabview.add("Commands")
+        tool_tab = tabview.add("AI Tools")
+
+        self._build_tools_commands(cmd_tab)
+        self._build_tools_ai_tools(tool_tab)
+
+        btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Save", command=self._tools_save,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444")).pack(side="right")
+
+    def _build_tools_commands(self, parent: ctk.CTkFrame) -> None:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
+
+        header_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        header_row.pack(fill="x", padx=4, pady=(4, 0))
+        for i, h in enumerate(["Command", "Enabled", "Visible", "Permission"]):
+            ctk.CTkLabel(header_row, text=h, font=("Segoe UI", 9, "bold"),
+                         anchor="w", width=90 if i == 0 else 60).pack(side="left", padx=4)
+
+        self._tools_cmd_widgets = {}
+        for cmd in _COMMAND_LIST:
+            policy = self._tools_cmd_policy.get(cmd, {})
+            if not isinstance(policy, dict):
+                policy = {}
+            row = ctk.CTkFrame(scroll, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+
+            ctk.CTkLabel(row, text=f"/{cmd}", font=("Segoe UI", 9), anchor="w",
+                         width=90).pack(side="left", padx=4)
+
+            en_var = ctk.BooleanVar(value=bool(policy.get("enabled", True)))
+            ctk.CTkCheckBox(row, variable=en_var, text="", width=20).pack(side="left", padx=4)
+
+            vis_var = ctk.BooleanVar(value=bool(policy.get("visible", True)))
+            ctk.CTkCheckBox(row, variable=vis_var, text="", width=20).pack(side="left", padx=4)
+
+            perm_var = ctk.StringVar(value=str(policy.get("permission", "everyone")))
+            ctk.CTkComboBox(row, variable=perm_var, values=_PERMISSION_LEVELS,
+                            state="readonly", font=("Segoe UI", 9), width=100).pack(side="left", padx=4)
+
+            self._tools_cmd_widgets[cmd] = (en_var, vis_var, perm_var)
+
+    def _build_tools_ai_tools(self, parent: ctk.CTkFrame) -> None:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll._scrollbar.grid_remove()
+
+        tp_default = ToolPolicy()
+        self._tools_ai_auto_var = ctk.StringVar(value=", ".join(self._tools_tool_policy.get("ai_auto_tools", tp_default.ai_auto_tools)))
+        self._tools_cmd_tools_var = ctk.StringVar(value=", ".join(self._tools_tool_policy.get("command_tools", tp_default.command_tools)))
+        self._tools_blocked_var = ctk.StringVar(value=", ".join(self._tools_tool_policy.get("blocked_tools", tp_default.blocked_tools)))
+        self._tools_user_vis_var = ctk.StringVar(value=", ".join(self._tools_tool_policy.get("user_visible_tools", tp_default.user_visible_tools)))
+        self._tools_req_admin_var = ctk.StringVar(value=", ".join(self._tools_tool_policy.get("require_admin_for", tp_default.require_admin_for)))
+        self._tools_req_owner_var = ctk.StringVar(value=", ".join(self._tools_tool_policy.get("require_owner_for", tp_default.require_owner_for)))
+
+        sections = [
+            ("AI Auto Tools", "Tools the AI can call automatically", self._tools_ai_auto_var),
+            ("Command-only Tools", "Tools callable only via explicit /tools", self._tools_cmd_tools_var),
+            ("Blocked Tools (dangerous)", "Never allowed in Telegram", self._tools_blocked_var),
+            ("User-visible Tools", "Shown in /tools list for non-admins", self._tools_user_vis_var),
+            ("Require Admin", "These tools need admin role", self._tools_req_admin_var),
+            ("Require Owner", "These tools need owner role", self._tools_req_owner_var),
+        ]
+        for title, sub, var in sections:
+            section = ctk.CTkFrame(scroll, fg_color="transparent")
+            section.pack(fill="x", pady=4)
+            ctk.CTkLabel(section, text=title, font=("Segoe UI", 10, "bold"),
+                         anchor="w").pack(anchor="w")
+            ctk.CTkLabel(section, text=sub, font=("Segoe UI", 8),
+                         text_color=("#888888", "#888888"), anchor="w").pack(anchor="w")
+            ctk.CTkEntry(section, textvariable=var, font=("Segoe UI", 9)).pack(fill="x", pady=(2, 0))
+
+    def _tools_save(self) -> None:
+        cmd_policy = {}
+        for cmd, (en_var, vis_var, perm_var) in self._tools_cmd_widgets.items():
+            cmd_policy[cmd] = {
+                "enabled": bool(en_var.get()),
+                "visible": bool(vis_var.get()),
+                "permission": perm_var.get(),
             }
-            ToolTip(btn, tooltip_map[key])
+        self._tools_telegram_raw["command_policy"] = cmd_policy
+        self._tools_tool_policy["ai_auto_tools"] = [x.strip() for x in self._tools_ai_auto_var.get().split(",") if x.strip()]
+        self._tools_tool_policy["command_tools"] = [x.strip() for x in self._tools_cmd_tools_var.get().split(",") if x.strip()]
+        self._tools_tool_policy["blocked_tools"] = [x.strip() for x in self._tools_blocked_var.get().split(",") if x.strip()]
+        self._tools_tool_policy["user_visible_tools"] = [x.strip() for x in self._tools_user_vis_var.get().split(",") if x.strip()]
+        self._tools_tool_policy["require_admin_for"] = [x.strip() for x in self._tools_req_admin_var.get().split(",") if x.strip()]
+        self._tools_tool_policy["require_owner_for"] = [x.strip() for x in self._tools_req_owner_var.get().split(",") if x.strip()]
+        self.config_path.write_text(yaml.safe_dump(self._tools_raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        self._on_config_saved()
 
-        action = ctk.CTkFrame(footer, fg_color="transparent")
-        action.pack(fill="x", pady=(6, 0))
+    def _build_force_message_form(self) -> None:
+        import yaml
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        telegram_raw = raw.get("telegram", {}) or {}
+        all_chats = list(set(
+            str(x).strip() for x in (
+                telegram_raw.get("allowed_chat_ids", []) +
+                telegram_raw.get("owner_chat_ids", []) +
+                telegram_raw.get("admin_chat_ids", [])
+            ) if str(x).strip()
+        ))
 
-        self.access_btn = ctk.CTkButton(
-            action, text="Access: Private", command=self._toggle_access,
-            font=("Segoe UI", 10, "bold"), height=34,
-            fg_color=("#1a4030", "#1a4030"), text_color=GREEN,
-            hover_color=("#153828", "#153828"), corner_radius=6,
-        )
-        self.access_btn.pack(side="left", padx=(0, 8))
-        ToolTip(self.access_btn, "Toggle between private and all-chats access")
+        chat_var = ctk.StringVar(value=all_chats[0] if all_chats else "")
+        row = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        row.pack(fill="x", pady=4)
+        ctk.CTkLabel(row, text="Target Chat ID", font=("Segoe UI", 10), width=100, anchor="w").pack(side="left")
+        if all_chats:
+            ctk.CTkComboBox(row, variable=chat_var, values=all_chats, font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        else:
+            ctk.CTkEntry(row, textvariable=chat_var, font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        self._force_vars = {"chat_id": chat_var}
 
-        self.auto_btn = ctk.CTkButton(
-            action, text="Auto: Off", command=self._toggle_auto,
-            font=("Segoe UI", 10, "bold"), height=34,
-            fg_color=("#1a4030", "#1a4030"), text_color=GREEN,
-            hover_color=("#153828", "#153828"), corner_radius=6,
-        )
-        self.auto_btn.pack(side="left")
-        ToolTip(self.auto_btn, "Toggle autonomous mode on/off")
+        msg_text = ctk.CTkTextbox(self._content_area, font=("Segoe UI", 10), height=120)
+        msg_text.pack(fill="x", pady=4)
+        self._force_vars["message"] = msg_text
 
-        self.primary_btn = ctk.CTkButton(
-            action, text="Start Bot", command=self._primary_action,
-            font=("Segoe UI", 11, "bold"), height=38,
-            fg_color=("#1a4030", "#1a4030"), text_color=GREEN,
-            hover_color=("#153828", "#153828"), corner_radius=6,
-        )
-        self.primary_btn.pack(side="right")
-        ToolTip(self.primary_btn, "Start or stop the Telegram bot")
+        self._force_status = ctk.StringVar(value="")
+        ctk.CTkLabel(self._content_area, textvariable=self._force_status,
+                     font=("Segoe UI", 9), text_color=("#888888", "#888888")).pack(pady=4)
+
+        btn_row = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Send", command=self._send_force_message,
+                      font=("Segoe UI", 10, "bold"), width=90).pack(side="right")
+        ctk.CTkButton(btn_row, text="Cancel", command=self._show_dashboard,
+                      font=("Segoe UI", 10), width=90,
+                      fg_color=("#555555", "#444444")).pack(side="right", padx=(8, 0))
+
+    def _send_force_message(self) -> None:
+        chat_id = self._force_vars["chat_id"].get().strip()
+        text = self._force_vars["message"].get("0.0", "end-1c").strip()
+        if not chat_id or not text:
+            self._force_status.set("chat_id and message are required")
+            return
+        t = threading.Thread(target=self._send_force_thread, args=(chat_id, text), daemon=True)
+        t.start()
+
+    def _send_force_thread(self, chat_id: str, text: str) -> None:
+        result = send_forced_message(self.config_path, chat_id, text)
+        if result.get("ok"):
+            self.root.after(0, lambda: self._force_status.set("Message sent successfully"))
+        else:
+            self.root.after(0, lambda: self._force_status.set(f"Failed: {result.get('error', 'unknown')}"))
+
+    def _on_config_saved(self) -> None:
+        self._load_config()
+        self._determine_status()
+        self._refresh_all(reload_config=True)
+
+    def _open_config(self) -> None:
+        self._set_active_nav("config")
+        def _on_test_ok(username: str, bot_id: str) -> None:
+            self._bot_username = username
+            self._bot_id = bot_id
+            self._test_ok = True
+            self._refresh_all()
+        ConfigDialog(self.root, self.config_path, self._on_config_saved, on_test_ok=_on_test_ok)
+
+    def _open_access(self) -> None:
+        self._set_active_nav("access")
+        AccessDialog(self.root, self.config_path, self._on_config_saved)
+
+    def _open_tools(self) -> None:
+        self._set_active_nav("tools")
+        ToolsDialog(self.root, self.config_path, self._on_config_saved)
+
+    def _open_force_message(self) -> None:
+        self._set_active_nav("force_msg")
+        ForceMessageDialog(self.root, self.config_path)
+
+    def _open_logs(self) -> None:
+        self._nav_stack.append("logs")
+        self._set_active_nav("logs")
+        self._show_panel("logs")
+
+    def _open_details(self) -> None:
+        self._nav_stack.append("details")
+        self._set_active_nav("details")
+        self._show_panel("details")
+
+    def _go_back(self) -> None:
+        if self._nav_stack:
+            self._nav_stack.pop()
+        if self._nav_stack:
+            prev = self._nav_stack[-1]
+            self._show_panel(prev)
+        else:
+            self._show_dashboard()
 
     def _create_card(self, card_data: dict, parent: ctk.CTkFrame | None = None) -> ctk.CTkFrame:
         if parent is None:
@@ -277,28 +807,39 @@ class TelegramSetupCenter:
         card.columnconfigure(2, weight=1)
         card.columnconfigure(3, weight=0)
 
-        accent = ctk.CTkFrame(card, fg_color=accent_color, width=5, corner_radius=0)
-        accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 10))
+        card._accent = ctk.CTkFrame(card, fg_color=accent_color, width=5, corner_radius=0)
+        card._accent.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 10))
 
-        ctk.CTkLabel(card, text=icon_text,
-                     font=("Segoe UI", 14, "bold"),
-                     text_color=accent_color).grid(row=0, column=1, rowspan=2, padx=(0, 6))
+        card._icon_lbl = ctk.CTkLabel(card, text=icon_text,
+                                      font=("Segoe UI", 14, "bold"),
+                                      text_color=accent_color)
+        card._icon_lbl.grid(row=0, column=1, rowspan=2, padx=(0, 6))
 
         ctk.CTkLabel(card, text=card_data["title"],
                      font=("Segoe UI", 10, "bold"), anchor="w").grid(
             row=0, column=2, sticky="w", pady=(6, 0))
 
-        ctk.CTkLabel(card, text=card_data.get("subtitle", ""),
-                     font=("Segoe UI", 9),
-                     text_color=("#888888", "#888888"), anchor="w").grid(
-            row=1, column=2, sticky="w", pady=(0, 6))
+        card._subtitle_lbl = ctk.CTkLabel(card, text=card_data.get("subtitle", ""),
+                                          font=("Segoe UI", 9),
+                                          text_color=("#888888", "#888888"), anchor="w")
+        card._subtitle_lbl.grid(row=1, column=2, sticky="w", pady=(0, 6))
 
-        ctk.CTkLabel(card, text=card_data.get("status", ""),
-                     font=("Segoe UI", 9, "bold"),
-                     text_color=accent_color).grid(
-            row=0, column=3, rowspan=2, sticky="e", padx=(0, 16))
+        card._status_lbl = ctk.CTkLabel(card, text=card_data.get("status", ""),
+                                        font=("Segoe UI", 9, "bold"),
+                                        text_color=accent_color)
+        card._status_lbl.grid(row=0, column=3, rowspan=2, sticky="e", padx=(0, 16))
 
         return card
+
+    def _update_cards(self) -> None:
+        for widget, data in zip(self._card_widgets, self._card_data):
+            ok = data["ok"]
+            color = GREEN if ok else RED
+            widget._subtitle_lbl.configure(text=data.get("subtitle", ""))
+            widget._status_lbl.configure(text=data.get("status", ""), text_color=color)
+            widget._icon_lbl.configure(text="\u2713" if ok else "\u2717", text_color=color)
+            widget._accent.configure(fg_color=color)
+            widget.configure(fg_color="#0f2820" if ok else "#281414")
 
     def _rebuild_cards(self) -> None:
         for w in self._card_widgets:
@@ -323,7 +864,7 @@ class TelegramSetupCenter:
         if self.status == BotStatus.SETUP:
             return "Bot token is missing \u2014 open Config."
         if self.status == BotStatus.READY:
-            return "Bot is ready. Choose access/tools, then click Start."
+            return "Bot is ready."
         if self.status == BotStatus.RUNNING:
             return "Bot is running."
         if self.status == BotStatus.ERROR:
@@ -381,11 +922,20 @@ class TelegramSetupCenter:
             self._config = load_config(self.config_path)
         except Exception as exc:
             self._config = None
-            self._log_lines.append(f"[Config load error: {exc}]")
+            self._append_log(f"[Config load error: {exc}]")
 
     def _determine_status(self) -> None:
-        status_info = telegram_bot_status(self.config_path)
-        if status_info["running"]:
+        def _worker():
+            try:
+                status_info = telegram_bot_status(self.config_path)
+                self.root.after(0, lambda: self._apply_status(status_info))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_status(self, status_info: dict) -> None:
+        if status_info.get("running"):
             self.status = BotStatus.RUNNING
             return
         if not self._config:
@@ -395,159 +945,56 @@ class TelegramSetupCenter:
         if not telegram.bot_token or telegram.bot_token.startswith("${"):
             self.status = BotStatus.SETUP
             return
-        if self._test_ok:
-            self.status = BotStatus.READY
+        self.status = BotStatus.READY if self._test_ok else BotStatus.SETUP
+
+    def _refresh_all(self, reload_config: bool = False) -> None:
+        if reload_config:
+            self._load_config()
+        old_data = [d.copy() for d in self._card_data]
+        self._update_card_data()
+        if self._card_data != old_data:
+            self._rebuild_cards()
         else:
-            self.status = BotStatus.SETUP
-
-    def _refresh_all(self) -> None:
-        self._load_config()
-        self._update_card_data()
+            self._update_cards()
         self._update_header()
-        self._rebuild_cards()
-        self._update_buttons()
 
-    def _update_buttons(self) -> None:
-        if not self.primary_btn:
-            return
-        if self.status == BotStatus.SETUP:
-            self.primary_btn.configure(text="Config", state="normal", fg_color="#1a4030", text_color=GREEN)
-        elif self.status == BotStatus.READY:
-            self.primary_btn.configure(text="Start Bot", state="normal", fg_color="#1a4030", text_color=GREEN)
-        elif self.status == BotStatus.STARTING:
-            self.primary_btn.configure(text="Starting\u2026", state="disabled", fg_color=("#444444", "#333333"), text_color=("#888888", "#888888"))
-        elif self.status == BotStatus.RUNNING:
-            self.primary_btn.configure(text="Stop Bot", state="normal", fg_color="#281414", text_color=RED)
-        elif self.status == BotStatus.ERROR:
-            self.primary_btn.configure(text="Restart Bot", state="normal", fg_color="#1a4030", text_color=GREEN)
-
-        if self._config:
-            tg = self._config.telegram
-            self.access_btn.configure(text=f"Access: {'All Chats' if tg.allow_all_chats else 'Private'}")
-            self.auto_btn.configure(text=f"Auto: {'On' if tg.autonomous_enabled else 'Off'}")
-
-    def _primary_action(self) -> None:
-        if self.status == BotStatus.SETUP:
-            self._open_config()
-        elif self.status == BotStatus.READY:
-            self._action_start()
-        elif self.status == BotStatus.RUNNING:
-            self._action_stop()
-        elif self.status == BotStatus.ERROR:
-            self._action_restart()
-
-    def _toggle_access(self) -> None:
-        if not self._config:
-            return
-        self._config.telegram.allow_all_chats = not self._config.telegram.allow_all_chats
-        self._save_raw_config()
-        self._update_card_data()
-        self._rebuild_cards()
-        self._update_buttons()
-
-    def _toggle_auto(self) -> None:
-        if not self._config:
-            return
-        self._config.telegram.autonomous_enabled = not self._config.telegram.autonomous_enabled
-        self._save_raw_config()
-        self._update_buttons()
-
-    def _save_raw_config(self) -> None:
-        import yaml
-        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
-        telegram = raw.setdefault("telegram", {})
-        if self._config:
-            telegram["allow_all_chats"] = self._config.telegram.allow_all_chats
-            telegram["autonomous_enabled"] = self._config.telegram.autonomous_enabled
-        self.config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
-
-    def _action_start(self) -> None:
-        self.status = BotStatus.STARTING
-        self._refresh_all()
-        t = threading.Thread(target=self._start_thread, daemon=True)
-        t.start()
-
-    def _start_thread(self) -> None:
-        try:
-            start_telegram_bot(self.config_path)
-            self.root.after(1500, self._on_start_ok)
-        except RuntimeError as exc:
-            self.root.after(0, lambda: self._on_start_failed(str(exc)))
-        except Exception as exc:
-            self.root.after(0, lambda: self._on_start_failed(str(exc)))
-
-    def _on_start_ok(self) -> None:
-        self._log_lines.append("[Telegram Bot started successfully]")
-        self._test_ok = True
-        self._determine_status()
-        self._refresh_all()
-
-    def _on_start_failed(self, msg: str) -> None:
-        self._log_lines.append(f"[Start failed: {msg}]")
-        self._last_msg = msg
-        self.status = BotStatus.ERROR
-        self._refresh_all()
-
-    def _action_stop(self) -> None:
-        t = threading.Thread(target=self._stop_thread, daemon=True)
-        t.start()
-
-    def _stop_thread(self) -> None:
-        try:
-            stop_telegram_bot(self.config_path)
-            self.root.after(1000, self._on_stop_ok)
-        except Exception as exc:
-            self.root.after(0, lambda: self._on_stop_failed(str(exc)))
-
-    def _on_stop_ok(self) -> None:
-        self._log_lines.append("[Telegram Bot stopped]")
-        self._determine_status()
-        self._refresh_all()
-
-    def _on_stop_failed(self, msg: str) -> None:
-        self._log_lines.append(f"[Stop failed: {msg}]")
-        self._last_msg = msg
-        self.status = BotStatus.ERROR
-        self._refresh_all()
-
-    def _action_restart(self) -> None:
-        self.status = BotStatus.STARTING
-        self._refresh_all()
-        t = threading.Thread(target=self._restart_thread, daemon=True)
-        t.start()
-
-    def _restart_thread(self) -> None:
-        try:
-            restart_telegram_bot(self.config_path)
-            self.root.after(2000, self._on_start_ok)
-        except Exception as exc:
-            self.root.after(0, lambda: self._on_start_failed(str(exc)))
+    def _append_log(self, line: str) -> None:
+        self._log_lines.append(line)
+        if len(self._log_lines) > MAX_LOG_LINES:
+            self._log_lines = self._log_lines[-MAX_LOG_LINES:]
 
     def _poll_status(self) -> None:
         if self._stopped.is_set():
             return
-        try:
-            status_info = telegram_bot_status(self.config_path)
-            was_running = self.status == BotStatus.RUNNING
-            now_running = status_info["running"]
-            if was_running and not now_running:
-                self.status = BotStatus.ERROR
-                self._last_msg = "Bot stopped unexpectedly"
-                self._log_lines.append("[Bot stopped unexpectedly]")
-                self._refresh_all()
-            elif not was_running and now_running:
-                self.status = BotStatus.RUNNING
-                self._refresh_all()
-        except Exception:
-            pass
-        self.root.after(5000, self._poll_status)
+
+        def _worker():
+            try:
+                status_info = telegram_bot_status(self.config_path)
+                self.root.after(0, lambda: self._apply_poll(status_info))
+            except Exception:
+                pass
+            if not self._stopped.is_set():
+                self.root.after(5000, self._poll_status)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_poll(self, status_info: dict) -> None:
+        was_running = self.status == BotStatus.RUNNING
+        now_running = status_info.get("running", False)
+        if was_running and not now_running:
+            self.status = BotStatus.ERROR
+            self._last_msg = "Bot stopped unexpectedly"
+            self._append_log("[Bot stopped unexpectedly]")
+            self._refresh_all()
+        elif not was_running and now_running:
+            self.status = BotStatus.RUNNING
+            self._refresh_all()
 
     def _auto_test_token(self) -> None:
         if self._test_ok:
             return
         token = None
         try:
-            from .config import load_config
             cfg = load_config(self.config_path)
             t = cfg.telegram
             if t.bot_token and not t.bot_token.startswith("${"):
@@ -583,36 +1030,14 @@ class TelegramSetupCenter:
     def run(self) -> None:
         self.root.mainloop()
 
-    def _open_config(self) -> None:
-        def _on_test_ok(username: str, bot_id: str) -> None:
-            self._bot_username = username
-            self._bot_id = bot_id
-            self._test_ok = True
-            self._update_card_data()
-            self._rebuild_cards()
-            self._update_header()
-            self._update_buttons()
-        ConfigDialog(self.root, self.config_path, self._on_config_saved, on_test_ok=_on_test_ok)
-
-    def _on_config_saved(self) -> None:
-        self._load_config()
-        self._determine_status()
-        self._refresh_all()
-
-    def _open_access(self) -> None:
-        AccessDialog(self.root, self.config_path, self._on_config_saved)
-
-    def _open_tools(self) -> None:
-        ToolsDialog(self.root, self.config_path, self._on_config_saved)
-
-    def _open_force_message(self) -> None:
-        ForceMessageDialog(self.root, self.config_path)
-
-    def _open_logs(self) -> None:
-        LogsDialog(self.root, self.config_path, lambda: follow_telegram_log(self.config_path))
-
-    def _open_details(self) -> None:
-        DetailsDialog(self.root, self.config_path)
+    def _go_home(self) -> None:
+        self._current_view = "home"
+        self._nav_stack.clear()
+        self._footer_frame.pack_forget()
+        self.cards_area.pack(fill="x", expand=False, padx=PAD, pady=(8, 0))
+        self._content_area.pack_forget()
+        self.subtitle_label.configure(text=self._subtitle_text())
+        self._set_active_nav("dashboard")
 
 
 class ConfigDialog:
@@ -625,13 +1050,13 @@ class ConfigDialog:
         self.dialog.geometry("540x580")
         self.dialog.minsize(480, 420)
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self._load()
         self._build()
 
     def _load(self) -> None:
-        import yaml
         self.raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         self.telegram_raw = self.raw.setdefault("telegram", {})
 
@@ -647,6 +1072,25 @@ class ConfigDialog:
         self.enabled_var = ctk.BooleanVar(value=bool(self.telegram_raw.get("enabled", False)))
         ctk.CTkCheckBox(scroll, text="Enable Telegram bot", variable=self.enabled_var,
                         font=("Segoe UI", 10)).grid(row=row, column=0, columnspan=3, sticky="w", pady=2)
+        row += 1
+
+        self.allow_all_var = ctk.BooleanVar(value=bool(self.telegram_raw.get("allow_all_chats", False)))
+        self.allow_all_cb = ctk.CTkCheckBox(
+            scroll, text="Allow all chats (open to everyone)",
+            variable=self.allow_all_var,
+            font=("Segoe UI", 10),
+            text_color=RED if self.allow_all_var.get() else None,
+        )
+        self.allow_all_cb.grid(row=row, column=0, columnspan=3, sticky="w", pady=2)
+        def _on_allow_toggle():
+            self.allow_all_cb.configure(text_color=RED if self.allow_all_var.get() else None)
+        self.allow_all_var.trace_add("write", lambda *_: _on_allow_toggle())
+        row += 1
+
+        self.auto_var = ctk.BooleanVar(value=bool(self.telegram_raw.get("autonomous_enabled", False)))
+        ctk.CTkCheckBox(scroll, text="Autonomous mode (bot can initiate conversations)",
+                        variable=self.auto_var, font=("Segoe UI", 10)).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=2)
         row += 1
 
         ctk.CTkLabel(scroll, text="Bot Token", font=("Segoe UI", 10), anchor="w").grid(
@@ -758,8 +1202,9 @@ class ConfigDialog:
             self.dialog.after(0, lambda: self.test_result_var.set(f"FAIL: {result.get('error', 'unknown')}"))
 
     def _save(self) -> None:
-        import yaml
         self.telegram_raw["enabled"] = bool(self.enabled_var.get())
+        self.telegram_raw["allow_all_chats"] = bool(self.allow_all_var.get())
+        self.telegram_raw["autonomous_enabled"] = bool(self.auto_var.get())
         token = self.token_entry.get().strip()
         if token:
             self.telegram_raw["bot_token"] = token
@@ -770,7 +1215,7 @@ class ConfigDialog:
         self.telegram_raw["max_output_tokens"] = int(self.output_tokens_var.get())
         self.telegram_raw["poll_interval_seconds"] = float(self.poll_interval_var.get())
         self.telegram_raw["response_timeout_seconds"] = float(self.resp_timeout_var.get())
-        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
         if self.on_save:
             self.on_save()
         self.dialog.destroy()
@@ -785,13 +1230,13 @@ class AccessDialog:
         self.dialog.geometry("560x520")
         self.dialog.minsize(480, 420)
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self._load()
         self._build()
 
     def _load(self) -> None:
-        import yaml
         self.raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         self.telegram_raw = self.raw.setdefault("telegram", {})
 
@@ -856,13 +1301,12 @@ class AccessDialog:
                       hover_color=("#666666", "#555555")).pack(side="right")
 
     def _save(self) -> None:
-        import yaml
         self.telegram_raw["allow_all_chats"] = bool(self.allow_all_var.get())
         self.telegram_raw["allowed_chat_ids"] = [x.strip() for x in self.allowed_text.get("0.0", "end-1c").split("\n") if x.strip()]
         self.telegram_raw["owner_chat_ids"] = [x.strip() for x in self.owner_text.get("0.0", "end-1c").split("\n") if x.strip()]
         self.telegram_raw["admin_chat_ids"] = [x.strip() for x in self.admin_text.get("0.0", "end-1c").split("\n") if x.strip()]
         self.telegram_raw["core_editing_enabled"] = bool(self.core_edit_var.get())
-        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
         if self.on_save:
             self.on_save()
         self.dialog.destroy()
@@ -886,13 +1330,13 @@ class ToolsDialog:
         self.dialog.geometry("700x580")
         self.dialog.minsize(580, 480)
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self._load()
         self._build()
 
     def _load(self) -> None:
-        import yaml
         self.raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         self.telegram_raw = self.raw.setdefault("telegram", {})
         self.cmd_policy_raw = self.telegram_raw.setdefault("command_policy", {})
@@ -923,7 +1367,6 @@ class ToolsDialog:
     def _build_commands(self, parent: ctk.CTkFrame) -> None:
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         scroll.pack(fill="both", expand=True)
-        scroll._scrollbar.grid_remove()
 
         header_row = ctk.CTkFrame(scroll, fg_color="transparent")
         header_row.pack(fill="x", padx=4, pady=(4, 0))
@@ -957,10 +1400,8 @@ class ToolsDialog:
     def _build_tools(self, parent: ctk.CTkFrame) -> None:
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         scroll.pack(fill="both", expand=True)
-        scroll._scrollbar.grid_remove()
 
-        from .config import ToolPolicy as Tp
-        tp_default = Tp()
+        tp_default = ToolPolicy()
         self._ai_auto_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("ai_auto_tools", tp_default.ai_auto_tools)))
         self._cmd_tools_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("command_tools", tp_default.command_tools)))
         self._blocked_var = ctk.StringVar(value=", ".join(self.tool_policy_raw.get("blocked_tools", tp_default.blocked_tools)))
@@ -986,7 +1427,6 @@ class ToolsDialog:
             ctk.CTkEntry(section, textvariable=var, font=("Segoe UI", 9)).pack(fill="x", pady=(2, 0))
 
     def _save(self) -> None:
-        import yaml
         cmd_policy = {}
         for cmd, (en_var, vis_var, perm_var) in self._cmd_widgets.items():
             cmd_policy[cmd] = {
@@ -1001,7 +1441,7 @@ class ToolsDialog:
         self.tool_policy_raw["user_visible_tools"] = [x.strip() for x in self._user_vis_var.get().split(",") if x.strip()]
         self.tool_policy_raw["require_admin_for"] = [x.strip() for x in self._req_admin_var.get().split(",") if x.strip()]
         self.tool_policy_raw["require_owner_for"] = [x.strip() for x in self._req_owner_var.get().split(",") if x.strip()]
-        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+        self.config_path.write_text(yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
         if self.on_save:
             self.on_save()
         self.dialog.destroy()
@@ -1015,13 +1455,13 @@ class ForceMessageDialog:
         self.dialog.geometry("540x420")
         self.dialog.minsize(480, 360)
         self.dialog.resizable(True, True)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self._load()
         self._build()
 
     def _load(self) -> None:
-        import yaml
         self.raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         self.telegram_raw = self.raw.setdefault("telegram", {})
 
@@ -1099,7 +1539,7 @@ class LogsDialog:
         self.dialog.geometry("740x540")
         self.dialog.minsize(580, 380)
         self.dialog.resizable(True, True)
-        self.dialog.transient(parent)
+
         self._filter = "all"
         self._build()
 
@@ -1152,29 +1592,29 @@ class LogsDialog:
             if self._filter != "all":
                 if self._filter == "errors" and "error" not in lower:
                     continue
-                if self._filter == "access" and "rejected" not in lower and "allow" not in lower:
+                elif self._filter == "access" and "access" not in lower:
                     continue
-                if self._filter == "tools" and "tool" not in lower:
+                elif self._filter == "tools" and "tool" not in lower:
                     continue
-                if self._filter == "provider" and "provider" not in lower:
+                elif self._filter == "provider" and "provider" not in lower and "model" not in lower:
                     continue
-                if self._filter == "sends" and "sent" not in lower:
+                elif self._filter == "sends" and "send" not in lower and "message" not in lower:
                     continue
             self.text.insert("end", line + "\n")
         self.text.see("end")
 
     def _clear(self) -> None:
-        self.text.delete("0.0", "end")
+        from .telegram_launcher import _log_path
+        try:
+            log_path = _log_path(self.config_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+        self._refresh()
 
     def _close(self) -> None:
         self.dialog.destroy()
-
-
-class _DetailItem:
-    def __init__(self, label: str, display_value: str, full_value: str) -> None:
-        self.label = label
-        self.display_value = display_value
-        self.full_value = full_value
 
 
 class DetailsDialog:
@@ -1184,6 +1624,7 @@ class DetailsDialog:
         self.dialog.title("Telegram Bot Details")
         self.dialog.geometry("780x540")
         self.dialog.minsize(640, 440)
+
         self.dialog.transient(parent)
         self.dialog.grab_set()
         self.dialog.resizable(True, True)
@@ -1194,7 +1635,7 @@ class DetailsDialog:
         main = ctk.CTkFrame(self.dialog, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=16, pady=16)
 
-        self.items = self._build_items()
+        items = self._build_items()
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -1225,13 +1666,12 @@ class DetailsDialog:
         self.tree.column("field", width=200, minwidth=140, stretch=False)
         self.tree.column("value", width=500, minwidth=300, stretch=True)
         self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<MouseWheel>", self._on_tree_mousewheel)
+        self.tree.bind("<MouseWheel>", lambda e: self.tree.yview_scroll(-1 * (e.delta // 120), "units"))
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._on_right_click)
 
-        for idx, item in enumerate(self.items):
+        for idx, item in enumerate(items):
             self.tree.insert("", "end", iid=str(idx), values=(item.label, item.display_value))
-
         self._selected_idx: str | None = None
 
         btn_row = ctk.CTkFrame(self.dialog, fg_color="transparent")
@@ -1245,110 +1685,107 @@ class DetailsDialog:
                       fg_color=("#555555", "#444444"),
                       hover_color=("#666666", "#555555")).pack(side="right", padx=4)
         self.dialog.bind("<Escape>", lambda e: self.dialog.destroy())
-        self.dialog.bind("<Control-c>", lambda e: self._copy_selected())
+
+    class _DetailItem:
+        def __init__(self, label: str, display_value: str, full_value: str) -> None:
+            self.label = label
+            self.display_value = display_value
+            self.full_value = full_value
 
     def _build_items(self) -> list[_DetailItem]:
-        import yaml
+        items: list[DetailsDialog._DetailItem] = []
         try:
             raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         except Exception:
             raw = {}
         telegram_raw = raw.get("telegram", {}) or {}
-        items: list[_DetailItem] = []
 
-        from .telegram_launcher import telegram_bot_status
-        status_info = telegram_bot_status(self.config_path)
-
-        cfg_path = str(self.config_path)
-        items.append(_DetailItem("Config path", _compact_path(cfg_path), cfg_path))
-
-        items.append(_DetailItem("Enabled", str(telegram_raw.get("enabled", False)),
-                                 str(telegram_raw.get("enabled", False))))
-
-        token = telegram_raw.get("bot_token", "")
-        token_status = "set" if (token and not str(token).startswith("${")) else "missing"
-        items.append(_DetailItem("Bot token", token_status, token_status))
-
-        items.append(_DetailItem("Provider", str(telegram_raw.get("provider", "-")),
-                                 str(telegram_raw.get("provider", "-"))))
-        items.append(_DetailItem("Model", str(telegram_raw.get("model", "-")),
-                                 str(telegram_raw.get("model", "-"))))
-        items.append(_DetailItem("Allow all chats", str(telegram_raw.get("allow_all_chats", False)),
-                                 str(telegram_raw.get("allow_all_chats", False))))
-
-        allowed = telegram_raw.get("allowed_chat_ids", [])
-        items.append(_DetailItem("Allowed chats", str(len(allowed)),
-                                 ", ".join(str(x) for x in allowed) if allowed else "none"))
-        owners = telegram_raw.get("owner_chat_ids", [])
-        items.append(_DetailItem("Owners", str(len(owners)),
-                                 ", ".join(str(x) for x in owners) if owners else "none"))
-        admins = telegram_raw.get("admin_chat_ids", [])
-        items.append(_DetailItem("Admins", str(len(admins)),
-                                 ", ".join(str(x) for x in admins) if admins else "none"))
-
-        items.append(_DetailItem("Max input chars", str(telegram_raw.get("max_input_chars", 4000)),
-                                 str(telegram_raw.get("max_input_chars", 4000))))
-        items.append(_DetailItem("Max output tokens", str(telegram_raw.get("max_output_tokens", 512)),
-                                 str(telegram_raw.get("max_output_tokens", 512))))
-        items.append(_DetailItem("Poll interval", f"{telegram_raw.get('poll_interval_seconds', 2.0)}s",
-                                 str(telegram_raw.get('poll_interval_seconds', 2.0))))
-        items.append(_DetailItem("Response timeout", f"{telegram_raw.get('response_timeout_seconds', 180.0)}s",
-                                 str(telegram_raw.get('response_timeout_seconds', 180.0))))
-        items.append(_DetailItem("Auto enabled", str(telegram_raw.get("autonomous_enabled", True)),
-                                 str(telegram_raw.get("autonomous_enabled", True))))
-        items.append(_DetailItem("Self evolution", str(telegram_raw.get("self_evolution_enabled", True)),
-                                 str(telegram_raw.get("self_evolution_enabled", True))))
-        items.append(_DetailItem("Core editing", str(telegram_raw.get("core_editing_enabled", False)),
-                                 str(telegram_raw.get("core_editing_enabled", False))))
-
-        items.append(_DetailItem("Runtime running", str(status_info.get("running", False)),
-                                 str(status_info.get("running", False))))
-        pid = status_info.get("pid")
-        items.append(_DetailItem("Runtime PID", str(pid) if pid else "none",
-                                 str(pid) if pid else "none"))
-
-        tp = telegram_raw.get("tool_policy", {})
-        ai_auto = tp.get("ai_auto_tools", [])
-        cmd_tools = tp.get("command_tools", [])
-        blocked = tp.get("blocked_tools", [])
-        items.append(_DetailItem("AI auto tools", str(len(ai_auto)),
-                                 ", ".join(ai_auto) if ai_auto else "none"))
-        items.append(_DetailItem("Command tools", str(len(cmd_tools)),
-                                 ", ".join(cmd_tools) if cmd_tools else "none"))
-        items.append(_DetailItem("Blocked tools", str(len(blocked)),
-                                 ", ".join(blocked) if blocked else "none"))
-
+        items.append(DetailsDialog._DetailItem("Config path", _compact_path(str(self.config_path)), str(self.config_path)))
+        items.append(DetailsDialog._DetailItem("Bot Token", "set" if telegram_raw.get("bot_token") else "missing",
+                                               "set" if telegram_raw.get("bot_token") else "missing"))
+        items.append(DetailsDialog._DetailItem("Provider", telegram_raw.get("provider", "-"),
+                                               telegram_raw.get("provider", "-")))
+        items.append(DetailsDialog._DetailItem("Model", telegram_raw.get("model", "-"),
+                                               telegram_raw.get("model", "-")))
+        items.append(DetailsDialog._DetailItem("Allow all chats", str(telegram_raw.get("allow_all_chats", False)),
+                                               str(telegram_raw.get("allow_all_chats", False))))
+        allowed_ids = telegram_raw.get("allowed_chat_ids", [])
+        items.append(DetailsDialog._DetailItem("Allowed IDs", str(len(allowed_ids)),
+                                               ", ".join(str(x) for x in allowed_ids) if allowed_ids else "-"))
+        owner_ids = telegram_raw.get("owner_chat_ids", [])
+        items.append(DetailsDialog._DetailItem("Owner IDs", str(len(owner_ids)),
+                                               ", ".join(str(x) for x in owner_ids) if owner_ids else "-"))
+        admin_ids = telegram_raw.get("admin_chat_ids", [])
+        items.append(DetailsDialog._DetailItem("Admin IDs", str(len(admin_ids)),
+                                               ", ".join(str(x) for x in admin_ids) if admin_ids else "-"))
+        cmd_policy = telegram_raw.get("command_policy", {})
+        items.append(DetailsDialog._DetailItem("Command policies", str(len(cmd_policy)),
+                                               ", ".join(cmd_policy.keys()) if cmd_policy else "-"))
+        items.append(DetailsDialog._DetailItem("System prompt",
+                                               _compact_path(telegram_raw.get("system_prompt", "-"), 60) if telegram_raw.get("system_prompt") else "-",
+                                               telegram_raw.get("system_prompt", "-")))
+        items.append(DetailsDialog._DetailItem("Max input chars", str(telegram_raw.get("max_input_chars", 4000)),
+                                               str(telegram_raw.get("max_input_chars", 4000))))
+        items.append(DetailsDialog._DetailItem("Max output tokens", str(telegram_raw.get("max_output_tokens", 512)),
+                                               str(telegram_raw.get("max_output_tokens", 512))))
+        items.append(DetailsDialog._DetailItem("Poll interval", f'{telegram_raw.get("poll_interval_seconds", 2.0)}s',
+                                               str(telegram_raw.get("poll_interval_seconds", 2.0))))
         return items
-
-    def _on_tree_mousewheel(self, event: Any) -> None:
-        self.tree.yview_scroll(-1 * (event.delta // 120), "units")
 
     def _on_select(self, _event: Any = None) -> None:
         sel = self.tree.selection()
         self._selected_idx = sel[0] if sel else None
 
     def _on_right_click(self, event: Any) -> None:
-        iid = self.tree.identify_row(event.y)
-        if iid:
-            self.tree.selection_set(iid)
-            self._selected_idx = iid
+        item = self.tree.identify("item", event.x, event.y)
+        if item:
+            self.tree.selection_set(item)
+            self._selected_idx = item
             self._copy_selected()
 
-    def _copy_selected(self) -> None:
-        if self._selected_idx is None:
-            sel = self.tree.selection()
-            if not sel:
-                return
-            self._selected_idx = sel[0]
+    def _get_full_value(self, idx: str) -> str:
         try:
-            idx = int(self._selected_idx)
-            item = self.items[idx]
+            return self._build_items()[int(idx)].full_value
+        except (IndexError, ValueError):
+            return ""
+
+    def _copy_selected(self) -> None:
+        idx = self._selected_idx
+        if idx is None:
+            sel = self.tree.selection()
+            idx = sel[0] if sel else None
+        if idx is None:
+            from tkinter import messagebox
+            messagebox.showinfo("Copy", "No item selected.", parent=self.dialog)
+            return
+        full = self._get_full_value(idx)
+        if full:
             self.dialog.clipboard_clear()
-            self.dialog.clipboard_append(item.full_value)
-        except (ValueError, IndexError):
-            pass
+            self.dialog.clipboard_append(full)
 
     def _copy_all(self) -> None:
-        lines = [f"{item.label}: {item.full_value}" for item in self.items]
+        parts: list[str] = []
+        for item in self._build_items():
+            parts.append(f"{item.label:<25} {item.full_value}")
+        text = "\n".join(parts)
         self.dialog.clipboard_clear()
-        self.dialog.clipboard_append("\n".join(lines))
+        self.dialog.clipboard_append(text)
+
+
+def launch_gui(config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+    if not HAS_TK:
+        print("customtkinter is not available.")
+        sys.exit(1)
+    app = TelegramSetupCenter(config_path=config_path)
+    app.run()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Telegram Bot Setup GUI")
+    parser.add_argument("--config", type=Path, default=None, help="Path to config YAML")
+    args = parser.parse_args()
+
+    config_path = args.config or DEFAULT_CONFIG_PATH
+    launch_gui(config_path)

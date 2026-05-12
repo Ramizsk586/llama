@@ -1,6 +1,6 @@
 ---
 name: llama-bridge-tools
-description: Use when Claude Code needs llama bridge MCP tools for staged deep research, current web search, source verification, image research, weather, Wikipedia, or date/time lookups.
+description: Use when Claude Code needs llama bridge MCP tools for deep research, current web search, source verification, image research, weather, Wikipedia, or date/time lookups.
 ---
 
 # Llama Bridge Tools
@@ -11,10 +11,19 @@ lookups.
 
 Prefer the highest-level bridge tool that fits the task:
 
-- For deep research, use the staged flow: `deep_plan_agent`, then
-  `deep_collect_agent`, then save `temp/ad.md`, then `deep_review_agent`,
-  then write the final `report.md`.
-  Keep the collection stage fixed at 2 Tavily agents, 2 SerpAPI agents, and 3 Wikipedia agents.
+- For `/deep` and deep research, only call tools whose names contain `deep`.
+  Start with `deep` or `deep_plan_agent`; do not use normal search, source,
+  image, Wikipedia, weather, or time tools for `/deep`. Use the staged flow:
+  `deep_plan_agent`, then
+  `deep_collect_agent` for single-agent collection calls, then each listed
+  collection agent separately, then `deep_collect_agent` with
+  `subagent_briefs`, then use the returned `temp_files`, then `deep_review_agent` for
+  single-agent verification calls, then each listed verifier separately, then
+  `deep_review_agent` with `verification_briefs`, then `deep_master_review_agent`
+  to get 8 master-review calls, optionally `deep_image_agent` to download
+  report-ready image files, then each listed `deep_master_*` call separately,
+  then `deep_master_review_agent` with `master_review_briefs`, then write the
+  final `report.md` using any returned image `local_path` values.
 - `source_research` for cited factual research and evidence gathering.
 - `image_research` for compact sourced image candidates.
 - `tavily_search` or `serpapi_search` for current web results.

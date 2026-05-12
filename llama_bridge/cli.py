@@ -34,11 +34,13 @@ from .config import (
     load_config,
     codex_model_error,
     copilot_cli_model_error,
+    kilo_model_error,
     openclaw_model_error,
     opencode_model_error,
     pi_model_error,
     resolve_codex_model,
     resolve_copilot_cli_model,
+    resolve_kilo_model,
     resolve_openclaw_model,
     resolve_opencode_model,
     resolve_pi_model,
@@ -399,6 +401,7 @@ def _color_http_status(match: re.Match[str]) -> str:
     return _style(status, "31")
 
 
+
 def _pause_with_spinner(message: str, seconds: float) -> None:
     if not sys.stdout.isatty():
         time.sleep(seconds)
@@ -667,10 +670,6 @@ def main() -> None:
                 remove_target=args.rm,
             )
             return
-        if args.command in ("telegram", "telegram-ui", "bot-ui", "teligram-ui"):
-            config_path = _arg_path(args.config)
-            _cmd_telegram_gui(config_path)
-            return
         if args.command in ("gui", "control-center", "cc"):
             config_path = _arg_path(args.config)
             _cmd_llama_gui(config_path)
@@ -679,6 +678,9 @@ def main() -> None:
             config_path = _arg_path(getattr(args, "bot_run_config", None) or args.config)
             if args.bot_command in {None, "setup"}:
                 _cmd_bot_setup(config_path)
+                return
+            if args.bot_command == "gui":
+                _cmd_bot_gui(config_path)
                 return
             if args.bot_command == "run":
                 from .teligram import run_teligram
@@ -703,6 +705,17 @@ def main() -> None:
                 return
             if args.bot_command == "logs":
                 _cmd_bot_logs(config_path)
+                return
+            parser.print_help()
+            return
+
+        if args.command in ("openapi", "api-spec"):
+            config_path = _arg_path(args.config)
+            if args.openapi_command in {None, "export"}:
+                _cmd_openapi_export(config_path, args.output)
+                return
+            if args.openapi_command == "validate":
+                _cmd_openapi_validate(config_path)
                 return
             parser.print_help()
             return
@@ -870,6 +883,27 @@ def _build_parser() -> argparse.ArgumentParser:
     api_subparsers.add_parser(
         "limits",
         help="open the provider usage and limits terminal view",
+    )
+
+    openapi_cmd = subparsers.add_parser(
+        "openapi",
+        help="export or validate OpenAPI specification for the bridge",
+        aliases=["api-spec"],
+    )
+    openapi_cmd.add_argument("--config")
+    openapi_subparsers = openapi_cmd.add_subparsers(dest="openapi_command")
+    openapi_export_cmd = openapi_subparsers.add_parser(
+        "export",
+        help="export OpenAPI spec to a file or stdout",
+    )
+    openapi_export_cmd.add_argument(
+        "--output", "-o",
+        default=None,
+        help="output file path (default: print to stdout)",
+    )
+    openapi_subparsers.add_parser(
+        "validate",
+        help="validate the OpenAPI spec structure",
     )
 
     tools_cmd = subparsers.add_parser("tools", help="inspect and test bridge tools")
@@ -1121,20 +1155,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="remove one installed CLI by name, or prompt to choose when no name is given",
     )
 
-    telegram_cmd = subparsers.add_parser(
-        "telegram",
-        help="inspect the restricted Telegram bot configuration",
-    )
-    telegram_cmd.add_argument("--config")
-    telegram_subparsers = telegram_cmd.add_subparsers(dest="telegram_command")
-    telegram_subparsers.add_parser("status", help="show Telegram bot configuration status")
-
     bot_cmd = subparsers.add_parser(
         "bot",
-        help="guided Telegram bot setup",
+        help="Telegram bot setup and GUI",
     )
     bot_cmd.add_argument("--config")
     bot_subparsers = bot_cmd.add_subparsers(dest="bot_command")
+    bot_subparsers.add_parser("gui", help="launch the Telegram Bot Setup Center GUI")
     bot_subparsers.add_parser("setup", help="run the Telegram bot setup workflow")
     bot_run_cmd = bot_subparsers.add_parser("run", help="run the Teligram polling bot")
     bot_run_cmd.add_argument("--config", dest="bot_run_config", help="path to env.yml")
@@ -1148,13 +1175,6 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_send_ai.add_argument("message", nargs="+", help="prompt for the AI message")
     bot_subparsers.add_parser("test-token", help="test Telegram bot token via getMe")
     bot_subparsers.add_parser("logs", help="show last 50 lines of Telegram bot log")
-
-    tgui_cmd = subparsers.add_parser(
-        "telegram-ui",
-        help="Telegram Bot Setup Center - manage Telegram bot via compact GUI",
-        aliases=["bot-ui", "teligram-ui"],
-    )
-    tgui_cmd.add_argument("--config")
 
     gui_cmd = subparsers.add_parser(
         "gui",
@@ -1187,27 +1207,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_init(config_path: Path, force: bool) -> None:
-    if config_path.exists():
-        created, changed = merge_missing_config_fields(config_path)
-        _title("llama init")
-        _print_state("ok", "existing config checked and merged forward", "32")
-        _kv_rows(
-            [
-                ("config", str(created)),
-                ("updated", "yes" if changed else "no"),
-            ]
-        )
-        _print_note("Existing providers, API keys, and models were preserved.")
-        return
+    _cmd_init_hardcoded(config_path, force)
 
-    target_path = _example_config_path(config_path)
-    created = write_default_config(target_path, force=force)
+
+def _cmd_init_hardcoded(config_path: Path, force: bool) -> None:
+    """Write env.yml directly with template defaults (no interactive prompts)."""
+    created = write_default_config(config_path, force=force)
+    merge_missing_config_fields(config_path)
     _title("llama init")
-    _print_state("ok", "example configuration is ready", "32")
+    _print_state("ok", "config file created", "32")
     _kv_rows(
         [
-            ("example", str(created)),
-            ("next", f"edit API keys/models, then rename to {config_path.name}"),
+            ("config", str(created)),
+            ("next", "edit API keys/models in the file, then run llama serve"),
         ]
     )
 
@@ -2059,6 +2071,447 @@ def _cmd_api_limits(config_path: Path) -> None:
             return
 
 
+def _cmd_openapi_export(config_path: Path, output_path: str | None) -> None:
+    try:
+        config = load_config(config_path)
+    except Exception as exc:  # noqa: BLE001 - CLI should show config errors plainly.
+        _print_state("fail", f"could not load config: {exc}", "31")
+        return
+
+    spec = _generate_openapi_spec(config)
+
+    if output_path:
+        output_file = Path(output_path)
+        output_file.write_text(json.dumps(spec, indent=2, ensure_ascii=False), encoding="utf-8")
+        _title("llama openapi export")
+        _print_state("ok", f"OpenAPI spec written to {output_file}", "32")
+    else:
+        _title("llama openapi export")
+        print(json.dumps(spec, indent=2, ensure_ascii=False))
+
+
+def _cmd_openapi_validate(config_path: Path) -> None:
+    try:
+        config = load_config(config_path)
+    except Exception as exc:  # noqa: BLE001 - CLI should show config errors plainly.
+        _print_state("fail", f"could not load config: {exc}", "31")
+        return
+
+    spec = _generate_openapi_spec(config)
+    errors: list[str] = []
+
+    if "openapi" not in spec:
+        errors.append("Missing 'openapi' version field")
+    elif not str(spec["openapi"]).startswith("3."):
+        errors.append(f"Invalid OpenAPI version: {spec['openapi']}")
+
+    if "info" not in spec:
+        errors.append("Missing 'info' object")
+    else:
+        info = spec["info"]
+        if "title" not in info:
+            errors.append("Missing info.title")
+        if "version" not in info:
+            errors.append("Missing info.version")
+
+    if "paths" not in spec:
+        errors.append("Missing 'paths' object")
+    elif not isinstance(spec["paths"], dict):
+        errors.append("'paths' must be an object")
+    elif not spec["paths"]:
+        errors.append("No paths defined in 'paths'")
+
+    _title("llama openapi validate")
+    if errors:
+        _print_state("fail", "Validation failed:", "31")
+        for err in errors:
+            print(f"  {_style('*', '31')} {err}")
+    else:
+        path_count = len(spec["paths"])
+        _print_state("ok", f"OpenAPI spec is valid", "32")
+        _kv_rows([
+            ("version", spec.get("openapi", "unknown")),
+            ("title", spec.get("info", {}).get("title", "unknown")),
+            ("version", spec.get("info", {}).get("version", "unknown")),
+            ("paths", path_count),
+        ])
+
+
+def _generate_openapi_spec(config) -> dict[str, Any]:
+    server = config.server
+    base_url = f"http://{server.host}:{server.port}"
+
+    spec: dict[str, Any] = {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "llama bridge",
+            "description": "AI model bridge with multi-provider support",
+            "version": "0.1.0",
+        },
+        "servers": [{"url": base_url}],
+        "paths": {},
+        "components": {
+            "securitySchemes": {
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "token",
+                }
+            }
+        },
+        "security": [{"BearerAuth": []}],
+    }
+
+    paths = spec["paths"]
+
+    paths["/"] = {
+        "get": {
+            "summary": "Service probe",
+            "responses": {"200": {"description": "Service is healthy"}},
+        }
+    }
+
+    paths["/health"] = {
+        "get": {
+            "summary": "Bridge health status",
+            "responses": {"200": {"description": "Bridge is healthy"}},
+        }
+    }
+
+    paths["/v1/models"] = {
+        "get": {
+            "summary": "List configured models",
+            "tags": ["OpenAI Compatible"],
+            "responses": {
+                "200": {
+                    "description": "List of available models",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "data": {
+                                        "type": "array",
+                                        "items": {"$ref": "#/components/schemas/Model"},
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    paths["/v1/chat/completions"] = {
+        "post": {
+            "summary": "Chat completions",
+            "tags": ["OpenAI Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ChatCompletionRequest"}
+                    }
+                },
+            },
+            "responses": {
+                "200": {"description": "Chat completion response"}
+            },
+        }
+    }
+
+    paths["/v1/completions"] = {
+        "post": {
+            "summary": "Text completions (legacy)",
+            "tags": ["OpenAI Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/CompletionRequest"}
+                    }
+                },
+            },
+            "responses": {
+                "200": {"description": "Completion response"}
+            },
+        }
+    }
+
+    paths["/v1/responses"] = {
+        "post": {
+            "summary": "OpenAI Responses API",
+            "tags": ["OpenAI Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {
+                "200": {"description": "Response from model"}
+            },
+        }
+    }
+
+    paths["/v1/messages"] = {
+        "post": {
+            "summary": "Anthropic Messages API",
+            "tags": ["Anthropic Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {
+                "200": {"description": "Message response"}
+            },
+        }
+    }
+
+    paths["/v1/messages/batches"] = {
+        "get": {
+            "summary": "List message batches",
+            "tags": ["Anthropic Compatible"],
+            "responses": {"200": {"description": "List of batches"}},
+        },
+        "post": {
+            "summary": "Create message batch",
+            "tags": ["Anthropic Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {"200": {"description": "Batch created"}},
+        },
+    }
+
+    paths["/v1/tools"] = {
+        "get": {
+            "summary": "List bridge tools",
+            "tags": ["Bridge Tools"],
+            "responses": {
+                "200": {
+                    "description": "List of available tools",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "tools": {"type": "array"},
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    paths["/v1/tools/call"] = {
+        "post": {
+            "summary": "Call a bridge tool",
+            "tags": ["Bridge Tools"],
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "arguments": {"type": "object"},
+                            },
+                            "required": ["name"],
+                        }
+                    }
+                },
+            },
+            "responses": {"200": {"description": "Tool call result"}},
+        }
+    }
+
+    paths["/api/tags"] = {
+        "get": {
+            "summary": "List available models (Ollama compatible)",
+            "tags": ["Ollama Compatible"],
+            "responses": {"200": {"description": "List of models"}},
+        }
+    }
+
+    paths["/api/version"] = {
+        "get": {
+            "summary": "Bridge version",
+            "tags": ["Ollama Compatible"],
+            "responses": {"200": {"description": "Version info"}},
+        }
+    }
+
+    paths["/api/chat"] = {
+        "post": {
+            "summary": "Chat messages (Ollama compatible)",
+            "tags": ["Ollama Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {"200": {"description": "Chat response"}},
+        }
+    }
+
+    paths["/api/generate"] = {
+        "post": {
+            "summary": "Prompt completion (Ollama compatible)",
+            "tags": ["Ollama Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {"200": {"description": "Completion response"}},
+        }
+    }
+
+    paths["/api/embed"] = {
+        "post": {
+            "summary": "Embedding (Ollama compatible)",
+            "tags": ["Ollama Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {"200": {"description": "Embedding response"}},
+        }
+    }
+
+    for alias_name in config.anthropic_models:
+        alias = config.anthropic_models[alias_name]
+        model = alias.model or config.providers[alias.provider].default_model or alias_name
+
+        paths[f"/v1/models/{model}"] = {
+            "get": {
+                "summary": f"Get model: {model}",
+                "tags": ["Models"],
+                "responses": {
+                    "200": {"description": f"Model {model}"}
+                },
+            }
+        }
+
+    paths["/v1/assistants"] = {
+        "get": {
+            "summary": "List assistants",
+            "tags": ["OpenAI Compatible"],
+            "responses": {"200": {"description": "List of assistants"}},
+        },
+        "post": {
+            "summary": "Create assistant",
+            "tags": ["OpenAI Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {"200": {"description": "Assistant created"}},
+        },
+    }
+
+    paths["/v1/threads"] = {
+        "get": {
+            "summary": "List threads",
+            "tags": ["OpenAI Compatible"],
+            "responses": {"200": {"description": "List of threads"}},
+        },
+        "post": {
+            "summary": "Create thread",
+            "tags": ["OpenAI Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {"200": {"description": "Thread created"}},
+        },
+    }
+
+    paths["/v1/files"] = {
+        "get": {
+            "summary": "List files",
+            "tags": ["Anthropic Compatible"],
+            "responses": {"200": {"description": "List of files"}},
+        },
+        "post": {
+            "summary": "Upload file",
+            "tags": ["Anthropic Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"multipart/form-data": {"schema": {"type": "object"}}},
+            },
+            "responses": {"200": {"description": "File uploaded"}},
+        },
+    }
+
+    paths["/v1/skills"] = {
+        "get": {
+            "summary": "List skills",
+            "tags": ["Anthropic Compatible"],
+            "responses": {"200": {"description": "List of skills"}},
+        },
+        "post": {
+            "summary": "Create skill",
+            "tags": ["Anthropic Compatible"],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            },
+            "responses": {"200": {"description": "Skill created"}},
+        },
+    }
+
+    spec["components"]["schemas"] = {
+        "Model": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "type": {"type": "string"},
+                "display_name": {"type": "string"},
+            },
+        },
+        "ChatCompletionRequest": {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string"},
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                    },
+                },
+                "max_tokens": {"type": "integer"},
+                "temperature": {"type": "number"},
+                "stream": {"type": "boolean"},
+                "tools": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                },
+            },
+            "required": ["model", "messages"],
+        },
+        "CompletionRequest": {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string"},
+                "prompt": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                "max_tokens": {"type": "integer"},
+                "temperature": {"type": "number"},
+                "stream": {"type": "boolean"},
+            },
+            "required": ["model", "prompt"],
+        },
+    }
+
+    return spec
+
+
 def _cmd_telegram_status(config_path: Path) -> None:
     config = load_config(config_path)
     telegram = config.telegram
@@ -2215,7 +2668,13 @@ def _cmd_bot_logs(config_path: Path) -> None:
         print(line)
 
 
-def _cmd_telegram_gui(config_path: Path) -> None:
+def _cmd_bot_gui(config_path: Path) -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.FreeConsole()
+        except Exception:
+            pass
     from .telegram_setup_gui import HAS_TK as _HAS_TK
     if not _HAS_TK:
         raise SystemExit("Tkinter is not available. Install python-tk or python3-tk.")
@@ -7082,7 +7541,7 @@ def _cmd_openwebui_test_search(config_path: Path, query: str) -> None:
 
 def _cmd_openwebui_configure(config_path: Path) -> None:
     import yaml
-    from .openwebui_config import save_openwebui_config, VALID_SEARCH_PROVIDERS
+    from .openwebui_config import VALID_SEARCH_PROVIDERS
     merge_missing_config_fields(config_path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     owui_raw = raw.setdefault("openwebui", {})
