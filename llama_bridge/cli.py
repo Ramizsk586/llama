@@ -665,6 +665,9 @@ def main() -> None:
         if args.command == "poolside-acp-proxy":
             _cmd_poolside_acp_proxy(args.poolside_acp_args)
             return
+        if args.command == "agent":
+            _cmd_agent(args)
+            return
         if args.command == "cli":
             config_path = _arg_path(args.config)
             _cmd_cli(
@@ -1165,6 +1168,19 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs=argparse.REMAINDER,
         help=argparse.SUPPRESS,
     )
+
+    agent_cmd = subparsers.add_parser(
+        "agent",
+        help="start, stop, and inspect the installed llama_agent",
+    )
+    agent_cmd.add_argument("agent_action", nargs="?", choices=["start", "status", "stop"], default="start")
+    agent_cmd.add_argument("--home", help="llama_agent install directory")
+    agent_cmd.add_argument("--pid-file")
+    agent_cmd.add_argument("--log-file")
+    agent_cmd.add_argument("--foreground", action="store_true", help="run llama_agent in the current terminal")
+    agent_cmd.add_argument("--status", action="store_true", help="show llama_agent status")
+    agent_cmd.add_argument("--stop", action="store_true", help="stop llama_agent")
+    agent_cmd.add_argument("--no-start-bridge", action="store_true", help="do not start Llama Bridge before the agent")
 
     cli_cmd = subparsers.add_parser(
         "cli",
@@ -2020,6 +2036,195 @@ def _cmd_stop(pid_path: Path) -> None:
         pid_path.unlink(missing_ok=True)
         _clear_active_server_state(pid_path)
     _print_state("ok", f"llama stopped pid {pid}", "32")
+
+
+def _cmd_agent(args: argparse.Namespace) -> None:
+    """Start, stop, or inspect the installed llama_agent."""
+    action = "status" if args.status else "stop" if args.stop else args.agent_action
+    home = _agent_home(Path(args.home) if args.home else None)
+    pid_path = Path(args.pid_file) if args.pid_file else home / ".llama-agent.pid"
+    log_path = Path(args.log_file) if args.log_file else home / ".llama-agent.log"
+    if action == "status":
+        _cmd_agent_status(home, pid_path, log_path)
+        return
+    if action == "stop":
+        _cmd_agent_stop(pid_path)
+        return
+    _cmd_agent_start(home, pid_path, log_path, foreground=args.foreground, start_bridge=not args.no_start_bridge)
+
+
+def _agent_home(override: Path | None = None) -> Path:
+    """Resolve the installed llama_agent directory."""
+    candidates: list[Path] = []
+    if override is not None:
+        candidates.append(override)
+    if os.environ.get("LLAMA_AGENT_HOME"):
+        candidates.append(Path(os.environ["LLAMA_AGENT_HOME"]))
+    if os.environ.get("LLAMA_HOME"):
+        candidates.append(Path(os.environ["LLAMA_HOME"]) / "agent")
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / "agent")
+    candidates.append(Path(__file__).resolve().parent.parent / "agent")
+    for candidate in candidates:
+        path = candidate.expanduser().resolve()
+        if (path / "package.json").exists():
+            return path
+    return candidates[0].expanduser().resolve() if candidates else Path.cwd()
+
+
+def _cmd_agent_start(home: Path, pid_path: Path, log_path: Path, *, foreground: bool, start_bridge: bool) -> None:
+    """Start llama_agent in the background or foreground."""
+    _title("llama agent")
+    _ensure_agent_home(home)
+    if _is_running(pid_path):
+        _print_state("run", f"llama_agent is already running with pid {pid_path.read_text().strip()}", "32")
+        _kv_rows([("home", str(home)), ("log", str(log_path))])
+        return
+    if start_bridge:
+        config_path = _default_config_path()
+        _ensure_setup(config_path)
+        config = load_config(config_path)
+        _cmd_start(
+            config_path,
+            _arg_path(None, DEFAULT_PID_PATH, config_path),
+            _arg_path(None, DEFAULT_LOG_PATH, config_path),
+            _configured_idle_timeout_seconds(config),
+            verbose=False,
+        )
+    npm = _find_npm()
+    command, use_shell = _npm_start_command(npm)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if foreground:
+        _print_state("run", "starting llama_agent in the current terminal", "36")
+        raise SystemExit(subprocess.run(command, cwd=home, check=False, shell=use_shell).returncode)
+    log_path.write_text("", encoding="utf-8")
+    with log_path.open("a", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            command,
+            cwd=home,
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=handle,
+            close_fds=True,
+            creationflags=_background_creationflags(),
+            shell=use_shell,
+        )
+    env = _read_agent_env(home)
+    port = env.get("PORT", "3456")
+    if not _wait_for_agent_start(process, port, timeout_seconds=10):
+        _print_state("fail", f"llama_agent failed to start, see log: {log_path}", "31")
+        return
+    pid_path.write_text(str(process.pid), encoding="utf-8")
+    _print_state("ok", f"llama_agent started in background on pid {process.pid}", "32")
+    _kv_rows([("home", str(home)), ("log", str(log_path)), ("status", "llama agent --status"), ("stop", "llama agent --stop")])
+
+
+def _cmd_agent_status(home: Path, pid_path: Path, log_path: Path) -> None:
+    """Show llama_agent status."""
+    _title("llama agent status")
+    pid = _read_pid(pid_path)
+    running = pid is not None and _pid_alive(pid)
+    if pid is not None and not running:
+        pid_path.unlink(missing_ok=True)
+        pid = None
+    env = _read_agent_env(home)
+    port = env.get("PORT", "3456")
+    bridge_url = env.get("LLAMA_BRIDGE_URL", "http://127.0.0.1:8089")
+    _kv_rows(
+        [
+            ("Agent", _status_label(running)),
+            ("Agent PID", pid or "-"),
+            ("Agent health", _http_status(f"http://127.0.0.1:{port}")),
+            ("Bridge", _http_status(bridge_url)),
+            ("Home", str(home)),
+            ("Log", str(log_path)),
+        ]
+    )
+
+
+def _wait_for_agent_start(process: subprocess.Popen[Any], port: str, timeout_seconds: float) -> bool:
+    """Wait for the agent health endpoint or process failure."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return False
+        if _http_status(f"http://127.0.0.1:{port}").startswith("ok"):
+            return True
+        time.sleep(0.5)
+    return process.poll() is None
+
+
+def _cmd_agent_stop(pid_path: Path) -> None:
+    """Stop the background llama_agent process."""
+    pid = _read_pid(pid_path)
+    if pid is None:
+        _print_state("stop", "llama_agent is not running", "33")
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _print_state("stop", "llama_agent process was not found", "33")
+    finally:
+        pid_path.unlink(missing_ok=True)
+    _print_state("ok", f"llama_agent stopped pid {pid}", "32")
+
+
+def _ensure_agent_home(home: Path) -> None:
+    """Validate that llama_agent is installed."""
+    if not (home / "package.json").exists():
+        raise SystemExit(
+            f"llama_agent is not installed at {home}.\n"
+            "Run the Windows setup again and choose the llama_agent option, or pass --home."
+        )
+
+
+def _find_npm() -> str:
+    """Return the npm executable path."""
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if not npm and os.name == "nt":
+        npm_path = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "nodejs" / "npm.cmd"
+        if npm_path.exists():
+            npm = str(npm_path)
+    if not npm:
+        raise SystemExit("npm was not found. Install Node.js LTS and try again.")
+    return npm
+
+
+def _npm_start_command(npm: str) -> tuple[list[str] | str, bool]:
+    """Return a Windows-safe npm start command."""
+    if os.name == "nt" and Path(npm).suffix.lower() in {".cmd", ".bat"}:
+        return subprocess.list2cmdline([npm, "start"]), True
+    return [npm, "start"], False
+
+
+def _background_creationflags() -> int:
+    """Return Windows background process flags when available."""
+    if os.name != "nt":
+        return 0
+    return (
+        subprocess.CREATE_NEW_PROCESS_GROUP
+        | subprocess.CREATE_NO_WINDOW
+        | subprocess.DETACHED_PROCESS
+        | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    )
+
+
+def _read_agent_env(home: Path) -> dict[str, str]:
+    """Read simple KEY=value entries from llama_agent env files."""
+    values: dict[str, str] = {}
+    for name in (".env", ".env.local"):
+        path = home / name
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
 
 def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
