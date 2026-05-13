@@ -515,6 +515,17 @@ def main() -> None:
             config_path = _default_config_path()
             _cmd_stop(_arg_path(args.pid_file, DEFAULT_PID_PATH, config_path))
             return
+        if args.command == "restart":
+            config_path = _arg_path(args.config) if args.config else _default_config_path()
+            _ensure_setup(config_path)
+            config = load_config(config_path)
+            _cmd_restart(
+                config_path,
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                0 if args.forever else _configured_idle_timeout_seconds(config),
+            )
+            return
         if args.command == "logs":
             config_path = _arg_path(args.config) if args.config else _default_config_path()
             _cmd_logs(
@@ -822,6 +833,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     stop_cmd = subparsers.add_parser("stop", help="stop the background bridge")
     stop_cmd.add_argument("--pid-file")
+
+    restart_cmd = subparsers.add_parser("restart", help="restart the background bridge")
+    restart_cmd.add_argument("--config")
+    restart_cmd.add_argument("--pid-file")
+    restart_cmd.add_argument("--log-file")
+    restart_cmd.add_argument(
+        "--forever",
+        action="store_true",
+        help="disable the configured idle auto-stop",
+    )
 
     logs_cmd = subparsers.add_parser("logs", help="show bridge logs")
     logs_cmd.add_argument("--config")
@@ -2039,6 +2060,17 @@ def _cmd_stop(pid_path: Path) -> None:
         pid_path.unlink(missing_ok=True)
         _clear_active_server_state(pid_path)
     _print_state("ok", f"llama stopped pid {pid}", "32")
+
+
+def _cmd_restart(
+    config_path: Path,
+    pid_path: Path,
+    log_path: Path,
+    idle_timeout_seconds: int = 0,
+) -> None:
+    _title("llama restart")
+    _cmd_stop(pid_path)
+    _cmd_start(config_path, pid_path, log_path, idle_timeout_seconds=idle_timeout_seconds, verbose=False)
 
 
 def _cmd_agent(args: argparse.Namespace) -> None:
@@ -3633,6 +3665,7 @@ def _cmd_logs(
             _print_state("stop", "llama server is not running; showing saved log and exiting", "33")
             follow = False
 
+    main_log_path = log_path
     if dev:
         log_path = config_path.parent / "llama.dev.log"
 
@@ -3647,6 +3680,15 @@ def _cmd_logs(
             ) from exc
 
     requested_dev_log = dev
+    if dev and (not log_path.exists() or log_path.stat().st_size == 0):
+        if main_log_path.exists() and main_log_path.stat().st_size > 0:
+            _print_state("info", f"no dev log entries yet at {log_path}; showing normal log at {main_log_path}", "36")
+            log_path = main_log_path
+            dev = False
+        else:
+            _print_state("info", f"no dev log entries yet at {log_path}", "36")
+            return
+
     if not log_path.exists() or (not dev and log_path.stat().st_size == 0):
         fallback_log_path = config_path.parent / "llama.dev.log"
         if not dev and fallback_log_path.exists() and fallback_log_path.stat().st_size > 0:

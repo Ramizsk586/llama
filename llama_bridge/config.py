@@ -350,6 +350,9 @@ telegram:
   owner_chat_ids: []
   admin_chat_ids: []
   allow_all_chats: false
+  admin_pin_hash: null
+  core_editing_enabled: false
+  require_owner_approval_for_core_changes: true
   provider: ollama_cloud
   model: gemma4:31b
   system_prompt: "You are a restricted Telegram bot powered by llama bridge. Answer helpfully, keep replies concise, use bridge tools only when clearly needed, and refuse unsafe or privileged actions."
@@ -399,6 +402,7 @@ telegram:
       - source_research
     command_tools:
       - image_research
+      - image_download
       - verify_sources
     blocked_tools:
       - shell.execute
@@ -407,6 +411,7 @@ telegram:
       - wikipedia_search
       - tavily_search
       - image_research
+      - image_download
     require_admin_for:
       - shell.execute
       - manim_render
@@ -445,6 +450,7 @@ tools:
     - tavily_search
     - source_research
     - image_research
+    - image_download
     - verify_sources
 
   # -- Tool selection & filtering ----------------------------------------
@@ -607,12 +613,12 @@ class ToolPolicy:
         "tavily_search", "source_research",
     ])
     command_tools: list[str] = field(default_factory=lambda: [
-        "image_research", "verify_sources",
+        "image_research", "image_download", "verify_sources",
     ])
     blocked_tools: list[str] = field(default_factory=lambda: ["shell.execute"])
     user_visible_tools: list[str] = field(default_factory=lambda: [
         "weather_current", "wikipedia_search",
-        "tavily_search", "image_research",
+        "tavily_search", "image_research", "image_download",
     ])
     require_admin_for: list[str] = field(default_factory=lambda: ["shell.execute", "manim_render"])
     require_owner_for: list[str] = field(default_factory=lambda: ["shell.execute"])
@@ -1194,6 +1200,7 @@ def _merge_missing_config_fields_ruamel(path: Path) -> None:
     yaml_parser = YAML()
     yaml_parser.preserve_quotes = True
     yaml_parser.default_flow_style = False
+    yaml_parser.indent(mapping=2, sequence=4, offset=2)
 
     if path.exists():
         existing_text = path.read_text(encoding="utf-8")
@@ -1208,7 +1215,10 @@ def _merge_missing_config_fields_ruamel(path: Path) -> None:
         comment_line_count = sum(
             1 for line in existing_text.splitlines() if line.lstrip().startswith("#")
         )
-        if comment_line_count < 10:
+        template_comment_line_count = sum(
+            1 for line in template_text.splitlines() if line.lstrip().startswith("#")
+        )
+        if comment_line_count < max(10, template_comment_line_count):
             _overlay_config_values(template_data, existing_data)
             output = io.StringIO()
             yaml_parser.dump(template_data, output)
@@ -1307,11 +1317,15 @@ def write_config_data(path: Path, data: dict[str, Any]) -> Path:
         comment_line_count = sum(
             1 for line in existing_text.splitlines() if line.lstrip().startswith("#")
         )
-        source_text = existing_text if comment_line_count >= 10 else template_text
+        template_comment_line_count = sum(
+            1 for line in template_text.splitlines() if line.lstrip().startswith("#")
+        )
+        source_text = existing_text if comment_line_count >= template_comment_line_count else template_text
 
         yaml_parser = YAML()
         yaml_parser.preserve_quotes = True
         yaml_parser.default_flow_style = False
+        yaml_parser.indent(mapping=2, sequence=4, offset=2)
         base = yaml_parser.load(source_text) if source_text.strip() else CommentedMap()
         if base is None:
             base = CommentedMap()

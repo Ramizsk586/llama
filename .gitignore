@@ -28,3 +28,4 @@ llama.telegram.pid
 llama.claude.closed
 uv.lock
 .ruff_cache
+.runtime

@@ -26,6 +26,10 @@ from .master import MasterReviewer
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 WIKIMEDIA_USER_AGENT = "llama-bridge/0.1 (local personal use; contact: user@example.com)"
 GEOCODING_USER_AGENT = "llama-bridge/0.1 (local personal use)"
+MOZILLA_IMAGE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 COUNTRY_TIMEZONES = {
     "india": "Asia/Kolkata",
     "in": "Asia/Kolkata",
@@ -778,6 +782,41 @@ class ToolRegistry:
         )
         self._register(
             ToolDefinition(
+                name="image_download",
+                description=(
+                    "Download a public HTTP image URL to a local file and return its local_path.\n"
+                    "USE WHEN: image_research returns an image_url or thumbnail that must be attached, uploaded, or embedded as a local file.\n"
+                    "GUARDRAILS: Only download public http/https image URLs. Do not use this for private, localhost, or non-image URLs.\n"
+                    "RESULT FORMAT: local_path, absolute_path, media_type, bytes, source_url, and title."
+                ),
+                parameters={
+                    "type": "object",
+                    "required": ["image_url"],
+                    "properties": {
+                        "image_url": {
+                            "type": "string",
+                            "description": "Public direct image URL returned by image_research.",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Optional image title used to name the downloaded file.",
+                        },
+                        "source_url": {
+                            "type": "string",
+                            "description": "Optional source page URL for provenance and request headers.",
+                        },
+                        "output_dir": {
+                            "type": "string",
+                            "description": "Repo-relative output directory. Defaults to downloaded_images.",
+                            "default": "downloaded_images",
+                        },
+                    },
+                },
+                handler=self._image_download,
+            )
+        )
+        self._register(
+            ToolDefinition(
                 name="verify_sources",
                 description=(
                     "Launch parallel source-verifier workers for specific URLs and return reachable evidence snippets.\n"
@@ -1225,6 +1264,11 @@ class ToolRegistry:
         gathered: list[dict[str, Any] | Exception] = []
         fallback_used = False
         wikipedia_used = False
+        ddg_result = await asyncio.gather(
+            self._research_duckduckgo_images(query, max_results),
+            return_exceptions=True,
+        )
+        gathered.extend(ddg_result)
         if self.config.tools.wikipedia.enabled:
             wiki_result = await asyncio.gather(
                 self._research_wikipedia_images(query, max_results),
@@ -1298,10 +1342,11 @@ class ToolRegistry:
                 "Use clear, readable images only; skip blurry thumbnails, tiny previews, cropped maps/charts, or weakly sourced images.",
                 "Prefer full image_url values over thumbnails, and include a source_url for every embedded image when possible.",
                 "Use regular search/source data for the article text, then place images near the relevant section.",
+                "DuckDuckGo image search uses browser-style Mozilla headers and is preferred for Telegram sendable image requests.",
                 "Use SerpAPI image search as a fallback when the preferred image provider fails or returns no images.",
             ],
             "provider_policy": {
-                "preferred": "wikipedia_images" if wikipedia_used else ("tavily_images" if self.config.tools.tavily.enabled else "serpapi_images"),
+                "preferred": "duckduckgo_images",
                 "fallback": "serpapi_images",
                 "fallback_used": fallback_used,
                 "wikipedia_used": wikipedia_used,
@@ -1319,6 +1364,53 @@ class ToolRegistry:
             ],
             "errors": errors,
         }
+
+    async def _research_duckduckgo_images(self, query: str, max_results: int) -> dict[str, Any]:
+        headers = {
+            "User-Agent": MOZILLA_IMAGE_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        page = await self._request_with_retries(
+            "GET",
+            "https://duckduckgo.com/",
+            params={"q": query, "iax": "images", "ia": "images"},
+            headers=headers,
+            follow_redirects=True,
+        )
+        match = re.search(r"vqd=['\"]?([^'\"&<>\\]+)", page.text)
+        if not match:
+            raise ValueError("DuckDuckGo image token was not found.")
+        vqd = match.group(1)
+        response = await self._request_with_retries(
+            "GET",
+            "https://duckduckgo.com/i.js",
+            params={
+                "l": "wt-wt",
+                "o": "json",
+                "q": query,
+                "vqd": vqd,
+                "f": ",,,,,",
+                "p": "1",
+                "s": "0",
+            },
+            headers={
+                **headers,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Referer": str(page.url),
+                "X-Requested-With": "XMLHttpRequest",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            follow_redirects=True,
+        )
+        data = response.json()
+        images = [
+            _image_candidate("duckduckgo", item, title=item.get("title") if isinstance(item, dict) else query)
+            for item in (data.get("results") or [])[:max_results]
+        ]
+        return {"provider": "duckduckgo", "results": [], "images": images}
 
     async def _research_wikipedia_images(self, query: str, max_results: int) -> dict[str, Any]:
         provider = self.config.tools.wikipedia
@@ -1406,6 +1498,61 @@ class ToolRegistry:
             counter += 1
         file_path.write_bytes(response.content)
         return file_path.relative_to(Path.cwd()).as_posix()
+
+    async def _image_download(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        image_url = _validate_public_http_url(_required_string(arguments, "image_url"))
+        source_url = str(arguments.get("source_url") or "").strip()
+        if source_url:
+            _validate_public_http_url(source_url)
+        title = str(arguments.get("title") or "image").strip()
+        output_dir = safe_tool_output_dir(arguments.get("output_dir") or "downloaded_images")
+        headers = {
+            "User-Agent": MOZILLA_IMAGE_USER_AGENT,
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if source_url:
+            headers["Referer"] = source_url
+        try:
+            response = await self._request_with_retries(
+                "GET",
+                image_url,
+                headers=headers,
+                follow_redirects=True,
+            )
+        except Exception:
+            proxy_url = f"https://external-content.duckduckgo.com/iu/?u={quote(image_url, safe='')}&f=1&nofb=1"
+            response = await self._request_with_retries(
+                "GET",
+                proxy_url,
+                headers={
+                    **headers,
+                    "Referer": "https://duckduckgo.com/",
+                },
+                follow_redirects=True,
+            )
+        content_type = response.headers.get("content-type", "").split(";", maxsplit=1)[0].strip().lower()
+        if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
+            raise ValueError(f"URL did not return an image content type: {content_type}")
+        content = response.content
+        if len(content) > 25 * 1024 * 1024:
+            raise ValueError("Image is too large to download safely.")
+        suffix = image_suffix_from_response(str(response.url), content_type)
+        if suffix not in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}:
+            raise ValueError(f"Unsupported image type: {content_type or suffix}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        slug = _slugify_filename(title)[:80] or "image"
+        path = unique_tool_path(output_dir / f"{slug}{suffix}")
+        path.write_bytes(content)
+        return {
+            "title": title,
+            "image_url": image_url,
+            "source_url": source_url or None,
+            "local_path": path.relative_to(Path.cwd()).as_posix(),
+            "absolute_path": str(path.resolve()),
+            "media_type": content_type or None,
+            "bytes": len(content),
+        }
 
     async def _verify_sources(self, arguments: dict[str, Any]) -> dict[str, Any]:
         urls = arguments.get("urls")
@@ -1853,6 +2000,13 @@ def validate_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, A
 
     if name in {"wikipedia_search", "serpapi_search", "tavily_search", "source_research", "image_research"}:
         _ensure_non_empty_string(cleaned, "query")
+    if name == "image_download":
+        _ensure_non_empty_string(cleaned, "image_url")
+        cleaned["image_url"] = _validate_public_http_url(_clean_url(str(cleaned["image_url"])))
+        if cleaned.get("source_url"):
+            cleaned["source_url"] = _validate_public_http_url(_clean_url(str(cleaned["source_url"])))
+        if cleaned.get("output_dir") is not None and not isinstance(cleaned["output_dir"], str):
+            cleaned["output_dir"] = str(cleaned["output_dir"])
     if name == "manim_render":
         _ensure_non_empty_string(cleaned, "prompt")
         if cleaned.get("quality") is not None and cleaned["quality"] not in {"low", "medium", "high"}:
@@ -2072,7 +2226,7 @@ def _dedupe_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
     for image in images:
-        url = image.get("image_url") or image.get("thumbnail")
+        url = image.get("local_path") or image.get("image_url") or image.get("thumbnail")
         if not url:
             continue
         key = str(url).rstrip("/").lower()
@@ -2117,6 +2271,48 @@ def _compact_image_markdown(image: dict[str, Any]) -> str:
 def _slugify_filename(value: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
     return text.strip(".-").lower()
+
+
+def safe_tool_output_dir(value: Any) -> Path:
+    raw = str(value or "downloaded_images").strip() or "downloaded_images"
+    path = Path(raw)
+    if path.is_absolute():
+        raise ToolValidationError("output_dir must be relative to the workspace.")
+    root = Path.cwd().resolve()
+    resolved = (root / path).resolve()
+    if root != resolved and root not in resolved.parents:
+        raise ToolValidationError("output_dir must stay inside the workspace.")
+    return resolved
+
+
+def image_suffix_from_response(url: str, content_type: str) -> str:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}:
+        return suffix
+    if "png" in content_type:
+        return ".png"
+    if "jpeg" in content_type or "jpg" in content_type:
+        return ".jpg"
+    if "webp" in content_type:
+        return ".webp"
+    if "gif" in content_type:
+        return ".gif"
+    if "svg" in content_type:
+        return ".svg"
+    return ".img"
+
+
+def unique_tool_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    for counter in range(2, 10_000):
+        candidate = parent / f"{stem}-{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise ValueError("Could not choose a unique output path.")
 
 
 def _html_title(html: str) -> str | None:
@@ -2314,6 +2510,8 @@ def _validate_tool_output(name: str, result: Any) -> dict[str, Any]:
             raise ValueError(f"{name} returned no verdict")
     elif name == "image_research":
         _require_list_output(name, result, "images")
+    elif name == "image_download":
+        _require_output_keys(name, result, {"local_path", "absolute_path", "bytes"})
     elif name == "master_review":
         _require_output_keys(name, result, {"ok", "tool", "data", "metadata"})
     elif name == "manim_render":
@@ -2433,6 +2631,8 @@ def _tool_source(name: str) -> str:
         return "serpapi+tavily+parallel-verifiers"
     if name == "image_research":
         return "serpapi+tavily-images"
+    if name == "image_download":
+        return "http-image-download"
     if name == "verify_sources":
         return "parallel-source-verifiers"
     if name == "master_review":
@@ -2481,6 +2681,10 @@ TOOL_KEYWORDS = {
     "image_research": {
         "keywords": ["image", "images", "photo", "picture", "visual", "markdown", "illustrate", "screenshot"],
         "weight": 3.5,
+    },
+    "image_download": {
+        "keywords": ["download image", "send image", "attach image", "upload photo", "local image"],
+        "weight": 3.2,
     },
     "verify_sources": {
         "keywords": ["verify", "check source", "validate", "link", "links", "url", "citation", "fact check"],
@@ -2789,6 +2993,7 @@ def _tool_sort_key(tool: dict[str, Any], scores: dict[str, float], default_searc
         f"{default_search_provider}_search": 70,
         "tavily_search": 65,
         "serpapi_search": 60,
+        "image_download": 59,
         "image_research": 58,
         "wikipedia_search": 55,
         "wikipedia_page": 45,
@@ -2833,7 +3038,7 @@ def _forced_tool_names(query: str, default_search_provider: str = "tavily") -> s
     ):
         return {"datetime_now"}
     if any(word in query_lower for word in ("image", "images", "photo", "picture", "visual")):
-        return {"image_research"}
+        return {"image_research", "image_download"}
     if any(
         phrase in query_lower
         for phrase in (

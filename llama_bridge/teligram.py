@@ -1040,6 +1040,23 @@ class TeligramBot:
     def prepare_output_text(self, text: str) -> str:
         return self.output_rules.apply(polish_telegram_text(text))
 
+    def write_dev_log(self, event: str, payload: Any) -> None:
+        if os.environ.get("LLAMA_DEV_LOG") != "1":
+            return
+        try:
+            source_path = getattr(self.config, "source_path", None)
+            base_dir = Path(source_path).parent if source_path else self.workspace.parent
+            log_path = base_dir / "llama.dev.log"
+            entry = {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "event": event,
+                "payload": compact_telegram_dev_payload(payload),
+            }
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        except Exception:
+            return
+
     async def send_photo(self, chat_id: str, photo: str, caption: str | None = None) -> None:
         payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo, **self._telegram_thread_payload(self._send_context(chat_id).get("thread_id"))}
         if caption:
@@ -1368,32 +1385,29 @@ class TeligramBot:
         if not images:
             await self.send_message(chat_id, "I could not find a sendable image for that.")
             return
-        fallback_url = ""
-        fallback_caption = "Image"
         for image in images:
-            url = str(image.get("image_url") or image.get("thumbnail") or "").strip()
-            if not url:
-                continue
             title = str(image.get("title") or query).strip()
             source = str(image.get("source_url") or "").strip()
-            caption = f"{title}\nSource: {source}" if source else title
-            fallback_url = fallback_url or url
-            fallback_caption = fallback_caption if fallback_url != url else caption
+            source_host = urlparse(source).netloc if source else ""
+            caption = f"{title}\nSource: {source_host}" if source_host else title
             local_path = str(image.get("local_path") or "").strip()
             if local_path:
                 path = Path(local_path)
                 if path.exists() and path.is_file():
                     await self.send_photo_file(chat_id, path, caption)
                     return
-            downloaded = await self.download_image(url, query, source_url=source)
-            if downloaded is not None:
-                await self.send_photo_file(chat_id, downloaded, caption)
-                return
-            LOGGER.info("Telegram image candidate download failed, trying next candidate: url=%s", url)
-        if fallback_url:
-            await self.send_photo(chat_id, fallback_url, fallback_caption)
-            return
-        await self.send_message(chat_id, "I found image metadata, but none of the image URLs were sendable.")
+            for url in image_candidate_urls(image):
+                downloaded = await self.download_image_with_tool(
+                    url,
+                    query,
+                    title=title,
+                    source_url=source,
+                )
+                if downloaded is not None:
+                    await self.send_photo_file(chat_id, downloaded, caption)
+                    return
+                LOGGER.info("Telegram image candidate download failed, trying next URL: url=%s", url)
+        await self.send_message(chat_id, "I found image metadata, but I could not download a sendable image file.")
 
     async def handle_download_image_followup(self, chat_id: str, text: str) -> bool:
         url = extract_first_image_url(text)
@@ -1403,9 +1417,31 @@ class TeligramBot:
             return False
 
         await self.send_message(chat_id, "Downloading the image and sending it now.")
-        downloaded = await self.download_image(url, "telegram-image")
+        downloaded = await self.download_image_with_tool(url, "telegram-image", title="telegram-image")
         if downloaded is None:
-            await self.send_photo(chat_id, url, "Image")
+            await self.send_message(chat_id, "I could not download that image file, so I did not send the link.")
+            return True
+        await self.send_photo_file(chat_id, downloaded, "Image")
+        return True
+
+    async def handle_image_tool_chat_request(self, chat_id: str, text: str) -> bool:
+        query = parse_natural_image_request(text)
+        if query is None:
+            return False
+        LOGGER.info("Telegram route: image_tool_chat_request")
+        await self.handle_image_request(chat_id, query)
+        return True
+
+    async def handle_model_image_reply(self, chat_id: str, user_text: str, reply: str) -> bool:
+        if parse_natural_image_request(user_text) is None:
+            return False
+        url = extract_first_image_url(reply)
+        if url is None:
+            return False
+        LOGGER.info("Telegram route: model_image_reply_download")
+        downloaded = await self.download_image_with_tool(url, "telegram-image", title="telegram-image")
+        if downloaded is None:
+            await self.send_message(chat_id, "I found an image link, but I could not download it, so I did not send the link.")
             return True
         await self.send_photo_file(chat_id, downloaded, "Image")
         return True
@@ -1429,9 +1465,47 @@ class TeligramBot:
         images = ((result.get("data") or {}).get("images") or [])
         candidates: list[dict[str, Any]] = []
         for image in images:
-            if isinstance(image, dict) and (image.get("image_url") or image.get("thumbnail")):
+            if isinstance(image, dict) and (image.get("local_path") or image.get("image_url") or image.get("thumbnail")):
                 candidates.append(image)
         return candidates
+
+    async def download_image_with_tool(
+        self,
+        url: str,
+        query: str,
+        *,
+        title: str | None = None,
+        source_url: str | None = None,
+    ) -> Path | None:
+        if self.tools and "image_download" in self.available_tool_names():
+            LOGGER.info("Telegram deterministic tool call: mode=image tool=image_download")
+            arguments = {
+                "image_url": url,
+                "title": title or query,
+                "source_url": source_url,
+                "output_dir": "generated/telegram_images",
+            }
+            result = await self.tools.call_structured("image_download", arguments)
+            self.write_dev_log(
+                "telegram.tool.call",
+                {
+                    "name": "image_download",
+                    "arguments": arguments,
+                    "ok": result.get("ok") if isinstance(result, dict) else None,
+                    "error": result.get("error") if isinstance(result, dict) else None,
+                },
+            )
+            if result.get("ok"):
+                data = result.get("data") or {}
+                path_text = str(data.get("absolute_path") or data.get("local_path") or "").strip()
+                if path_text:
+                    path = Path(path_text)
+                    if not path.is_absolute():
+                        path = Path.cwd() / path
+                    if path.exists() and path.is_file():
+                        return path
+            LOGGER.info("Telegram image_download tool failed: %s", result.get("error") if isinstance(result, dict) else "-")
+        return await self.download_image(url, query, source_url=source_url)
 
     async def download_image(self, url: str, query: str, *, source_url: str | None = None) -> Path | None:
         if not is_http_url(url):
@@ -2263,6 +2337,15 @@ class TeligramBot:
             len(messages),
             len(tools),
         )
+        self.write_dev_log(
+            "telegram.provider.request",
+            {
+                "provider": self.provider_name,
+                "model": self.model,
+                "messages": messages,
+                "tools": [openai_tool_name(tool) for tool in tools],
+            },
+        )
         try:
             data = await asyncio.wait_for(
                 self.create_chat_completion_with_tools(payload),
@@ -2271,6 +2354,13 @@ class TeligramBot:
             content = chat_completion_text(data)
             if content:
                 LOGGER.info("Telegram provider response: ok chars=%s", len(content))
+                self.write_dev_log(
+                    "telegram.provider.response",
+                    {
+                        "chars": len(content),
+                        "content": content,
+                    },
+                )
                 return content
             LOGGER.warning("Provider returned an empty Telegram response")
         except (httpx.ConnectError, httpx.NetworkError) as exc:
@@ -2314,6 +2404,19 @@ class TeligramBot:
                     arguments = {}
                 LOGGER.info("Telegram tool call: %s", name)
                 result = await self.tools.call_structured(name, arguments)
+                self.write_dev_log(
+                    "telegram.tool.call",
+                    {
+                        "name": name,
+                        "arguments": arguments,
+                        "ok": result.get("ok") if isinstance(result, dict) else None,
+                        "error": result.get("error") if isinstance(result, dict) else None,
+                    },
+                )
+                if name == "image_research":
+                    followup = await self.image_research_download_followup(result)
+                    if followup is not None:
+                        result = {**result, "telegram_followup_tool": followup}
                 request_payload["messages"].append(
                     {
                         "role": "tool",
@@ -2322,6 +2425,52 @@ class TeligramBot:
                     }
                 )
         return data
+
+    async def image_research_download_followup(self, image_research_result: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.tools or "image_download" not in self.available_tool_names():
+            return None
+        if not image_research_result.get("ok"):
+            return None
+        images = ((image_research_result.get("data") or {}).get("images") or [])
+        if not isinstance(images, list):
+            return None
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            if image.get("local_path"):
+                return {
+                    "name": "image_download",
+                    "skipped": True,
+                    "reason": "image_research already returned local_path",
+                    "local_path": image.get("local_path"),
+                }
+            for url in image_candidate_urls(image):
+                arguments = {
+                    "image_url": url,
+                    "title": image.get("title") or "telegram-image",
+                    "source_url": image.get("source_url"),
+                    "output_dir": "generated/telegram_images",
+                }
+                LOGGER.info("Telegram followup tool call: image_download")
+                result = await self.tools.call_structured("image_download", arguments)
+                self.write_dev_log(
+                    "telegram.tool.call",
+                    {
+                        "name": "image_download",
+                        "arguments": arguments,
+                        "ok": result.get("ok") if isinstance(result, dict) else None,
+                        "error": result.get("error") if isinstance(result, dict) else None,
+                        "followup_for": "image_research",
+                    },
+                )
+                if result.get("ok"):
+                    return {
+                        "name": "image_download",
+                        "arguments": arguments,
+                        "result": result,
+                    }
+                LOGGER.info("Telegram followup image_download failed, trying next image URL")
+        return None
 
     def selected_openai_tools(self, messages: list[dict[str, str]]) -> list[dict[str, Any]]:
         if not self.tools or not getattr(self.provider_cfg, "supports_tools", False):
@@ -2590,10 +2739,19 @@ class TeligramBot:
         if await self.handle_download_image_followup(chat_id, text):
             LOGGER.info("Telegram route: image_download_followup")
             return
+        if await self.handle_image_tool_chat_request(chat_id, text):
+            return
         natural_file = parse_natural_file_request(text)
         if natural_file is not None:
             LOGGER.info("Telegram route: natural_file_request")
             await self.handle_file_request(chat_id, natural_file)
+            return
+        natural_job = parse_natural_job_request(text)
+        if natural_job is not None:
+            LOGGER.info("Telegram route: natural_job_request")
+            schedule_text, action = natural_job
+            result = self.create_routine_from_text(f"{schedule_text} | {action}", chat_id)
+            await self.send_message(chat_id, result)
             return
         natural_schedule = parse_natural_schedule_request(text)
         if natural_schedule is not None:
@@ -2636,6 +2794,8 @@ class TeligramBot:
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await typing_task
+        if await self.handle_model_image_reply(chat_id, trimmed, reply):
+            return
         await self.send_message(chat_id, reply)
 
     def latest_conversation_image_url(self, chat_id: str) -> str | None:
@@ -3923,7 +4083,11 @@ def parse_natural_poll_request(text: str) -> tuple[str, list[str]] | None:
 
 def parse_natural_image_request(text: str) -> str | None:
     patterns = [
+        r"(?is)^\s*i\s+(?:want|need|would\s+like)\s+(?:an?\s+)?(?:image|photo|picture)\s+(?:of|for|about)?\s*(.+)$",
         r"(?is)^\s*(?:send|show|find|get)\s+(?:me\s+)?(?:an?\s+)?(?:image|photo|picture)\s+(?:of|for|about)?\s*(.+)$",
+        r"(?is)^\s*(?:search|look\s*up)\s+(?:for\s+)?(?:me\s+)?(?:an?\s+)?(?:image|photo|picture)s?\s+(?:of|for|about)?\s*(.+)$",
+        r"(?is)^\s*(?:image|photo|picture)\s+(?:search|sarch)\s+(?:of|for|about)?\s*(.+)$",
+        r"(?is)^\s*(?:search|sarch)\s+(?:image|photo|picture)s?\s+(?:of|for|about)?\s*(.+)$",
         r"(?is)^\s*(?:image|photo|picture)\s+(?:of|for|about)\s+(.+)$",
     ]
     for pattern in patterns:
@@ -3931,7 +4095,54 @@ def parse_natural_image_request(text: str) -> str | None:
         if match:
             query = match.group(1).strip(" .")
             return query or None
+    lowered = text.lower()
+    if any(word in lowered for word in ("image", "photo", "picture")) and any(
+        word in lowered for word in ("send", "show", "find", "get", "search", "sarch", "download")
+    ):
+        query = re.sub(
+            r"(?i)\b(send|show|find|get|search|sarch|download|me|please|an?|images?|photos?|pictures?|of|for|about)\b",
+            " ",
+            text,
+        )
+        query = re.sub(r"\s+", " ", query).strip(" .")
+        return query or None
     return None
+
+
+def compact_telegram_dev_payload(value: Any, *, depth: int = 0, key: str | None = None) -> Any:
+    if depth >= 6:
+        return "<nested value omitted>"
+    if isinstance(value, str):
+        limit = 700 if key == "content" else 350
+        if len(value) <= limit:
+            return value
+        return f"{value[:limit]}... <truncated {len(value) - limit} chars>"
+    if isinstance(value, list):
+        return [compact_telegram_dev_payload(item, depth=depth + 1) for item in value[:12]]
+    if isinstance(value, dict):
+        compacted: dict[str, Any] = {}
+        for item_key, item_value in value.items():
+            item_key_text = str(item_key)
+            if item_key_text.lower() in {"api_key", "apikey", "authorization", "x-api-key", "auth_token", "token"}:
+                compacted[item_key_text] = "<redacted>"
+                continue
+            if item_key_text == "messages" and isinstance(item_value, list):
+                compacted[item_key_text] = [
+                    {
+                        "role": str(message.get("role") or ""),
+                        "content": compact_telegram_dev_payload(str(message.get("content") or ""), depth=depth + 1, key="content"),
+                    }
+                    for message in item_value[:8]
+                    if isinstance(message, dict)
+                ]
+                continue
+            compacted[item_key_text] = compact_telegram_dev_payload(
+                item_value,
+                depth=depth + 1,
+                key=item_key_text,
+            )
+        return compacted
+    return value
 
 
 def looks_like_image_download_request(text: str) -> bool:
@@ -3947,6 +4158,15 @@ def extract_first_image_url(text: str) -> str | None:
         if looks_like_image_url(url):
             return url
     return None
+
+
+def image_candidate_urls(image: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for key in ("image_url", "thumbnail"):
+        url = str(image.get(key) or "").strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def looks_like_image_url(url: str) -> bool:
@@ -4053,6 +4273,33 @@ def normalize_scheduled_action(action: str) -> str:
     return f"send {action}"
 
 
+def parse_natural_job_request(text: str) -> tuple[str, str] | None:
+    cleaned = text.strip()
+    patterns = [
+        r"(?is)^\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:you\s+have\s+to|to|that|for)?\s+(.+?)\s*$",
+        r"(?is)^\s*(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:to\s+)?(.+?)\s*$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, cleaned)
+        if not match:
+            continue
+        hour, minute, meridiem, action = match.groups()
+        time_text = normalize_schedule_time(hour, minute, meridiem)
+        action = normalize_scheduled_action(action)
+        if time_text and action:
+            return local_time_once_iso(time_text), action
+    return None
+
+
+def local_time_once_iso(time_text: str) -> str:
+    hour_text, minute_text = time_text.split(":", maxsplit=1)
+    now = datetime.now().astimezone()
+    candidate = now.replace(hour=int(hour_text), minute=int(minute_text), second=0, microsecond=0)
+    if candidate < now - timedelta(minutes=2):
+        candidate += timedelta(days=1)
+    return candidate.isoformat()
+
+
 def parse_routine_create_request(text: str) -> tuple[str, str] | None:
     if "|" in text:
         schedule, prompt = text.split("|", maxsplit=1)
@@ -4080,6 +4327,15 @@ def parse_routine_schedule(schedule: str) -> dict[str, Any]:
     cron_parts = original.split()
     if len(cron_parts) == 5 and all(is_cron_field(part) for part in cron_parts):
         return {"kind": "cron", "expr": original, "display": original}
+    time_match = re.match(r"^(\d{1,2}):(\d{2})\s*([ap]m)?$", original, re.IGNORECASE)
+    if time_match:
+        time_text = normalize_schedule_time(time_match.group(1), time_match.group(2), time_match.group(3))
+        if time_text is None:
+            raise ValueError(f"Invalid time: {original}")
+        run_at = parse_datetime_or_none(local_time_once_iso(time_text))
+        if run_at is None:
+            raise ValueError(f"Invalid time: {original}")
+        return {"kind": "once", "run_at": run_at.isoformat(), "display": f"once at {format_local_datetime(run_at)}"}
     if "T" in original or re.match(r"^\d{4}-\d{2}-\d{2}", original):
         dt = parse_datetime_or_none(original)
         if dt is None:
