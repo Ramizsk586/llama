@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import json
 import os
 import platform
 import re
@@ -393,6 +394,7 @@ def main() -> int:
         python = _ensure_python(args.dry_run)
         _refuse_admin()
         _validate_install_dir(install_dir)
+        _check_existing_llama_install(install_dir, args, install_state)
         _check_disk_space(Path(tempfile.gettempdir()), install_dir)
         steps.complete(step)
         panel.render()
@@ -446,10 +448,10 @@ def main() -> int:
             raise RuntimeError(f"Build did not create {built_exe}")
         _verify_exe(built_exe, source_dir)
 
-        install_agent = _choose_agent_install(args)
+        install_agent, agent_is_update = _choose_agent_install(args, install_dir)
         step = steps.next("Installed llama agent")
         if install_agent:
-            _install_llama_agent(git, agent_source_dir, install_dir / "agent", args.dry_run, panel, step)
+            _install_llama_agent(git, agent_source_dir, install_dir / "agent", args.dry_run, panel, step, agent_is_update)
             agent_installed = True
         else:
             Log.info("Skipping llama_agent install.")
@@ -623,20 +625,92 @@ def _install_with_winget(package_id: str, display_name: str, dry_run: bool) -> N
     )
 
 
-def _choose_agent_install(args: argparse.Namespace) -> bool:
-    """Ask whether llama_agent should be installed."""
+def _check_existing_llama_install(install_dir: Path, args: argparse.Namespace, install_state: InstallState) -> None:
+    """Detect an existing llama.exe and ask whether it should be replaced."""
+    llama_exe = install_dir / "llama.exe"
+    if not llama_exe.exists():
+        return
+
+    installed_version = "unknown"
+    try:
+        result = subprocess.run(
+            [str(llama_exe), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.stdout.strip():
+            installed_version = result.stdout.strip().splitlines()[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    remote_version = "latest from GitHub"
+    Log.info("Llama Bridge is already installed.")
+    Log.info(f"  Installed version : {installed_version}")
+    Log.info(f"  Available version : {remote_version}")
+
+    if not sys.stdin.isatty():
+        Log.warn("Existing install detected but input is not interactive; proceeding with update automatically.")
+        _uninstall_existing_llama(install_dir, install_state, args.dry_run)
+        return
+
+    print()
+    answer = input("Do you want to update to the latest version? [Y/n]: ").strip().lower()
+    if answer in {"", "y", "yes"}:
+        _uninstall_existing_llama(install_dir, install_state, args.dry_run)
+        return
+
+    Log.info("Keeping existing installation. Exiting.")
+    raise SystemExit(0)
+
+
+def _uninstall_existing_llama(install_dir: Path, state: InstallState, dry_run: bool) -> None:
+    """Move the current install aside so a new build can replace it."""
+    Log.warn(f"Removing existing Llama Bridge installation from {install_dir}...")
+    if dry_run:
+        Log.info(f"[DRY RUN] Would delete {install_dir}")
+        return
+    backup_dir = install_dir.with_name(f"{install_dir.name}.old")
+    _set_install_backup_state(state, backup_dir)
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+    install_dir.rename(backup_dir)
+    Log.ok(f"Existing installation moved to backup: {backup_dir}")
+
+
+def _choose_agent_install(args: argparse.Namespace, install_dir: Path) -> tuple[bool, bool]:
+    """Ask whether llama_agent should be installed or updated."""
     if args.install_agent and args.no_install_agent:
         raise RuntimeError("Use only one of --install-agent or --no-install-agent.")
+    agent_dir = install_dir / "agent"
+    agent_installed = (agent_dir / "package.json").exists()
+
+    if agent_installed:
+        if args.install_agent:
+            return True, True
+        if args.no_install_agent:
+            return False, False
+        if not sys.stdin.isatty():
+            Log.warn("Existing agent detected; skipping update in non-interactive mode.")
+            return False, False
+        print()
+        Log.info(f"llama_agent is already installed at {agent_dir}.")
+        answer = input("Do you want to update it to the latest version? [Y/n]: ").strip().lower()
+        if answer in {"", "y", "yes"}:
+            return True, True
+        return False, False
+
     if args.install_agent:
-        return True
+        return True, False
     if args.no_install_agent:
-        return False
+        return False, False
     if not sys.stdin.isatty():
         Log.warn("Input is not interactive; skipping optional llama_agent install.")
-        return False
+        return False, False
     print()
     answer = input("Install llama_agent and enable `llama agent` commands? [Y/n]: ").strip().lower()
-    return answer in {"", "y", "yes"}
+    return answer in {"", "y", "yes"}, False
 
 
 def _install_llama_agent(
@@ -646,18 +720,27 @@ def _install_llama_agent(
     dry_run: bool,
     panel: StatusPanel,
     step: StepEntry,
+    is_update: bool,
 ) -> None:
     """Clone and configure llama_agent for use with Llama Bridge."""
     _ensure_node(dry_run)
     npm = _ensure_npm(dry_run)
+    if is_update:
+        Log.warn("Removing old agent install...")
+        if dry_run:
+            Log.info(f"[DRY RUN] Would delete existing agent at {final_agent_dir}")
+        elif final_agent_dir.exists():
+            shutil.rmtree(final_agent_dir)
     if dry_run:
         Log.info(f"[DRY RUN] Would clone {AGENT_REPO_URL} into {agent_dir}.")
         Log.info("[DRY RUN] Would run npm install, write .env.local, and launch npm run setup.")
+        Log.info("[DRY RUN] Would check for npm dependency updates.")
         panel.steps.complete(step)
         panel.render()
         return
     _run([git, "clone", "--depth", "1", AGENT_REPO_URL, str(agent_dir)], "Cloning llama_agent", panel, step, finish_step=False)
     _run([npm, "install"], "Installing llama_agent dependencies", panel, step, cwd=agent_dir, finish_step=False)
+    _check_npm_updates(npm, agent_dir, panel, step)
     _write_agent_env(agent_dir)
     if sys.stdin.isatty():
         _run_agent_setup_wizard(npm, agent_dir, final_agent_dir, panel, step)
@@ -669,6 +752,86 @@ def _install_llama_agent(
     panel.render()
     Log.ok("llama_agent configured for Llama Bridge.")
     Log.info("Use `llama agent` to start it, `llama agent --logs` to watch it, `llama agent --status` to inspect it, and `llama agent --stop` to stop it.")
+
+
+def _check_npm_updates(npm: str, agent_dir: Path, panel: StatusPanel, step: StepEntry) -> None:
+    """Offer to update outdated llama_agent npm dependencies."""
+    try:
+        result = subprocess.run(
+            [npm, "outdated", "--json"],
+            cwd=agent_dir,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        Log.debug(f"Could not check npm package updates: {exc}")
+        return
+
+    output = (result.stdout or "").strip()
+    if not output:
+        Log.debug("No outdated npm packages found.")
+        return
+    try:
+        outdated = json.loads(output)
+    except json.JSONDecodeError:
+        Log.debug("No outdated npm packages found.")
+        return
+    if not isinstance(outdated, dict) or not outdated:
+        Log.debug("No outdated npm packages found.")
+        return
+
+    compatible_updates: dict[str, str] = {}
+    major_updates: dict[str, str] = {}
+    rows: list[tuple[str, str, str, str]] = []
+    for name, details in sorted(outdated.items()):
+        if not isinstance(details, dict):
+            continue
+        current = str(details.get("current") or "")
+        wanted = str(details.get("wanted") or "")
+        latest = str(details.get("latest") or "")
+        if not current:
+            continue
+        if wanted and wanted != current:
+            compatible_updates[name] = wanted
+        if latest and latest != (wanted or current):
+            major_updates[name] = latest
+        if (wanted and wanted != current) or (latest and latest != current):
+            rows.append((name, current, wanted or "-", latest or "-"))
+
+    if not rows:
+        Log.ok("All npm packages are up to date.")
+        return
+
+    Log.info("Outdated npm packages found:")
+    Log.info("  Package                   Current   ->  Wanted    (Latest)")
+    Log.info("  ----------------------------------------------------------")
+    for name, current, wanted, latest in rows:
+        Log.info(f"  {name:<25} {current:<9} ->  {wanted:<9} ({latest})")
+
+    if not sys.stdin.isatty():
+        Log.warn("Non-interactive mode; skipping npm dependency update.")
+        return
+
+    updated = False
+    if compatible_updates:
+        answer = input(f"Update {len(compatible_updates)} compatible package(s) to their wanted versions? [Y/n]: ").strip().lower()
+        if answer in {"", "y", "yes"}:
+            packages = [f"{name}@{version}" for name, version in compatible_updates.items()]
+            _run([npm, "install", *packages, "--save"], "Updating compatible npm packages", panel, step, cwd=agent_dir, finish_step=False)
+            updated = True
+
+    if major_updates:
+        answer = input(
+            f"WARNING: {len(major_updates)} package(s) have MAJOR version updates available (may be breaking). Update those too? [y/N]: "
+        ).strip().lower()
+        if answer in {"y", "yes"}:
+            packages = [f"{name}@{version}" for name, version in major_updates.items()]
+            _run([npm, "install", *packages, "--save"], "Updating major npm packages", panel, step, cwd=agent_dir, finish_step=False)
+            updated = True
+
+    if updated:
+        Log.ok("npm packages updated.")
 
 
 def _ensure_node(dry_run: bool) -> str:
@@ -942,20 +1105,26 @@ def _copy_tree(source: Path, target: Path, agent_source: Path | None, dry_run: b
 
 def _replace_install_dir(staging_dir: Path, install_dir: Path, state: InstallState, dry_run: bool) -> None:
     """Atomically replace the install directory with the staged runtime."""
-    backup_dir = install_dir.with_name(f"{install_dir.name}.old")
-    state.backup_dir = backup_dir
+    backup_dir = state.backup_dir or install_dir.with_name(f"{install_dir.name}.old")
+    if state.backup_dir is None:
+        _set_install_backup_state(state, backup_dir)
     if dry_run:
         Log.info(f"[DRY RUN] Would replace {install_dir} with {staging_dir}.")
         return
-    state.replace_started = True
     install_dir.parent.mkdir(parents=True, exist_ok=True)
-    if backup_dir.exists():
+    if backup_dir.exists() and install_dir.exists():
         shutil.rmtree(backup_dir)
     if install_dir.exists():
         Log.warn(f"Moving existing install to backup: {backup_dir}")
         install_dir.rename(backup_dir)
     shutil.move(str(staging_dir), str(install_dir))
     Log.ok(f"Installed runtime files to {install_dir}")
+
+
+def _set_install_backup_state(state: InstallState, backup_dir: Path) -> None:
+    """Record the backup directory used for replacement and rollback."""
+    state.replace_started = True
+    state.backup_dir = backup_dir
 
 
 def _rollback_install_dir(install_dir: Path, state: InstallState, dry_run: bool) -> None:

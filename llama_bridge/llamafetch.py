@@ -150,9 +150,11 @@ def _open_sprinkle_slot(cells: list[str], col: int) -> bool:
 
 def _sprinkle_floor(frame: int) -> list[str]:
     rows = []
-    for row, slots in enumerate(((8, 18, 30), (13, 24, 34))):
+    center = LOGO_WIDTH // 2
+    for row, offset in enumerate((5, 10)):
         cells = [" "] * LOGO_WIDTH
-        for col in slots:
+        for i in range(3):
+            col = center - offset + (i * offset)
             glyph = SPARK if (col + row + frame) % 3 == 0 else DOT
             cells[col] = glyph
         rows.append(_paint_line(cells).rstrip())
