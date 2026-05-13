@@ -52,6 +52,7 @@ from .llama_claw import (
     run_ollama_openclaw,
     run_openclaw_command,
 )
+from .llamafetch import print_llamafetch
 from .master import MasterReviewer
 from .mcp_tools import main as mcp_tools_main
 from .tools import ToolRegistry, classify_query_intent, select_relevant_tools
@@ -464,10 +465,12 @@ def main() -> None:
             return
 
         if args.command is None:
-            _cmd_setup(_default_config_path(), install_system=True)
-            _print_note("Run `llama serve` to start the server or `llama claude` to launch Claude Code.")
+            _cmd_info(_default_config_path())
             return
 
+        if args.command == "info":
+            _cmd_info(_arg_path(args.config))
+            return
         if args.command == "init":
             _cmd_init(_arg_path(args.config), args.force)
             return
@@ -857,6 +860,9 @@ def _build_parser() -> argparse.ArgumentParser:
     status_cmd.add_argument("--pid-file")
     status_cmd.add_argument("--log-file")
 
+    info_cmd = subparsers.add_parser("info", help="show system info (like neofetch)")
+    info_cmd.add_argument("--config")
+
     api_cmd = subparsers.add_parser("api", help="inspect configured model APIs")
     api_cmd.add_argument("--config")
     api_cmd.add_argument(
@@ -1173,13 +1179,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "agent",
         help="start, stop, and inspect the installed llama_agent",
     )
-    agent_cmd.add_argument("agent_action", nargs="?", choices=["start", "status", "stop"], default="start")
+    agent_cmd.add_argument("agent_action", nargs="?", choices=["start", "status", "stop", "logs"], default="start")
     agent_cmd.add_argument("--home", help="llama_agent install directory")
     agent_cmd.add_argument("--pid-file")
     agent_cmd.add_argument("--log-file")
     agent_cmd.add_argument("--foreground", action="store_true", help="run llama_agent in the current terminal")
     agent_cmd.add_argument("--status", action="store_true", help="show llama_agent status")
     agent_cmd.add_argument("--stop", action="store_true", help="stop llama_agent")
+    agent_cmd.add_argument("--logs", action="store_true", help="show llama_agent logs")
+    agent_cmd.add_argument("-f", "--follow", action="store_true", default=True, help="keep printing new log lines (default)")
+    agent_cmd.add_argument("--no-follow", dest="follow", action="store_false", help="show the current log and exit")
+    agent_cmd.add_argument("--tail", type=int, default=200, help="number of existing log lines to show before following")
     agent_cmd.add_argument("--no-start-bridge", action="store_true", help="do not start Llama Bridge before the agent")
 
     cli_cmd = subparsers.add_parser(
@@ -2040,10 +2050,13 @@ def _cmd_stop(pid_path: Path) -> None:
 
 def _cmd_agent(args: argparse.Namespace) -> None:
     """Start, stop, or inspect the installed llama_agent."""
-    action = "status" if args.status else "stop" if args.stop else args.agent_action
+    action = "logs" if args.logs else "status" if args.status else "stop" if args.stop else args.agent_action
     home = _agent_home(Path(args.home) if args.home else None)
     pid_path = Path(args.pid_file) if args.pid_file else home / ".llama-agent.pid"
     log_path = Path(args.log_file) if args.log_file else home / ".llama-agent.log"
+    if action == "logs":
+        _cmd_agent_logs(log_path, pid_path, follow=args.follow, tail=args.tail)
+        return
     if action == "status":
         _cmd_agent_status(home, pid_path, log_path)
         return
@@ -2092,7 +2105,7 @@ def _cmd_agent_start(home: Path, pid_path: Path, log_path: Path, *, foreground: 
             verbose=False,
         )
     npm = _find_npm()
-    command, use_shell = _npm_start_command(npm)
+    command, use_shell = _npm_agent_command(npm, home)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if foreground:
         _print_state("run", "starting llama_agent in the current terminal", "36")
@@ -2116,7 +2129,13 @@ def _cmd_agent_start(home: Path, pid_path: Path, log_path: Path, *, foreground: 
         return
     pid_path.write_text(str(process.pid), encoding="utf-8")
     _print_state("ok", f"llama_agent started in background on pid {process.pid}", "32")
-    _kv_rows([("home", str(home)), ("log", str(log_path)), ("status", "llama agent --status"), ("stop", "llama agent --stop")])
+    _kv_rows([
+        ("home", str(home)),
+        ("log", str(log_path)),
+        ("logs", "llama agent --logs"),
+        ("status", "llama agent --status"),
+        ("stop", "llama agent --stop"),
+    ])
 
 
 def _cmd_agent_status(home: Path, pid_path: Path, log_path: Path) -> None:
@@ -2140,6 +2159,36 @@ def _cmd_agent_status(home: Path, pid_path: Path, log_path: Path) -> None:
             ("Log", str(log_path)),
         ]
     )
+
+
+def _cmd_agent_logs(log_path: Path, pid_path: Path, *, follow: bool = True, tail: int = 200) -> None:
+    """Show or follow llama_agent logs."""
+    running = _is_running(pid_path)
+    if not running and follow:
+        _print_state("stop", "llama_agent is not running; showing saved log and exiting", "33")
+        follow = False
+    if not log_path.exists():
+        _print_state("warn", f"no llama_agent log found at {log_path}", "33")
+        return
+    _title("llama agent logs")
+    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+        if tail > 0:
+            lines = handle.readlines()
+            for line in lines[-tail:]:
+                print(_format_log_line(line), end="")
+        elif not follow:
+            pass
+        try:
+            while True:
+                line = handle.readline()
+                if line:
+                    print(_format_log_line(line), end="")
+                    continue
+                if not follow:
+                    return
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return
 
 
 def _wait_for_agent_start(process: subprocess.Popen[Any], port: str, timeout_seconds: float) -> bool:
@@ -2193,11 +2242,21 @@ def _find_npm() -> str:
     return npm
 
 
-def _npm_start_command(npm: str) -> tuple[list[str] | str, bool]:
-    """Return a Windows-safe npm start command."""
+def _npm_agent_command(npm: str, home: Path) -> tuple[list[str] | str, bool]:
+    """Return a Windows-safe command for the full llama_agent stack."""
+    script = "start"
+    package_path = home / "package.json"
+    try:
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        scripts = package.get("scripts") if isinstance(package, dict) else {}
+        if isinstance(scripts, dict) and "dev" in scripts:
+            script = "dev"
+    except Exception:
+        script = "start"
+
     if os.name == "nt" and Path(npm).suffix.lower() in {".cmd", ".bat"}:
-        return subprocess.list2cmdline([npm, "start"]), True
-    return [npm, "start"], False
+        return subprocess.list2cmdline([npm, "run", script]), True
+    return [npm, "run", script], False
 
 
 def _background_creationflags() -> int:
@@ -2283,6 +2342,10 @@ def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
     if log_path.exists():
         rows.append(("log size", f"{log_path.stat().st_size} bytes"))
     _kv_rows(rows)
+
+
+def _cmd_info(config_path: Path) -> None:
+    print_llamafetch(config_path)
 
 
 def _cmd_api_status(config_path: Path, timeout: float = 90.0) -> None:

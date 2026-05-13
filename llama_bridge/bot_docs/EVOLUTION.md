@@ -6,7 +6,9 @@ Every autonomous cycle:
 - Observe compact interaction signals.
 - Curate durable facts into MEMORY.md and USER.md.
 - Create or update small workflow skills when repeated patterns appear.
-- Review agent-authored skills for staleness.
+- Track agent-created skill usage in `skills/agent-created/.usage.json`.
+- Review agent-authored skills for staleness and archive stale unpinned skills.
+- Write an audit report under `.runtime/evolution_reports/`.
 - Keep all memory bounded, non-secret, and actionable.
 
 ## Skill Creation
@@ -37,3 +39,19 @@ Skip:
 - Never store secrets, tokens, passwords, or private raw messages.
 - Store behavior summaries, not transcripts.
 - Ask for confirmation before unsafe, destructive, or credentialed work.
+- Never modify access control, owner/admin lists, bot tokens, provider keys, or core safety rules.
+- Never create recursive autonomous routines from inside a routine run.
+
+## Llama Routine Learning
+
+When routine usage repeats, self-evolution may:
+- Add durable user preferences about scheduling style.
+- Create a procedural skill for common routine patterns.
+- Summarize routine failures into MEMORY.md as lessons learned.
+- Keep all routine outputs bounded and local unless the routine's delivery target is explicit.
+
+## Last Evolution Run
+
+- Time: never
+- Signals: none
+- Changes: none

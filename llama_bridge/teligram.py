@@ -11,8 +11,9 @@ import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -460,13 +461,18 @@ EDITABLE_DOCS = {
 TELEGRAM_MESSAGE_LIMIT = 4096
 SAFE_MESSAGE_CHUNK_SIZE = 3900
 MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
+MAX_TEXT_ATTACHMENT_BYTES = 2 * 1024 * 1024
+RECENT_UPDATE_CACHE_SIZE = 512
 GENERATED_FILE_MAX_CHARS = 40_000
 AUTONOMOUS_STATE_KEY = "autonomous"
 SELF_EVOLUTION_STATE_KEY = "self_evolution"
+LLAMA_ROUTINES_STATE_KEY = "llama_routines"
 MAX_EVOLUTION_EVENTS = 120
+EVOLUTION_REPORT_LIMIT = 12
 MEMORY_CHAR_LIMIT = 2200
 USER_CHAR_LIMIT = 1375
 AGENT_SKILL_CATEGORY = "agent-created"
+SKILL_USAGE_FILENAME = ".usage.json"
 SKILL_CATEGORY_LABELS = {
     "project_builder": "Project Builder",
     "visual_work": "Visual Workflow",
@@ -499,6 +505,7 @@ COMMANDS = [
     ("image", "Find and send an image"),
     ("file", "Create and send a file"),
     ("schedule", "Add a daily autonomous task"),
+    ("jobs", "Manage Llama routines"),
     ("evolve", "Run or inspect self-evolution"),
     ("poll", "Create a Telegram poll"),
     ("web", "Web/search mode"),
@@ -773,6 +780,10 @@ class TeligramBot:
         self.conversations: dict[str, Conversation] = {}
         self.pending_commands: dict[str, str] = {}
         self.sent_polls: dict[str, str] = {}
+        self.bot_username = ""
+        self._send_context_by_chat: dict[str, dict[str, Any]] = {}
+        self._recent_update_keys: list[str] = []
+        self._recent_update_key_set: set[str] = set()
         self.output_rules = OutputRules.from_documents(self.workspace_documents)
         # Load access control from config and runtime
         self.allowed_chat_ids = {str(item).strip() for item in self.telegram.allowed_chat_ids if str(item).strip()}
@@ -792,6 +803,7 @@ class TeligramBot:
         self.autonomous_enabled = bool(getattr(self.telegram, "autonomous_enabled", True))
         self.autonomous_interval_seconds = HARDCODED_HEARTBEAT_INTERVAL_SECONDS
         self._dynamic_heartbeat_tasks: dict[str, asyncio.Task] = {}
+        self._routine_loop_running = False
         self.self_evolution_enabled = bool(getattr(self.telegram, "self_evolution_enabled", True))
         self.self_evolution_min_events = max(1, int(getattr(self.telegram, "self_evolution_min_events", 3)))
 
@@ -822,6 +834,9 @@ class TeligramBot:
             conversation.system_prompt = self.system_prompt
 
     def apply_telegram_profile(self, profile: dict[str, Any]) -> None:
+        username = str(profile.get("username") or "").strip()
+        if username:
+            self.bot_username = username.lstrip("@")
         profile_name = str(profile.get("first_name") or "").strip()
         if not profile_name:
             return
@@ -860,21 +875,160 @@ class TeligramBot:
         result = data.get("result")
         return result if isinstance(result, dict) else {}
 
-    async def send_message(self, chat_id: str, text: str) -> None:
-        chunks = split_telegram_message(self.prepare_output_text(text))
-        for chunk in chunks:
+    async def _post_telegram_json(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        timeout: httpx.Timeout | None = None,
+        retries: int = 3,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(max(1, retries)):
             try:
                 response = await self.http.post(
-                    f"{self.api_base}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": chunk,
-                        "disable_web_page_preview": True,
-                    },
+                    f"{self.api_base}/{endpoint}",
+                    json={key: value for key, value in payload.items() if value is not None},
+                    timeout=timeout,
                 )
+                if response.status_code == 429 and attempt + 1 < retries:
+                    retry_after = 1.0
+                    with contextlib.suppress(Exception):
+                        retry_after = float((response.json().get("parameters") or {}).get("retry_after") or 1)
+                    await asyncio.sleep(min(max(retry_after, 1.0), 10.0))
+                    continue
+                if response.status_code >= 500 and attempt + 1 < retries:
+                    await asyncio.sleep(2**attempt)
+                    continue
                 response.raise_for_status()
-                LOGGER.info("Telegram message sent: chat=%s chars=%s", chat_id, len(chunk))
+                data = response.json()
+                if data.get("ok"):
+                    return data
+                raise RuntimeError(str(data.get("description") or "Telegram API returned ok=false"))
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError) as exc:
+                last_error = exc
+                if attempt + 1 >= retries:
+                    break
+                await asyncio.sleep(2**attempt)
             except Exception:
+                raise
+        raise RuntimeError(f"Telegram {endpoint} failed: {last_error}") from last_error
+
+    def _telegram_thread_payload(self, thread_id: str | int | None) -> dict[str, Any]:
+        if thread_id is None or str(thread_id).strip() == "":
+            return {}
+        try:
+            numeric = int(thread_id)
+        except (TypeError, ValueError):
+            return {}
+        if numeric == 1:
+            return {}
+        return {"message_thread_id": numeric}
+
+    def _send_context(self, chat_id: str) -> dict[str, Any]:
+        return self._send_context_by_chat.get(chat_id, {})
+
+    def _message_thread_id(self, message: dict[str, Any]) -> str | None:
+        thread_id = message.get("message_thread_id")
+        if thread_id is None:
+            return None
+        return str(thread_id)
+
+    def _message_id(self, message: dict[str, Any]) -> int | None:
+        message_id = message.get("message_id")
+        try:
+            return int(message_id)
+        except (TypeError, ValueError):
+            return None
+
+    def conversation_key(self, chat_id: str, thread_id: str | None = None) -> str:
+        return f"{chat_id}:thread:{thread_id}" if thread_id else chat_id
+
+    def _is_duplicate_update(self, update: dict[str, Any], message: dict[str, Any]) -> bool:
+        update_id = update.get("update_id")
+        edit_date = message.get("edit_date")
+        message_id = message.get("message_id")
+        key = f"u:{update_id}" if update_id is not None else f"m:{message.get('chat', {}).get('id')}:{message_id}:{edit_date or message.get('date')}"
+        if key in self._recent_update_key_set:
+            return True
+        self._recent_update_key_set.add(key)
+        self._recent_update_keys.append(key)
+        if len(self._recent_update_keys) > RECENT_UPDATE_CACHE_SIZE:
+            old = self._recent_update_keys.pop(0)
+            self._recent_update_key_set.discard(old)
+        return False
+
+    def _message_mentions_bot(self, message: dict[str, Any], text: str) -> bool:
+        username = self.bot_username.lstrip("@").lower()
+        if not username:
+            return False
+        expected = f"@{username}"
+        for key in ("entities", "caption_entities"):
+            for entity in message.get(key) or []:
+                if not isinstance(entity, dict):
+                    continue
+                offset = int(entity.get("offset") or 0)
+                length = int(entity.get("length") or 0)
+                if length <= 0:
+                    continue
+                span = text[offset : offset + length].strip().lower()
+                if entity.get("type") == "mention" and span == expected:
+                    return True
+                if entity.get("type") == "bot_command" and span.endswith(expected):
+                    return True
+        return bool(re.search(rf"(?i)(^|\s)@{re.escape(username)}\b", text))
+
+    def clean_bot_trigger_text(self, text: str) -> str:
+        username = self.bot_username.lstrip("@")
+        if not username:
+            return text
+        cleaned = re.sub(rf"(?i)@{re.escape(username)}\b[,:\-]*\s*", "", text).strip()
+        return cleaned or text
+
+    def should_process_group_message(self, message: dict[str, Any], text: str) -> bool:
+        chat = message.get("chat") or {}
+        chat_type = str(chat.get("type") or "").lower()
+        if chat_type not in {"group", "supergroup"}:
+            return True
+        if parse_command(text) is not None:
+            return True
+        allowed_group_ids = self.allowed_chat_ids | self.owner_chat_ids | self.admin_chat_ids
+        if self.allow_all_chats or str(chat.get("id")) in allowed_group_ids:
+            return True
+        if self._message_mentions_bot(message, text):
+            return True
+        reply = message.get("reply_to_message") or {}
+        reply_user = reply.get("from") or {}
+        return bool(reply_user.get("username") and str(reply_user.get("username")).lower() == self.bot_username.lower())
+
+    async def send_message(self, chat_id: str, text: str) -> None:
+        chunks = split_telegram_message(self.prepare_output_text(text))
+        context = self._send_context(chat_id)
+        thread_payload = self._telegram_thread_payload(context.get("thread_id"))
+        reply_to_message_id = context.get("reply_to_message_id")
+        for index, chunk in enumerate(chunks):
+            payload = {
+                "chat_id": chat_id,
+                "text": chunk,
+                "disable_web_page_preview": True,
+                **thread_payload,
+            }
+            if index == 0 and reply_to_message_id is not None:
+                payload["reply_to_message_id"] = reply_to_message_id
+            try:
+                await self._post_telegram_json("sendMessage", payload)
+                LOGGER.info("Telegram message sent: chat=%s chars=%s", chat_id, len(chunk))
+            except Exception as exc:
+                err = str(exc).lower()
+                if "message to be replied not found" in err or "message thread not found" in err:
+                    payload.pop("reply_to_message_id", None)
+                    payload.pop("message_thread_id", None)
+                    try:
+                        await self._post_telegram_json("sendMessage", payload)
+                        LOGGER.info("Telegram message sent after thread/reply fallback: chat=%s", chat_id)
+                        continue
+                    except Exception:
+                        pass
                 LOGGER.exception("Telegram sendMessage failed for chat %s", chat_id)
                 return
 
@@ -882,19 +1036,18 @@ class TeligramBot:
         return self.output_rules.apply(polish_telegram_text(text))
 
     async def send_photo(self, chat_id: str, photo: str, caption: str | None = None) -> None:
-        payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo}
+        payload: dict[str, Any] = {"chat_id": chat_id, "photo": photo, **self._telegram_thread_payload(self._send_context(chat_id).get("thread_id"))}
         if caption:
             payload["caption"] = self.prepare_output_text(caption)[:1024]
         try:
-            response = await self.http.post(f"{self.api_base}/sendPhoto", json=payload)
-            response.raise_for_status()
+            await self._post_telegram_json("sendPhoto", payload)
             LOGGER.info("Telegram photo sent: chat=%s caption_chars=%s", chat_id, len(payload.get("caption", "")))
         except Exception:
             LOGGER.exception("Telegram sendPhoto failed for chat %s", chat_id)
             await self.send_message(chat_id, "I found an image, but Telegram could not send it.")
 
     async def send_photo_file(self, chat_id: str, path: Path, caption: str | None = None) -> None:
-        data: dict[str, Any] = {"chat_id": chat_id}
+        data: dict[str, Any] = {"chat_id": chat_id, **self._telegram_thread_payload(self._send_context(chat_id).get("thread_id"))}
         if caption:
             data["caption"] = self.prepare_output_text(caption)[:1024]
         try:
@@ -908,7 +1061,7 @@ class TeligramBot:
             await self.send_message(chat_id, "I downloaded the image, but Telegram could not send it.")
 
     async def send_document(self, chat_id: str, path: Path, caption: str | None = None) -> None:
-        data: dict[str, Any] = {"chat_id": chat_id}
+        data: dict[str, Any] = {"chat_id": chat_id, **self._telegram_thread_payload(self._send_context(chat_id).get("thread_id"))}
         if caption:
             data["caption"] = self.prepare_output_text(caption)[:1024]
         try:
@@ -940,11 +1093,11 @@ class TeligramBot:
             "options": clean_options[:10],
             "is_anonymous": is_anonymous,
             "allows_multiple_answers": allows_multiple_answers,
+            **self._telegram_thread_payload(self._send_context(chat_id).get("thread_id")),
         }
         try:
-            response = await self.http.post(f"{self.api_base}/sendPoll", json=payload)
-            response.raise_for_status()
-            result = (response.json().get("result") or {}).get("poll") or {}
+            data = await self._post_telegram_json("sendPoll", payload)
+            result = (data.get("result") or {}).get("poll") or {}
             poll_id = str(result.get("id") or "")
             if poll_id:
                 self.sent_polls[poll_id] = chat_id
@@ -954,11 +1107,12 @@ class TeligramBot:
             await self.send_message(chat_id, "I could not create that poll.")
 
     async def send_typing(self, chat_id: str) -> None:
-        response = await self.http.post(
-            f"{self.api_base}/sendChatAction",
-            json={"chat_id": chat_id, "action": "typing"},
-        )
-        response.raise_for_status()
+        payload = {"chat_id": chat_id, "action": "typing"}
+        thread_id = self._send_context(chat_id).get("thread_id")
+        if thread_id is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                payload["message_thread_id"] = int(thread_id)
+        await self._post_telegram_json("sendChatAction", payload, retries=1)
 
     async def typing_loop(self, chat_id: str) -> None:
         while True:
@@ -1029,6 +1183,7 @@ class TeligramBot:
         if parsed is None:
             return False
         command, argument = parsed
+        state_id = str(self._send_context(chat_id).get("state_id") or chat_id)
 
         # Check command policy
         role = self._chat_role(chat_id, username)
@@ -1043,8 +1198,8 @@ class TeligramBot:
             await self.send_message(chat_id, self.status_text())
             return True
         if command == "clear":
-            self.conversation(chat_id).reset()
-            self.pending_commands.pop(chat_id, None)
+            self.conversation(state_id).reset()
+            self.pending_commands.pop(state_id, None)
             await self.send_message(chat_id, "Done. I cleared this chat's memory.")
             return True
         if command == "reload":
@@ -1077,38 +1232,41 @@ class TeligramBot:
             return True
         if command == "image":
             if not argument:
-                self.pending_commands[chat_id] = "image"
+                self.pending_commands[state_id] = "image"
                 await self.send_message(chat_id, "Send /image followed by what image you want.")
                 return True
             await self.handle_image_request(chat_id, argument)
             return True
         if command == "file":
             if not argument:
-                self.pending_commands[chat_id] = "file"
+                self.pending_commands[state_id] = "file"
                 await self.send_message(chat_id, "Send /file md notes.md | what you want in the file.")
                 return True
             await self.handle_file_request(chat_id, argument)
             return True
         if command == "schedule":
             if not argument:
-                self.pending_commands[chat_id] = "schedule"
+                self.pending_commands[state_id] = "schedule"
                 await self.send_message(chat_id, "Send /schedule every morning at 6 am send good morning")
                 return True
             await self.handle_schedule_request(chat_id, argument)
+            return True
+        if command in {"jobs", "job", "routine", "routines", "cron"}:
+            await self.handle_routine_command(chat_id, argument, username)
             return True
         if command == "evolve":
             await self.handle_evolve_command(chat_id, argument)
             return True
         if command == "poll":
             if not argument:
-                self.pending_commands[chat_id] = "poll"
+                self.pending_commands[state_id] = "poll"
                 await self.send_message(chat_id, "Send /poll Question | option 1 | option 2")
                 return True
             await self.handle_poll_request(chat_id, argument)
             return True
         if command == "summarize":
             if not argument:
-                self.pending_commands[chat_id] = "summarize"
+                self.pending_commands[state_id] = "summarize"
                 await self.send_message(chat_id, "Send /summarize followed by the text you want summarized.")
                 return True
             await self.run_command_prompt(
@@ -1119,7 +1277,7 @@ class TeligramBot:
             return True
         if command == "explain":
             if not argument:
-                self.pending_commands[chat_id] = "explain"
+                self.pending_commands[state_id] = "explain"
                 await self.send_message(chat_id, "Send /explain followed by the topic you want explained.")
                 return True
             await self.run_command_prompt(
@@ -1131,7 +1289,7 @@ class TeligramBot:
             return True
         if command == "web":
             if not argument:
-                self.pending_commands[chat_id] = "web"
+                self.pending_commands[state_id] = "web"
                 await self.send_message(chat_id, "Web search mode is ready.\n\nSend the query you want me to search for.")
                 return True
             await self.run_command_prompt(
@@ -1143,7 +1301,7 @@ class TeligramBot:
             return True
         if command == "deep":
             if not argument:
-                self.pending_commands[chat_id] = "deep"
+                self.pending_commands[state_id] = "deep"
                 await self.send_message(chat_id, "Deep research mode is ready.\n\nSend the topic you want me to research.")
                 return True
             await self.run_command_prompt(
@@ -1337,6 +1495,163 @@ class TeligramBot:
             await self.send_message(chat_id, index)
             return
         await self.send_message(chat_id, "Use /evolve status, /evolve run, or /evolve skills.")
+
+    async def handle_routine_command(self, chat_id: str, argument: str, username: str = "") -> None:
+        parts = argument.strip().split(maxsplit=1)
+        action = (parts[0] if parts else "list").lower()
+        rest = parts[1] if len(parts) > 1 else ""
+        if action in {"help", "?"}:
+            await self.send_message(chat_id, self.routine_help_text())
+            return
+        if action in {"list", "ls", "status", "show"}:
+            await self.send_message(chat_id, self.routine_list_text(include_disabled=self.is_admin_chat(chat_id, username)))
+            return
+        if action in {"add", "create", "new"}:
+            if not rest:
+                await self.send_message(chat_id, "Use /jobs add <schedule> | <task>\nExample: /jobs add every 30m | check today's AI news and summarize it")
+                return
+            result = self.create_routine_from_text(rest, chat_id)
+            await self.send_message(chat_id, result)
+            return
+        if action in {"run", "trigger"}:
+            if not rest:
+                await self.send_message(chat_id, "Use /jobs run <routine_id>")
+                return
+            await self.trigger_routine(chat_id, rest.strip(), manual=True)
+            return
+        if action in {"pause", "resume", "remove", "delete", "rm"}:
+            if not self.is_admin_chat(chat_id, username):
+                await self.send_message(chat_id, "Routine management requires admin access.")
+                return
+            if not rest:
+                await self.send_message(chat_id, f"Use /jobs {action} <routine_id>")
+                return
+            result = self.update_routine_state(rest.strip(), action)
+            await self.send_message(chat_id, result)
+            return
+        await self.send_message(chat_id, self.routine_help_text())
+
+    def routine_help_text(self) -> str:
+        return (
+            "Llama routines\n\n"
+            "/jobs list - show routines\n"
+            "/jobs add <schedule> | <task> - create a routine\n"
+            "/jobs run <id> - run now\n"
+            "/jobs pause <id> - pause\n"
+            "/jobs resume <id> - resume\n"
+            "/jobs remove <id> - delete\n\n"
+            "Schedules: 30m, 2h, every 30m, every 2h, 2026-05-13T18:30, or cron like 0 9 * * *."
+        )
+
+    def create_routine_from_text(self, text: str, chat_id: str) -> str:
+        parsed = parse_routine_create_request(text)
+        if parsed is None:
+            return "Use /jobs add <schedule> | <task>\nExample: /jobs add every 2h | check the server status"
+        schedule_text, prompt = parsed
+        try:
+            schedule = parse_routine_schedule(schedule_text)
+            next_run = compute_routine_next_run(schedule)
+        except ValueError as exc:
+            return str(exc)
+        if next_run is None:
+            return "I could not compute the next run for that schedule."
+
+        state = self.read_telegram_state()
+        routines = state.setdefault(LLAMA_ROUTINES_STATE_KEY, {}).setdefault("jobs", [])
+        context = self._send_context(chat_id)
+        routine_id = uuid.uuid4().hex[:8]
+        routine = {
+            "id": routine_id,
+            "name": safe_filename(prompt[:48], default="routine").replace("_", " "),
+            "prompt": prompt,
+            "schedule": schedule,
+            "schedule_display": schedule.get("display", schedule_text),
+            "enabled": True,
+            "created_at_utc": datetime.now(UTC).isoformat(),
+            "next_run_at": next_run.isoformat(),
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "run_count": 0,
+            "repeat": 1 if schedule.get("kind") == "once" else None,
+            "origin": {
+                "chat_id": chat_id,
+                "thread_id": context.get("thread_id"),
+                "state_id": context.get("state_id") or chat_id,
+            },
+        }
+        routines.append(routine)
+        self.write_telegram_state(state)
+        return (
+            "Created Llama routine.\n\n"
+            f"ID: {routine_id}\n"
+            f"Schedule: {routine['schedule_display']}\n"
+            f"Next run: {format_local_datetime(next_run)}\n"
+            f"Task: {prompt}"
+        )
+
+    def routine_list_text(self, *, include_disabled: bool = False) -> str:
+        routines = self.routines(include_disabled=include_disabled)
+        if not routines:
+            return "No Llama routines yet.\n\nUse /jobs add <schedule> | <task>"
+        lines = ["Llama routines"]
+        for routine in routines[:20]:
+            status = "on" if routine.get("enabled", True) else "paused"
+            next_run = parse_datetime_or_none(str(routine.get("next_run_at") or ""))
+            next_text = format_local_datetime(next_run) if next_run else "none"
+            lines.append(
+                f"\n{routine.get('id')} - {status}\n"
+                f"{routine.get('schedule_display') or '?'} | next {next_text}\n"
+                f"{str(routine.get('prompt') or '')[:160]}"
+            )
+        return "\n".join(lines)
+
+    def routines(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
+        state = self.read_telegram_state()
+        root = state.get(LLAMA_ROUTINES_STATE_KEY) if isinstance(state.get(LLAMA_ROUTINES_STATE_KEY), dict) else {}
+        jobs = root.get("jobs") if isinstance(root.get("jobs"), list) else []
+        routines = [job for job in jobs if isinstance(job, dict)]
+        if not include_disabled:
+            routines = [job for job in routines if job.get("enabled", True)]
+        return routines
+
+    def update_routine_state(self, routine_id: str, action: str) -> str:
+        state = self.read_telegram_state()
+        root = state.setdefault(LLAMA_ROUTINES_STATE_KEY, {})
+        jobs = root.setdefault("jobs", [])
+        for index, routine in enumerate(list(jobs)):
+            if not isinstance(routine, dict) or routine.get("id") != routine_id:
+                continue
+            if action in {"remove", "delete", "rm"}:
+                jobs.pop(index)
+                self.write_telegram_state(state)
+                return f"Removed Llama routine {routine_id}."
+            if action == "pause":
+                routine["enabled"] = False
+                routine["last_status"] = "paused"
+                self.write_telegram_state(state)
+                return f"Paused Llama routine {routine_id}."
+            if action == "resume":
+                routine["enabled"] = True
+                schedule = routine.get("schedule") if isinstance(routine.get("schedule"), dict) else {}
+                next_run = compute_routine_next_run(schedule)
+                routine["next_run_at"] = next_run.isoformat() if next_run else None
+                routine["last_status"] = "scheduled"
+                self.write_telegram_state(state)
+                return f"Resumed Llama routine {routine_id}."
+        return f"No routine found with ID {routine_id}."
+
+    async def trigger_routine(self, chat_id: str, routine_id: str, *, manual: bool = False) -> None:
+        state = self.read_telegram_state()
+        root = state.setdefault(LLAMA_ROUTINES_STATE_KEY, {})
+        jobs = root.setdefault("jobs", [])
+        for routine in jobs:
+            if isinstance(routine, dict) and routine.get("id") == routine_id:
+                await self.run_routine(routine, state, manual_chat_id=chat_id if manual else None)
+                self.write_telegram_state(state)
+                await self.send_message(chat_id, f"Ran Llama routine {routine_id}.")
+                return
+        await self.send_message(chat_id, f"No routine found with ID {routine_id}.")
 
     def generated_dir(self) -> Path:
         path = self.workspace / "generated"
@@ -1911,15 +2226,44 @@ class TeligramBot:
         message = update.get("message") or update.get("edited_message") or {}
         if not isinstance(message, dict):
             return
+        if self._is_duplicate_update(update, message):
+            LOGGER.info("Telegram duplicate update ignored: update=%s", update.get("update_id"))
+            return
         chat = message.get("chat") or {}
         if not isinstance(chat, dict) or chat.get("id") is None:
             return
         chat_id = str(chat["id"])
+        thread_id = self._message_thread_id(message)
+        state_id = self.conversation_key(chat_id, thread_id)
+        message_id = self._message_id(message)
         from_user = message.get("from") or {}
         chat_username = str(chat.get("username") or "").strip()
         from_username = str(from_user.get("username") or "").strip() if isinstance(from_user, dict) else ""
         username = from_username or chat_username
         user_id = str(from_user.get("id") or "") if isinstance(from_user, dict) else ""
+        prior_context = self._send_context_by_chat.get(chat_id)
+        self._send_context_by_chat[chat_id] = {
+            "thread_id": thread_id,
+            "reply_to_message_id": message_id,
+            "state_id": state_id,
+        }
+        try:
+            await self._handle_update_in_context(update, message, chat_id, state_id, username, user_id)
+        finally:
+            if prior_context is None:
+                self._send_context_by_chat.pop(chat_id, None)
+            else:
+                self._send_context_by_chat[chat_id] = prior_context
+
+    async def _handle_update_in_context(
+        self,
+        update: dict[str, Any],
+        message: dict[str, Any],
+        chat_id: str,
+        state_id: str,
+        username: str,
+        user_id: str,
+    ) -> None:
 
         # Allow /myid for unauthorized users
         text = message.get("text") or message.get("caption")
@@ -1941,6 +2285,10 @@ class TeligramBot:
             return
 
         text = text.strip()
+        if not self.should_process_group_message(message, text):
+            LOGGER.info("Telegram group message ignored: chat=%s username=%s", chat_id, username or "-")
+            return
+        text = self.clean_bot_trigger_text(text)
         LOGGER.info(
             "Telegram message received: chat=%s username=%s text_chars=%s",
             chat_id,
@@ -1948,7 +2296,7 @@ class TeligramBot:
             len(text),
         )
         self.record_user_behavior(chat_id, text[: self.telegram.max_input_chars])
-        pending = self.pending_commands.pop(chat_id, None)
+        pending = self.pending_commands.pop(state_id, None)
         if pending and not text.startswith("/"):
             text = f"/{pending} {text}"
         natural_poll = parse_natural_poll_request(text)
@@ -1992,7 +2340,7 @@ class TeligramBot:
             await self.send_message(chat_id, result)
             return
 
-        conversation = self.conversation(chat_id)
+        conversation = self.conversation(state_id)
         trimmed = text[: self.telegram.max_input_chars]
         conversation.user(trimmed)
         typing_task = asyncio.create_task(self.typing_loop(chat_id))
@@ -2013,7 +2361,8 @@ class TeligramBot:
         await self.send_message(chat_id, reply)
 
     def latest_conversation_image_url(self, chat_id: str) -> str | None:
-        conversation = self.conversations.get(chat_id)
+        state_id = str(self._send_context(chat_id).get("state_id") or chat_id)
+        conversation = self.conversations.get(state_id) or self.conversations.get(chat_id)
         if conversation is None:
             return None
         for message in reversed(conversation.messages):
@@ -2052,12 +2401,12 @@ class TeligramBot:
         ]
         for kind in attachment_types:
             if kind in message:
-                if has_caption:
-                    return True
                 if kind == "document":
                     await self.handle_document_attachment(chat_id, message[kind], caption)
-                else:
-                    await self.send_message(chat_id, self.attachment_response(kind, message.get(kind)))
+                    return False
+                if has_caption:
+                    return True
+                await self.send_message(chat_id, self.attachment_response(kind, message.get(kind)))
                 return False
         return True
 
@@ -2124,7 +2473,7 @@ class TeligramBot:
         file_name = str(document.get("file_name") or "").lower()
         mime_type = str(document.get("mime_type") or "")
         file_size = int(document.get("file_size") or 0)
-        if file_size > 2 * 1024 * 1024:  # 2 MB limit
+        if file_size > MAX_TEXT_ATTACHMENT_BYTES:
             await self.send_message(chat_id, "File too large (max 2MB for text reading)")
             return
         text_mimes = {
@@ -2144,8 +2493,47 @@ class TeligramBot:
         if not is_text:
             await self.send_message(chat_id, f"Received {file_name or 'document'}. File reading not supported for this type.")
             return
-        # For now, just acknowledge
-        await self.send_message(chat_id, f"Received text file {file_name or 'unnamed'}. Content reading not fully implemented yet.")
+        content = await self.download_text_document(document)
+        if content is None:
+            await self.send_message(chat_id, f"Received text file {file_name or 'unnamed'}, but I could not download its content.")
+            return
+        prompt = (caption or "").strip()
+        if not prompt:
+            prompt = "Summarize this text file and call out anything important."
+        await self.run_command_prompt(
+            chat_id,
+            f"{prompt}\n\nFile: {file_name or 'unnamed'}\n\n{content[:self.telegram.max_input_chars]}",
+            "Use the attached text file content to answer the user's request. Keep the response Telegram-friendly.",
+            max_tokens=min(max(self.telegram.max_output_tokens, 700), 1400),
+        )
+
+    async def download_text_document(self, document: dict[str, Any]) -> str | None:
+        file_id = str(document.get("file_id") or "").strip()
+        if not file_id:
+            return None
+        try:
+            data = await self._post_telegram_json("getFile", {"file_id": file_id})
+            file_path = str((data.get("result") or {}).get("file_path") or "").strip()
+            if not file_path:
+                return None
+            url = f"https://api.telegram.org/file/bot{self.telegram.bot_token}/{file_path}"
+            async with self.http.stream("GET", url, follow_redirects=True) as response:
+                response.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_TEXT_ATTACHMENT_BYTES:
+                        return None
+                    chunks.append(chunk)
+            raw = b"".join(chunks)
+            for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+                with contextlib.suppress(UnicodeDecodeError):
+                    return raw.decode(encoding, errors="strict")
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            LOGGER.exception("Telegram document download failed")
+            return None
 
     async def poll_forever(self) -> None:
         offset: int | None = None
@@ -2158,6 +2546,7 @@ class TeligramBot:
             if self.autonomous_enabled
             else None
         )
+        routine_task = asyncio.create_task(self.routine_loop())
         try:
             while True:
                 try:
@@ -2179,10 +2568,170 @@ class TeligramBot:
                     LOGGER.exception("Telegram polling loop error")
                     await asyncio.sleep(self.telegram.poll_interval_seconds)
         finally:
+            routine_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await routine_task
             if autonomous_task is not None:
                 autonomous_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await autonomous_task
+
+    async def routine_loop(self) -> None:
+        while True:
+            try:
+                await self.tick_routines()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Llama routine tick failed")
+            await asyncio.sleep(60)
+
+    async def tick_routines(self) -> None:
+        if self._routine_loop_running:
+            return
+        self._routine_loop_running = True
+        try:
+            state = self.read_telegram_state()
+            root = state.setdefault(LLAMA_ROUTINES_STATE_KEY, {})
+            jobs = root.setdefault("jobs", [])
+            now = datetime.now(UTC)
+            changed = False
+            for routine in jobs:
+                if not isinstance(routine, dict) or not routine.get("enabled", True):
+                    continue
+                next_run = parse_datetime_or_none(str(routine.get("next_run_at") or ""))
+                if next_run is None:
+                    schedule = routine.get("schedule") if isinstance(routine.get("schedule"), dict) else {}
+                    next_run = compute_routine_next_run(schedule, last_run_at=str(routine.get("last_run_at") or ""))
+                    routine["next_run_at"] = next_run.isoformat() if next_run else None
+                    changed = True
+                if next_run is None or next_run > now:
+                    continue
+                await self.run_routine(routine, state)
+                changed = True
+            if changed:
+                self.write_telegram_state(state)
+        finally:
+            self._routine_loop_running = False
+
+    async def run_routine(
+        self,
+        routine: dict[str, Any],
+        state: dict[str, Any],
+        *,
+        manual_chat_id: str | None = None,
+    ) -> None:
+        routine_id = str(routine.get("id") or "unknown")
+        prompt_text = str(routine.get("prompt") or "").strip()
+        if not prompt_text:
+            routine["last_status"] = "skipped"
+            routine["last_error"] = "empty prompt"
+            return
+        origin = routine.get("origin") if isinstance(routine.get("origin"), dict) else {}
+        target_chat_id = manual_chat_id or str(origin.get("chat_id") or "")
+        if not target_chat_id:
+            targets = self.autonomous_target_chats()
+            target_chat_id = targets[0] if targets else ""
+        if not target_chat_id:
+            routine["last_status"] = "skipped"
+            routine["last_error"] = "no delivery target"
+            return
+
+        prior_context = self._send_context_by_chat.get(target_chat_id)
+        self._send_context_by_chat[target_chat_id] = {
+            "thread_id": origin.get("thread_id"),
+            "state_id": origin.get("state_id") or target_chat_id,
+        }
+        try:
+            self.reload_workspace()
+            memory = self.workspace_documents.get("MEMORY.md", "")
+            user_prefs = self.workspace_documents.get("USER.md", "")
+            job_context = self.routine_context_text(routine)
+            request = (
+                "Llama routine run. Compose only the user-facing output for this scheduled routine. "
+                "If there is nothing useful to send, output exactly: [SILENT]\n\n"
+                f"Routine name: {routine.get('name') or routine_id}\n"
+                f"Task: {prompt_text}\n\n"
+                f"{job_context}"
+                f"USER.md:\n{user_prefs[:2000]}\n\n"
+                f"MEMORY.md:\n{memory[:3000]}"
+            )
+            reply = await self.call_model(
+                [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": request},
+                ],
+                max_tokens=min(max(self.telegram.max_output_tokens, 700), 1400),
+            )
+            reply = reply.strip()
+            timestamp = datetime.now(UTC).isoformat()
+            routine["last_run_at"] = timestamp
+            routine["run_count"] = int(routine.get("run_count") or 0) + 1
+            routine["last_error"] = None
+            output_path = self.save_routine_output(routine_id, reply)
+            routine["last_output_path"] = str(output_path)
+            if reply and not reply.startswith("[SILENT]") and not _is_heartbeat_ack_only(reply):
+                await self.send_message(target_chat_id, reply)
+                routine["last_status"] = "sent"
+            else:
+                routine["last_status"] = "silent"
+            self.advance_routine(routine)
+        except Exception as exc:
+            routine["last_run_at"] = datetime.now(UTC).isoformat()
+            routine["last_status"] = "error"
+            routine["last_error"] = str(exc)
+            self.advance_routine(routine)
+            LOGGER.exception("Llama routine failed: %s", routine_id)
+        finally:
+            if prior_context is None:
+                self._send_context_by_chat.pop(target_chat_id, None)
+            else:
+                self._send_context_by_chat[target_chat_id] = prior_context
+
+    def routine_context_text(self, routine: dict[str, Any]) -> str:
+        context_ids = routine.get("context_from")
+        if isinstance(context_ids, str):
+            context_ids = [context_ids]
+        if not isinstance(context_ids, list):
+            return ""
+        blocks = []
+        for context_id in context_ids[:5]:
+            context_id = str(context_id).strip()
+            path = self.latest_routine_output_path(context_id)
+            if not path:
+                continue
+            with contextlib.suppress(OSError):
+                content = path.read_text(encoding="utf-8", errors="replace")
+                blocks.append(f"Previous routine output {context_id}:\n{content[:3000]}")
+        if not blocks:
+            return ""
+        return "\n\n".join(blocks) + "\n\n"
+
+    def latest_routine_output_path(self, routine_id: str) -> Path | None:
+        routine_dir = self.runtime_dir() / "routine_outputs" / safe_filename(routine_id, default="routine")
+        if not routine_dir.exists():
+            return None
+        files = sorted(routine_dir.glob("*.md"))
+        return files[-1] if files else None
+
+    def save_routine_output(self, routine_id: str, content: str) -> Path:
+        output_dir = self.runtime_dir() / "routine_outputs" / safe_filename(routine_id, default="routine")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        path = output_dir / f"{stamp}.md"
+        path.write_text(content or "[empty]", encoding="utf-8")
+        return path
+
+    def advance_routine(self, routine: dict[str, Any]) -> None:
+        repeat = routine.get("repeat")
+        run_count = int(routine.get("run_count") or 0)
+        if isinstance(repeat, int) and repeat > 0 and run_count >= repeat:
+            routine["enabled"] = False
+            routine["next_run_at"] = None
+            return
+        schedule = routine.get("schedule") if isinstance(routine.get("schedule"), dict) else {}
+        next_run = compute_routine_next_run(schedule, last_run_at=str(routine.get("last_run_at") or ""))
+        routine["next_run_at"] = next_run.isoformat() if next_run else None
 
     async def autonomous_loop(self) -> None:
         while True:
@@ -2502,12 +3051,20 @@ class TeligramBot:
         changes.extend(memory_changes)
         skill_changes = self.curate_agent_skills(category_counts)
         changes.extend(skill_changes)
+        usage_changes = self.curate_skill_usage(category_counts)
+        changes.extend(usage_changes)
         archived = self.curate_stale_skills(state)
         changes.extend(archived)
+        report_path = self.write_evolution_report(category_counts, changes)
+        if report_path is not None:
+            changes.append(f"wrote evolution report {report_path.name}")
+        evolution_doc_changes = self.update_evolution_document(category_counts, changes)
+        changes.extend(evolution_doc_changes)
 
         evolution["last_run_utc"] = now
         evolution["last_event_count"] = len(events)
         evolution["category_counts"] = category_counts
+        evolution["last_changes"] = changes[:EVOLUTION_REPORT_LIMIT]
         self.write_telegram_state(state)
         self.reload_workspace()
 
@@ -2568,6 +3125,36 @@ class TeligramBot:
             changes.append(f"created/updated skill {skill_dir.name}")
         return changes
 
+    def curate_skill_usage(self, category_counts: dict[str, int]) -> list[str]:
+        skills_dir = self.workspace / "skills" / AGENT_SKILL_CATEGORY
+        if not skills_dir.exists():
+            return []
+        usage_path = skills_dir / SKILL_USAGE_FILENAME
+        try:
+            usage = json.loads(usage_path.read_text(encoding="utf-8")) if usage_path.exists() else {}
+        except Exception:
+            usage = {}
+        if not isinstance(usage, dict):
+            usage = {}
+        changed = False
+        now = datetime.now(UTC).isoformat()
+        for category, count in category_counts.items():
+            if count < self.self_evolution_min_events:
+                continue
+            slug = category.replace("_", "-")
+            if not (skills_dir / slug / "SKILL.md").exists():
+                continue
+            entry = usage.setdefault(slug, {})
+            entry["signals"] = int(count)
+            entry["last_seen_utc"] = now
+            entry["state"] = "active"
+            changed = True
+        if not changed:
+            return []
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        usage_path.write_text(json.dumps(usage, ensure_ascii=True, indent=2), encoding="utf-8")
+        return ["updated skill usage sidecar"]
+
     def curate_stale_skills(self, state: dict[str, Any]) -> list[str]:
         skills_dir = self.workspace / "skills" / AGENT_SKILL_CATEGORY
         if not skills_dir.exists():
@@ -2580,6 +3167,8 @@ class TeligramBot:
             category = slug.replace("-", "_")
             if category in active_categories:
                 continue
+            if skill_is_pinned(skill_file):
+                continue
             age_days = (datetime.now(UTC).timestamp() - skill_file.stat().st_mtime) / 86400
             if age_days < 90:
                 continue
@@ -2590,6 +3179,47 @@ class TeligramBot:
             skill_file.parent.rename(target)
             changes.append(f"archived stale skill {slug}")
         return changes
+
+    def write_evolution_report(self, category_counts: dict[str, int], changes: list[str]) -> Path | None:
+        report_dir = self.runtime_dir() / "evolution_reports"
+        try:
+            report_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            path = report_dir / f"{stamp}.md"
+            lines = [
+                "# Self-Evolution Report",
+                "",
+                f"Generated: {datetime.now(UTC).isoformat()}",
+                "",
+                "## Signals",
+                "",
+                format_counts(category_counts),
+                "",
+                "## Changes",
+                "",
+                *[f"- {change}" for change in changes[:EVOLUTION_REPORT_LIMIT]],
+            ]
+            path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+            return path
+        except Exception:
+            LOGGER.exception("Could not write evolution report")
+            return None
+
+    def update_evolution_document(self, category_counts: dict[str, int], changes: list[str]) -> list[str]:
+        path = self.safe_workspace_doc_path("EVOLUTION.md")
+        original = read_text_or_default(path, _packaged_workspace_template("EVOLUTION.md") or "# EVOLUTION.md\n")
+        latest = (
+            "## Last Evolution Run\n\n"
+            f"- Time: {datetime.now(UTC).isoformat()}\n"
+            f"- Signals: {format_counts(category_counts)}\n"
+            f"- Changes: {', '.join(changes[:EVOLUTION_REPORT_LIMIT]) if changes else 'none'}\n"
+        )
+        updated = replace_or_append_section(original, "Last Evolution Run", latest)
+        if updated == original:
+            return []
+        self.backup_document(path, original)
+        path.write_text(updated, encoding="utf-8")
+        return ["updated EVOLUTION.md audit section"]
 
     def evolution_status_text(self) -> str:
         state = self.read_telegram_state()
@@ -2676,6 +3306,7 @@ class TeligramBot:
     def status_text(self) -> str:
         docs = ", ".join(self.workspace_documents) or "none"
         tools_count = len(self.available_tool_names()) if self.tools else 0
+        routine_count = len(self.routines(include_disabled=False))
         return (
             f"{self.agent_name} is running.\n\n"
             f"Provider: {self.provider_name}\n"
@@ -2685,6 +3316,7 @@ class TeligramBot:
             f"Workspace: {self.workspace}\n"
             f"Loaded docs: {docs}\n"
             f"Tools: {tools_count} enabled\n"
+            f"Llama routines: {routine_count} active\n"
             f"Self-evolution: {'enabled' if self.self_evolution_enabled else 'disabled'}\n"
             f"Core editing: {'enabled' if self.core_editing_enabled else 'disabled'}"
         )
@@ -2975,6 +3607,161 @@ def normalize_scheduled_action(action: str) -> str:
     return f"send {action}"
 
 
+def parse_routine_create_request(text: str) -> tuple[str, str] | None:
+    if "|" in text:
+        schedule, prompt = text.split("|", maxsplit=1)
+        schedule = schedule.strip()
+        prompt = prompt.strip()
+        if schedule and prompt:
+            return schedule, prompt
+    match = re.match(r"(?is)^\s*(.+?)\s+(?:to|do|run|send)\s+(.+)$", text)
+    if match:
+        schedule = match.group(1).strip()
+        prompt = match.group(2).strip()
+        if schedule and prompt:
+            return schedule, prompt
+    return None
+
+
+def parse_routine_schedule(schedule: str) -> dict[str, Any]:
+    original = schedule.strip()
+    lowered = original.lower()
+    if not original:
+        raise ValueError("Schedule is required.")
+    if lowered.startswith("every "):
+        minutes = parse_duration_minutes(original[6:].strip())
+        return {"kind": "interval", "minutes": minutes, "display": f"every {format_duration_minutes(minutes)}"}
+    cron_parts = original.split()
+    if len(cron_parts) == 5 and all(is_cron_field(part) for part in cron_parts):
+        return {"kind": "cron", "expr": original, "display": original}
+    if "T" in original or re.match(r"^\d{4}-\d{2}-\d{2}", original):
+        dt = parse_datetime_or_none(original)
+        if dt is None:
+            raise ValueError(f"Invalid timestamp: {original}")
+        return {"kind": "once", "run_at": dt.isoformat(), "display": f"once at {format_local_datetime(dt)}"}
+    minutes = parse_duration_minutes(original)
+    run_at = datetime.now(UTC) + timedelta(minutes=minutes)
+    return {"kind": "once", "run_at": run_at.isoformat(), "display": f"once in {format_duration_minutes(minutes)}"}
+
+
+def parse_duration_minutes(value: str) -> int:
+    match = re.match(r"^\s*(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\s*$", value, re.IGNORECASE)
+    if not match:
+        raise ValueError("Invalid schedule. Use 30m, 2h, every 30m, a timestamp, or cron like 0 9 * * *.")
+    amount = int(match.group(1))
+    unit = match.group(2).lower()[0]
+    minutes = amount * {"m": 1, "h": 60, "d": 1440}[unit]
+    if minutes < 1:
+        raise ValueError("Schedule interval must be at least one minute.")
+    return minutes
+
+
+def format_duration_minutes(minutes: int) -> str:
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
+def parse_datetime_or_none(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.astimezone(UTC)
+
+
+def format_local_datetime(value: datetime | None) -> str:
+    if value is None:
+        return "none"
+    return value.astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
+
+
+def compute_routine_next_run(schedule: dict[str, Any], last_run_at: str | None = None) -> datetime | None:
+    now = datetime.now(UTC)
+    kind = schedule.get("kind")
+    if kind == "once":
+        if last_run_at:
+            return None
+        run_at = parse_datetime_or_none(str(schedule.get("run_at") or ""))
+        return run_at if run_at and run_at >= now - timedelta(minutes=2) else None
+    if kind == "interval":
+        minutes = int(schedule.get("minutes") or 0)
+        if minutes < 1:
+            return None
+        base = parse_datetime_or_none(last_run_at or "") or now
+        candidate = base + timedelta(minutes=minutes)
+        while candidate <= now:
+            candidate += timedelta(minutes=minutes)
+        return candidate
+    if kind == "cron":
+        return next_cron_time(str(schedule.get("expr") or ""), now)
+    return None
+
+
+def is_cron_field(field: str) -> bool:
+    return bool(re.fullmatch(r"[\d*,/\-]+", field))
+
+
+def next_cron_time(expr: str, after: datetime) -> datetime | None:
+    fields = expr.split()
+    if len(fields) != 5:
+        return None
+    start = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for offset in range(0, 366 * 24 * 60):
+        candidate = start + timedelta(minutes=offset)
+        if cron_matches(fields, candidate):
+            return candidate
+    return None
+
+
+def cron_matches(fields: list[str], dt: datetime) -> bool:
+    cron_weekday = (dt.weekday() + 1) % 7
+    values = [dt.minute, dt.hour, dt.day, dt.month, cron_weekday]
+    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
+    for index, (field, value, (minimum, maximum)) in enumerate(zip(fields, values, ranges)):
+        if not cron_field_matches(field, value, minimum, maximum):
+            if index == 4 and value == 0 and cron_field_matches(field, 7, minimum, maximum):
+                continue
+            return False
+    return True
+
+
+def cron_field_matches(field: str, value: int, minimum: int, maximum: int) -> bool:
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if "/" in part:
+            part, step_text = part.split("/", maxsplit=1)
+            try:
+                step = max(1, int(step_text))
+            except ValueError:
+                return False
+        if part == "*":
+            start, end = minimum, maximum
+        elif "-" in part:
+            start_text, end_text = part.split("-", maxsplit=1)
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError:
+                return False
+        else:
+            try:
+                start = end = int(part)
+            except ValueError:
+                return False
+        if start <= value <= end and (value - start) % step == 0:
+            return True
+    return False
+
+
 def parse_natural_doc_edit(text: str) -> tuple[str, str] | None:
     patterns = [
         r"(?is)^\s*in\s+([a-z_]+\.md)\s+add\s+(?:one\s+)?(?:new\s+)?(?:rule\s+)?(.+?)\s*$",
@@ -3052,6 +3839,17 @@ def extract_frontmatter_value(content: str, key: str) -> str | None:
 def first_heading(content: str) -> str | None:
     match = re.search(r"(?m)^#\s+(.+?)\s*$", content)
     return match.group(1).strip() if match else None
+
+
+def skill_is_pinned(skill_file: Path) -> bool:
+    with contextlib.suppress(OSError):
+        content = skill_file.read_text(encoding="utf-8")
+        pinned = extract_frontmatter_value(content, "pinned")
+        if pinned and pinned.lower() in {"true", "yes", "1"}:
+            return True
+        if re.search(r"(?im)^\s*pinned\s*:\s*(true|yes|1)\s*$", content):
+            return True
+    return False
 
 
 def is_http_url(url: str) -> bool:
@@ -3211,7 +4009,7 @@ def user_behavior_categories(text: str) -> list[str]:
         categories.append("file_outputs")
     if len(text) < 160:
         categories.append("direct_short_requests")
-    if any(word in lowered for word in ("autonomous", "automatic", "daily", "memory", "heartbeat")):
+    if any(word in lowered for word in ("autonomous", "automatic", "daily", "memory", "heartbeat", "routine", "routines", "cron", "job", "jobs", "reminder")):
         categories.append("autonomy_memory")
     return categories
 

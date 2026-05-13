@@ -449,7 +449,7 @@ def main() -> int:
         install_agent = _choose_agent_install(args)
         step = steps.next("Installed llama agent")
         if install_agent:
-            _install_llama_agent(git, agent_source_dir, args.dry_run, panel, step)
+            _install_llama_agent(git, agent_source_dir, install_dir / "agent", args.dry_run, panel, step)
             agent_installed = True
         else:
             Log.info("Skipping llama_agent install.")
@@ -512,7 +512,7 @@ def _success_summary(install_dir: Path, started: float, path_updated: bool, dry_
         f" Total time: {elapsed:.1f} seconds",
     ]
     if agent_installed:
-        lines.extend(["", " Agent   : llama agent / --status / --stop"])
+        lines.extend(["", " Agent   : llama agent / --logs / --status / --stop"])
     Log.box(lines, Log.GREEN)
     if not path_updated:
         Log.warn(f"PATH was not changed. Run directly with: {install_dir / 'llama.exe'}")
@@ -639,24 +639,36 @@ def _choose_agent_install(args: argparse.Namespace) -> bool:
     return answer in {"", "y", "yes"}
 
 
-def _install_llama_agent(git: str, agent_dir: Path, dry_run: bool, panel: StatusPanel, step: StepEntry) -> None:
+def _install_llama_agent(
+    git: str,
+    agent_dir: Path,
+    final_agent_dir: Path,
+    dry_run: bool,
+    panel: StatusPanel,
+    step: StepEntry,
+) -> None:
     """Clone and configure llama_agent for use with Llama Bridge."""
     _ensure_node(dry_run)
     npm = _ensure_npm(dry_run)
     if dry_run:
         Log.info(f"[DRY RUN] Would clone {AGENT_REPO_URL} into {agent_dir}.")
-        Log.info("[DRY RUN] Would run npm install and write .env.local for Llama Bridge.")
+        Log.info("[DRY RUN] Would run npm install, write .env.local, and launch npm run setup.")
         panel.steps.complete(step)
         panel.render()
         return
     _run([git, "clone", "--depth", "1", AGENT_REPO_URL, str(agent_dir)], "Cloning llama_agent", panel, step, finish_step=False)
     _run([npm, "install"], "Installing llama_agent dependencies", panel, step, cwd=agent_dir, finish_step=False)
     _write_agent_env(agent_dir)
-    _try_agent_codegen(agent_dir, panel, step)
+    if sys.stdin.isatty():
+        _run_agent_setup_wizard(npm, agent_dir, final_agent_dir, panel, step)
+    else:
+        Log.warn("Input is not interactive; skipping llama_agent setup wizard.")
+        Log.info(f"Finish agent setup later with: cd {final_agent_dir} && npm run setup")
+        _try_agent_codegen(agent_dir, panel, step)
     panel.steps.complete(step)
     panel.render()
     Log.ok("llama_agent configured for Llama Bridge.")
-    Log.info("Use `llama agent` to start it, `llama agent --status` to inspect it, and `llama agent --stop` to stop it.")
+    Log.info("Use `llama agent` to start it, `llama agent --logs` to watch it, `llama agent --status` to inspect it, and `llama agent --stop` to stop it.")
 
 
 def _ensure_node(dry_run: bool) -> str:
@@ -711,7 +723,8 @@ def _write_agent_env(agent_dir: Path) -> None:
         env_path.write_text("", encoding="utf-8")
     values = {
         "LLAMA_BRIDGE_URL": "http://127.0.0.1:8089",
-        "LLAMA_BRIDGE_MODEL": "default",
+        "LLAMA_BRIDGE_MODEL": "sonnet",
+        "LLAMA_BRIDGE_API_KEY": "change-me",
         "PORT": "3456",
         "PUBLIC_URL": "http://localhost:3456",
     }
@@ -719,6 +732,28 @@ def _write_agent_env(agent_dir: Path) -> None:
     for key, value in values.items():
         text = _set_env_line(text, key, value)
     env_path.write_text("\n".join(text).rstrip() + "\n", encoding="utf-8")
+
+
+def _run_agent_setup_wizard(npm: str, agent_dir: Path, final_agent_dir: Path, panel: StatusPanel, step: StepEntry) -> None:
+    """Run llama_agent's interactive setup wizard with inherited stdio."""
+    panel.clear()
+    was_enabled = panel.enabled
+    panel.enabled = False
+    Log.section("llama_agent setup wizard")
+    Log.info("Answer the prompts below to configure Telegram, Convex, Composio, memory search, and ngrok.")
+    Log.info("When it finishes, `llama agent` will start the full Boop stack in the background.")
+    try:
+        command = [npm, "run", "setup"]
+        Log.debug("Running: " + subprocess.list2cmdline(command))
+        result = subprocess.run(command, cwd=agent_dir, check=False)
+        if result.returncode != 0:
+            Log.warn(f"llama_agent setup exited with code {result.returncode}.")
+            Log.info(f"Finish or retry later with: cd {final_agent_dir} && npm run setup")
+        else:
+            Log.ok("llama_agent setup wizard completed.")
+    finally:
+        panel.enabled = was_enabled
+        panel.render()
 
 
 def _set_env_line(lines: list[str], key: str, value: str) -> list[str]:
@@ -1255,11 +1290,11 @@ def _pid_is_running(pid: int) -> bool:
 def _run_dry_install_steps(args: argparse.Namespace, steps: StepCounter, panel: StatusPanel, install_dir: Path) -> None:
     """Simulate install steps that would normally write to disk or registry."""
     agent_action = (
-        "install and configure llama_agent"
+        "install llama_agent dependencies and launch its setup wizard"
         if args.install_agent
         else "skip llama_agent"
         if args.no_install_agent
-        else "ask whether to install llama_agent and configure it if selected"
+        else "ask whether to install llama_agent and launch its setup wizard if selected"
     )
     dry_actions = [
         ("Cloned repository", f"clone {args.repo} into a temp directory"),

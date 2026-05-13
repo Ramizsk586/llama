@@ -51,6 +51,9 @@ Support these commands:
 - `/image <query>` - find, download when possible, and send an image.
 - `/file <txt|md|pdf> <name> | <request>` - create and send a file artifact.
 - `/schedule every morning at 6 am send good morning` - add a timed daily autonomous task.
+- `/jobs list` - inspect autonomous Llama routines.
+- `/jobs add <schedule> | <task>` - create a persistent routine.
+- `/jobs run|pause|resume|remove <id>` - manage a routine.
 - `/evolve status|run|skills` - inspect or run the self-evolution loop.
 - `/poll Question | option 1 | option 2` - create a Telegram poll.
 - `/web <query>` - web/search mode when tools are available.
@@ -83,6 +86,24 @@ Every configured heartbeat interval, default 30 minutes:
 - If the work is unclear, unsafe, or needs credentials, ask for confirmation instead of pretending it was done.
 - Timed tasks use `Daily HH:MM | action` in HEARTBEAT.md and run once per local day after that time.
 
+## Llama Routines
+
+Llama routines are the Telegram bot's renamed cron-style jobs.
+
+Use routines for work that should outlive the current chat turn:
+- one-shot reminders such as `30m | remind me to check logs`
+- recurring intervals such as `every 2h | summarize current provider health`
+- cron-style schedules such as `0 9 * * * | send a morning briefing`
+- timestamped work such as `2026-05-13T18:30 | send release checklist`
+
+Routine rules:
+- Store jobs in the Telegram runtime state, not in raw chat history.
+- Deliver to the originating chat and thread/topic by default.
+- Save each run's output under `.runtime/routine_outputs/`.
+- If a run has nothing useful to say, output `[SILENT]` and do not message the user.
+- Do not create recursive routines from inside routine runs.
+- Do not run unsafe, credentialed, destructive, or access-control-changing work without explicit user confirmation.
+
 ## Self-Evolution Loop
 
 Maintain a closed learning loop inspired by Hermes-style agents:
@@ -90,6 +111,8 @@ Maintain a closed learning loop inspired by Hermes-style agents:
 - Curate durable profile facts into USER.md.
 - Curate durable project/workflow lessons into MEMORY.md.
 - Create or update small agent-authored skills under `skills/agent-created/` when patterns repeat.
+- Track skill usage in a sidecar file and archive stale unpinned agent-created skills.
+- Write compact audit reports under `.runtime/evolution_reports/`.
 - Inject only a compact skill index into the prompt.
 - Archive stale agent-created skills instead of deleting them.
 - Keep all memories bounded, non-secret, and actionable.

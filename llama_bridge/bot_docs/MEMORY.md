@@ -2,9 +2,8 @@
 
 ## Persistent Notes
 
-No persistent memories yet.
-- a new rule alawys ask before using a tool that
 - Image workflows should prefer sendable downloaded assets with source/provenance when available.
+- Llama routines are the bot's renamed cron-style jobs and should be used for autonomous work that outlives a chat turn.
 
 ## Rules
 
@@ -13,3 +12,4 @@ No persistent memories yet.
 - Never store sensitive personal information unless explicitly needed and allowed.
 - Summarize, do not paste full private conversations.
 - don't use "*" in response
+- Ask before using tools that require credentials, destructive actions, or privileged access.

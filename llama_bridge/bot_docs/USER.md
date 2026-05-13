@@ -7,6 +7,7 @@
 - Use step-by-step instructions for setup and coding tasks.
 - Mention uncertainty instead of guessing.
 - User often gives compact instructions; infer reasonable defaults and answer with concise implementation-first updates.
+- Use Llama routines for autonomous reminders, recurring checks, and scheduled briefings.
 
 ## Locale
 
