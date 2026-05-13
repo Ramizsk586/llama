@@ -49,6 +49,8 @@ DEFAULT_EXAMPLE_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.example.yml"
 DEFAULT_API_SETTINGS_PATH = DEFAULT_CONFIG_DIR / "Api.json"
 DEFAULT_PID_PATH = DEFAULT_CONFIG_DIR / "llama.pid"
 DEFAULT_LOG_PATH = DEFAULT_CONFIG_DIR / "llama.log"
+DEFAULT_NGROK_PID_PATH = DEFAULT_CONFIG_DIR / "llama.ngrok.pid"
+DEFAULT_NGROK_LOG_PATH = DEFAULT_CONFIG_DIR / "llama.ngrok.log"
 
 DEFAULT_CONFIG_TEMPLATE = """# =============================================================================
 #                       llama -- config.example.yml
@@ -87,6 +89,18 @@ server:
 
   # Optional second port without built-in tools (for Open Web UI etc.)
   # openwebui_port: 8090
+
+
+# =============================================================================
+#                           NGROK CONFIG
+# =============================================================================
+#  Used by `llama start --online` to publish the local bridge through ngrok.
+#  Create a token at https://dashboard.ngrok.com/get-started/your-authtoken
+# =============================================================================
+
+ngrok:
+  auth_token: ${NGROK_AUTHTOKEN}
+  region: null
 
 
 # =============================================================================
@@ -289,6 +303,25 @@ copilot_cli:
   max_prompt_tokens: 65536
   max_output_tokens: 2048
   install_package: "@github/copilot"
+
+
+# =============================================================================
+#                    INTEGRATION: VS CODE COPILOT LOCAL
+# =============================================================================
+#  Models advertised through Ollama-compatible /api/tags for VS Code Copilot.
+#  VS Code allows up to 3 local Ollama models.
+# =============================================================================
+
+vs_copilot:
+  models:
+    - name: gemma4:31b
+      provider: ollama_cloud
+      model: gemma4:31b
+      context_size: 65536
+    - name: minimax
+      provider: opencode
+      model: minimax-m2.5-free
+      context_size: 65536
 
 
 # =============================================================================
@@ -509,6 +542,12 @@ class ServerConfig:
     auth_token: str = "change-me"
     idle_timeout_seconds: int = 180
     openwebui_port: int | None = None
+
+
+@dataclass(slots=True)
+class NgrokConfig:
+    auth_token: str | None = None
+    region: str | None = None
 
 
 @dataclass(slots=True)
@@ -775,6 +814,7 @@ class OpenWebUIConfig:
 @dataclass(slots=True)
 class BridgeConfig:
     server: ServerConfig
+    ngrok: NgrokConfig
     providers: dict[str, ProviderConfig]
     anthropic_models: dict[str, ModelAlias]
     pi: PiConfig
@@ -1386,6 +1426,12 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             stacklevel=2,
         )
 
+    ngrok_raw = raw.get("ngrok", {}) or {}
+    ngrok = NgrokConfig(
+        auth_token=ngrok_raw.get("auth_token"),
+        region=ngrok_raw.get("region"),
+    )
+
     providers: dict[str, ProviderConfig] = {}
     for name, value in (raw.get("providers", {}) or {}).items():
         providers[name] = ProviderConfig(
@@ -1604,6 +1650,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
 
     bridge_config = BridgeConfig(
         server=server,
+        ngrok=ngrok,
         providers=providers,
         anthropic_models=aliases,
         pi=pi,

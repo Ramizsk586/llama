@@ -218,6 +218,35 @@ def create_app(
                 "body": body,
             },
         )
+        if resolved.provider.type == "opencode":
+            try:
+                data = await _chat_completion_via_anthropic_provider(
+                    provider,
+                    payload,
+                    requested_model=str(body.get("model") or resolved.alias),
+                    upstream_model=resolved.upstream_model,
+                )
+            except httpx.HTTPStatusError as exc:
+                _write_dev_log(
+                    config,
+                    "openai_chat_response_error",
+                    {
+                        "status_code": exc.response.status_code,
+                        "body": _safe_response_text(exc.response),
+                    },
+                )
+                return _upstream_error(exc.response)
+            except httpx.RequestError as exc:
+                _write_dev_log(config, "openai_chat_response_error", {"message": str(exc)})
+                return _request_error(exc)
+            if bool(body.get("stream")):
+                return StreamingResponse(
+                    _safe_stream(_stream_buffered_openai_completion(data)),
+                    media_type="text/event-stream",
+                )
+            _write_dev_log(config, "openai_chat_response", data)
+            return JSONResponse(data)
+
         if bool(body.get("stream")):
             if _should_buffer_streaming_tool_request(body, payload):
                 try:
@@ -1096,6 +1125,27 @@ def create_app(
             provider_config=resolved.provider,
         )
         provider = _provider_for(app, resolved)
+        if resolved.provider.type == "opencode":
+            try:
+                data = await _chat_completion_via_anthropic_provider(
+                    provider,
+                    payload,
+                    requested_model=str(body.get("model") or resolved.alias),
+                    upstream_model=resolved.upstream_model,
+                )
+            except httpx.HTTPStatusError as exc:
+                return _upstream_error(exc.response)
+            except httpx.RequestError as exc:
+                return _request_error(exc)
+            if bool(body.get("stream", True)):
+                return StreamingResponse(
+                    _safe_stream(_stream_ollama_chat_response_from_completion(data, body)),
+                    media_type="application/x-ndjson",
+                )
+            return JSONResponse(
+                _chat_completion_to_ollama_chat_response(data, body)
+            )
+
         if bool(body.get("stream", True)):
             _log_streaming_tool_policy(config, "ollama_chat", payload)
             return StreamingResponse(
@@ -2165,6 +2215,250 @@ async def _chat_completion_with_bridge_tools(
             )
 
     return data
+
+
+async def _chat_completion_via_anthropic_provider(
+    provider: OpenAICompatibleProvider,
+    payload: dict[str, Any],
+    *,
+    requested_model: str,
+    upstream_model: str,
+) -> dict[str, Any]:
+    create_anthropic = getattr(provider, "create_anthropic_message", None)
+    if create_anthropic is None:
+        raise RuntimeError("Provider does not support Anthropic messages")
+    body = _openai_chat_payload_to_anthropic(payload, upstream_model)
+    response = await create_anthropic(body, upstream_model)
+    response.raise_for_status()
+    return _anthropic_message_to_openai_chat(response.json(), requested_model)
+
+
+def _openai_chat_payload_to_anthropic(
+    payload: dict[str, Any],
+    upstream_model: str,
+) -> dict[str, Any]:
+    system_parts: list[str] = []
+    messages: list[dict[str, Any]] = []
+
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role == "system":
+            text = _string_content(content)
+            if text:
+                system_parts.append(text)
+            continue
+        if role == "tool":
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": str(message.get("tool_call_id") or ""),
+                            "content": _string_content(content),
+                        }
+                    ],
+                }
+            )
+            continue
+        if role == "assistant":
+            blocks: list[dict[str, Any]] = []
+            text = _string_content(content)
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for index, tool_call in enumerate(message.get("tool_calls") or []):
+                function = tool_call.get("function") or {}
+                tool_id = str(tool_call.get("id") or f"toolu_{index}")
+                name = str(function.get("name") or "tool")
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": name,
+                        "input": _json_object_from_any(function.get("arguments")),
+                    }
+                )
+            messages.append({"role": "assistant", "content": blocks or ""})
+            continue
+        if role == "user":
+            messages.append({"role": "user", "content": _openai_content_to_anthropic(content)})
+
+    body: dict[str, Any] = {
+        "model": upstream_model,
+        "messages": _merge_anthropic_messages(messages),
+        "max_tokens": int(
+            payload.get("max_tokens")
+            or payload.get("max_completion_tokens")
+            or payload.get("max_output_tokens")
+            or 2048
+        ),
+    }
+    if system_parts:
+        body["system"] = "\n\n".join(system_parts)
+    for source_key, target_key in (
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop", "stop_sequences"),
+    ):
+        if payload.get(source_key) is not None:
+            body[target_key] = payload[source_key]
+    tools = _openai_tools_to_anthropic(payload.get("tools"))
+    if tools:
+        body["tools"] = tools
+        tool_choice = _openai_tool_choice_to_anthropic(payload.get("tool_choice"))
+        if tool_choice:
+            body["tool_choice"] = tool_choice
+    return body
+
+
+def _openai_content_to_anthropic(content: Any) -> str | list[dict[str, Any]]:
+    if isinstance(content, list):
+        blocks: list[dict[str, Any]] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text") or item.get("content")
+            if isinstance(text, str):
+                blocks.append({"type": "text", "text": text})
+        return blocks or ""
+    return _string_content(content)
+
+
+def _merge_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = message.get("content", "")
+        if merged and merged[-1].get("role") == role:
+            merged[-1]["content"] = _merge_anthropic_content(merged[-1].get("content"), content)
+        else:
+            merged.append({"role": role, "content": content})
+    return merged
+
+
+def _merge_anthropic_content(left: Any, right: Any) -> Any:
+    left_blocks = _anthropic_content_blocks(left)
+    right_blocks = _anthropic_content_blocks(right)
+    blocks = [*left_blocks, *right_blocks]
+    text_blocks = [
+        block
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    if len(blocks) == len(text_blocks):
+        return "\n\n".join(str(block.get("text") or "") for block in text_blocks if block.get("text"))
+    return blocks
+
+
+def _anthropic_content_blocks(content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, list):
+        return [item for item in content if isinstance(item, dict)]
+    text = _string_content(content)
+    return [{"type": "text", "text": text}] if text else []
+
+
+def _openai_tools_to_anthropic(tools: Any) -> list[dict[str, Any]]:
+    if not isinstance(tools, list):
+        return []
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        converted.append(
+            {
+                "name": name,
+                "description": function.get("description") or "",
+                "input_schema": function.get("parameters") or {"type": "object"},
+            }
+        )
+    return converted
+
+
+def _openai_tool_choice_to_anthropic(choice: Any) -> dict[str, Any] | None:
+    if choice in (None, "auto"):
+        return {"type": "auto"} if choice == "auto" else None
+    if choice == "required":
+        return {"type": "any"}
+    if choice == "none":
+        return {"type": "none"}
+    if isinstance(choice, dict):
+        function = choice.get("function") or {}
+        name = function.get("name") or choice.get("name")
+        if isinstance(name, str) and name:
+            return {"type": "tool", "name": name}
+        choice_type = choice.get("type")
+        if choice_type in {"auto", "any", "none"}:
+            return {"type": choice_type}
+    return None
+
+
+def _anthropic_message_to_openai_chat(
+    data: dict[str, Any],
+    requested_model: str,
+) -> dict[str, Any]:
+    content_blocks = data.get("content") or []
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for index, block in enumerate(content_blocks):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text_parts.append(str(block.get("text") or ""))
+        elif block.get("type") == "tool_use":
+            tool_calls.append(
+                {
+                    "id": block.get("id") or f"call_{index}",
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name") or "tool",
+                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=True),
+                    },
+                }
+            )
+    stop_reason = data.get("stop_reason")
+    finish_reason = "tool_calls" if tool_calls or stop_reason == "tool_use" else "stop"
+    if stop_reason == "max_tokens":
+        finish_reason = "length"
+    usage = data.get("usage") or {}
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "\n".join(part for part in text_parts if part) or None,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {
+        "id": data.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": requested_model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+        },
+    }
+
+
+def _json_object_from_any(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value) if value else {}
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _resolve_bridge_model(requested_model: str, config: BridgeConfig) -> ResolvedModel:
@@ -3902,6 +4196,42 @@ async def _stream_ollama_chat_response(
 ) -> AsyncIterator[str]:
     async for event in _stream_ollama_chat_events(provider, payload, request_body, config):
         yield f"{json.dumps(event, ensure_ascii=True)}\n"
+
+
+async def _stream_ollama_chat_response_from_completion(
+    data: dict[str, Any],
+    request_body: dict[str, Any],
+) -> AsyncIterator[str]:
+    response = _chat_completion_to_ollama_chat_response(data, request_body)
+    message = response.get("message") or {}
+    if message.get("content") or message.get("tool_calls"):
+        yield (
+            json.dumps(
+                {
+                    "model": response.get("model"),
+                    "created_at": response.get("created_at"),
+                    "message": message,
+                    "done": False,
+                },
+                ensure_ascii=True,
+            )
+            + "\n"
+        )
+    yield (
+        json.dumps(
+            {
+                "model": response.get("model"),
+                "created_at": response.get("created_at"),
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": response.get("done_reason", "stop"),
+                "prompt_eval_count": response.get("prompt_eval_count", 0),
+                "eval_count": response.get("eval_count", 0),
+            },
+            ensure_ascii=True,
+        )
+        + "\n"
+    )
 
 
 async def _stream_ollama_generate_response(

@@ -28,6 +28,8 @@ from .config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_EXAMPLE_CONFIG_PATH,
     DEFAULT_LOG_PATH,
+    DEFAULT_NGROK_LOG_PATH,
+    DEFAULT_NGROK_PID_PATH,
     DEFAULT_PID_PATH,
     ensure_default_dirs,
     merge_missing_config_fields,
@@ -504,12 +506,16 @@ def main() -> None:
             config_path = _arg_path(args.config)
             _ensure_setup(config_path)
             config = load_config(config_path)
+            pid_path = _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path)
+            log_path = _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path)
             _cmd_start(
                 config_path,
-                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                pid_path,
+                log_path,
                 0 if args.forever else _configured_idle_timeout_seconds(config),
             )
+            if args.online:
+                _cmd_ngrok_start(config_path)
             return
         if args.command == "stop":
             config_path = _default_config_path()
@@ -829,6 +835,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--forever",
         action="store_true",
         help="disable the configured idle auto-stop",
+    )
+    start_cmd.add_argument(
+        "--online",
+        action="store_true",
+        help="publish the bridge with ngrok and print the public URL",
     )
 
     stop_cmd = subparsers.add_parser("stop", help="stop the background bridge")
@@ -1968,6 +1979,143 @@ def _cmd_start(
             _print_note(f"LLM-only (no tools) server on {_server_url(cfg.server.host, openwebui_port)} for Open Web UI")
 
 
+def _cmd_ngrok_start(config_path: Path) -> None:
+    config = load_config(config_path)
+    pid_path = config_path.parent / DEFAULT_NGROK_PID_PATH.name
+    log_path = config_path.parent / DEFAULT_NGROK_LOG_PATH.name
+    existing_pid = _read_pid(pid_path)
+    if existing_pid is not None and _pid_alive(existing_pid):
+        public_url = _wait_for_ngrok_url(timeout_seconds=2.0)
+        if public_url:
+            _print_state("online", f"public URL: {public_url}", "32")
+        else:
+            _print_state("online", f"ngrok is already running with pid {existing_pid}", "32")
+        return
+    if existing_pid is not None:
+        pid_path.unlink(missing_ok=True)
+
+    running, _running_url = _server_is_running(config_path, config_path.parent / DEFAULT_PID_PATH.name)
+    if not running:
+        _print_state("fail", "llama server is not running, so ngrok was not started", "31")
+        return
+
+    ngrok_exe = shutil.which("ngrok")
+    if not ngrok_exe:
+        _print_state("fail", "ngrok command was not found on PATH", "31")
+        _print_note("Install ngrok, then set ngrok.auth_token in env.yml or NGROK_AUTHTOKEN.")
+        return
+
+    log_path.write_text("", encoding="utf-8")
+    target_url = _ngrok_target_url(config.server.host, config.server.port)
+    command = [ngrok_exe, "http", target_url]
+    if config.ngrok.region:
+        command.extend(["--region", str(config.ngrok.region)])
+
+    env = dict(os.environ)
+    auth_token = str(config.ngrok.auth_token or "").strip()
+    if auth_token and not auth_token.startswith("${"):
+        env["NGROK_AUTHTOKEN"] = auth_token
+        command.extend(["--authtoken", auth_token])
+    if config.server.auth_token == "change-me":
+        _print_state("warn", "server.auth_token is still 'change-me'; change it before sharing the public URL", "33")
+
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(config_path.parent),
+        "stdin": subprocess.DEVNULL,
+        "env": env,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW
+            | subprocess.DETACHED_PROCESS
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    with log_path.open("a", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            command,
+            stdout=handle,
+            stderr=handle,
+            **popen_kwargs,
+        )
+    pid_path.write_text(str(process.pid), encoding="utf-8")
+    _print_state("online", f"ngrok started on pid {process.pid}", "32")
+    public_url = _wait_for_ngrok_url()
+    if public_url:
+        _print_state("online", f"public URL: {public_url}", "32")
+        _print_note(f"OpenAI-compatible base URL: {public_url.rstrip('/')}/v1")
+        _print_note("Use server.auth_token as the API key.")
+    elif process.poll() is not None:
+        pid_path.unlink(missing_ok=True)
+        _print_state("fail", f"ngrok exited early, see log: {log_path}", "31")
+    else:
+        _print_state("warn", f"ngrok started, but no public URL was reported yet; see log: {log_path}", "33")
+
+
+def _cmd_ngrok_stop(pid_path: Path, *, verbose: bool = True) -> None:
+    pid = _read_pid(pid_path)
+    if pid is None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    finally:
+        pid_path.unlink(missing_ok=True)
+    if verbose:
+        _print_state("ok", f"ngrok stopped pid {pid}", "32")
+
+
+def _ngrok_target_url(host: str, port: int) -> str:
+    target_host = host
+    if target_host in {"0.0.0.0", "::"}:
+        target_host = "127.0.0.1"
+    return _server_url(target_host, port)
+
+
+def _wait_for_ngrok_url(timeout_seconds: float = 15.0) -> str | None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        public_url = _ngrok_public_url()
+        if public_url:
+            return public_url
+        time.sleep(0.5)
+    return None
+
+
+def _ngrok_public_url() -> str | None:
+    try:
+        request = Request("http://127.0.0.1:4040/api/tunnels", method="GET")
+        with urlopen(request, timeout=1) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    tunnels = payload.get("tunnels") if isinstance(payload, dict) else None
+    if not isinstance(tunnels, list):
+        return None
+    http_url = None
+    for tunnel in tunnels:
+        if not isinstance(tunnel, dict):
+            continue
+        public_url = str(tunnel.get("public_url") or "")
+        if public_url.startswith("https://"):
+            return public_url
+        if public_url.startswith("http://") and http_url is None:
+            http_url = public_url
+    return http_url
+
+
 def _try_openwebui_port(config_path: Path) -> int | None:
     try:
         config = load_config(config_path)
@@ -2034,6 +2182,7 @@ def _llama_root_config_candidates() -> list[Path]:
 
 
 def _cmd_stop(pid_path: Path) -> None:
+    _cmd_ngrok_stop(pid_path.parent / DEFAULT_NGROK_PID_PATH.name, verbose=False)
     pid = _read_pid(pid_path)
     if pid is None:
         config_path = pid_path.parent / DEFAULT_CONFIG_PATH.name
@@ -2331,6 +2480,9 @@ def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
         main_http = _http_status(main_url)
         if not process_running and main_http.startswith("ok"):
             process_running = True
+        ngrok_pid = _read_pid(config_path.parent / DEFAULT_NGROK_PID_PATH.name)
+        ngrok_running = ngrok_pid is not None and _pid_alive(ngrok_pid)
+        ngrok_url = _ngrok_public_url() if ngrok_running else None
 
     _title("llama status")
     rows: list[tuple[str, str | int]] = [("process", _status_label(process_running))]
@@ -2341,6 +2493,9 @@ def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
 
     if config is not None:
         rows.append(("url (tools)", f"{main_url} ({main_http})" if main_http else main_url))
+        if ngrok_running:
+            rows.append(("url (online)", ngrok_url or "ngrok running, URL not available yet"))
+            rows.append(("ngrok pid", ngrok_pid or "unknown"))
         if config.server.openwebui_port is not None:
             owui_url = _server_url(config.server.host, config.server.openwebui_port)
             owui_http = _http_status(owui_url)

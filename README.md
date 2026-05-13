@@ -104,6 +104,7 @@ llama claude -- --help
 llama serve
 llama status
 llama start --forever
+llama start --online
 llama api status
 llama api --limits
 llama logs
@@ -186,6 +187,19 @@ values. `llama api limits` works too.
 
 `llama logs` follows the live log until you press `Ctrl+C`. Use
 `llama logs --no-follow` to print the current log and exit.
+
+`llama start --online` starts the local bridge and then starts `ngrok` to create
+a public URL. Install the `ngrok` CLI first, then set `ngrok.auth_token` in
+`env.yml` or set `NGROK_AUTHTOKEN` in your environment:
+
+```yaml
+ngrok:
+  auth_token: ${NGROK_AUTHTOKEN}
+  region: null
+```
+
+The command prints both the public root URL and the `/v1` base URL. Public
+clients should use `server.auth_token` as the API key.
 
 `llama cli --list` shows which llama-managed CLI tools are currently usable and
 where they are installed. `llama cli --support` shows all CLI tools supported by
