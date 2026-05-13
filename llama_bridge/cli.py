@@ -43,6 +43,7 @@ from .config import (
     resolve_opencode_model,
     resolve_pi_model,
     write_claude_api_settings,
+    write_config_data,
     write_default_config,
 )
 from .llama_claw import (
@@ -62,6 +63,7 @@ PYTHON_REQUIREMENTS = {
     "fastapi": "fastapi>=0.115.0",
     "httpx": "httpx>=0.27.0",
     "yaml": "pyyaml>=6.0.2",
+    "ruamel.yaml": "ruamel.yaml>=0.18.0",
     "uvicorn": "uvicorn>=0.32.0",
 }
 
@@ -1409,10 +1411,7 @@ def _cmd_configure(config_path: Path) -> None:
     else:
         telegram["enabled"] = bool(telegram.get("enabled", False))
 
-    config_path.write_text(
-        yaml.safe_dump(raw, sort_keys=False, allow_unicode=False),
-        encoding="utf-8",
-    )
+    write_config_data(config_path, raw)
 
     _print_state("ok", "configuration updated", "32")
     _kv_rows(
@@ -1441,10 +1440,7 @@ def _cmd_bot_setup(config_path: Path) -> None:
         default=bool(telegram.get("enabled", True)),
     )
     if not telegram["enabled"]:
-        config_path.write_text(
-            yaml.safe_dump(raw, sort_keys=False, allow_unicode=False),
-            encoding="utf-8",
-        )
+        write_config_data(config_path, raw)
         _print_state("ok", "Telegram bot remains disabled", "32")
         return
 
@@ -1497,10 +1493,7 @@ def _cmd_bot_setup(config_path: Path) -> None:
         allow_blank=False,
     )
 
-    config_path.write_text(
-        yaml.safe_dump(raw, sort_keys=False, allow_unicode=False),
-        encoding="utf-8",
-    )
+    write_config_data(config_path, raw)
     workspace_path = Path(__file__).resolve().parent / "bot_docs"
     _ensure_teligram_workspace_files(workspace_path)
     _print_state("ok", "Telegram bot configuration updated", "32")
@@ -7793,7 +7786,7 @@ def _cmd_openwebui_start(config_path: Path, auth: str | None = None, web_search:
     if provider is not None:
         owui_raw["web_search_provider"] = provider
 
-    config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+    write_config_data(config_path, raw)
 
     _title("llama openwebui start")
     _print_state("start", "Starting bridge and Open WebUI...", "36")
@@ -7911,7 +7904,7 @@ def _cmd_openwebui_configure(config_path: Path) -> None:
             "Web search provider", list(VALID_SEARCH_PROVIDERS), current_provider
         )
 
-    config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
+    write_config_data(config_path, raw)
     _print_state("ok", "Open WebUI configuration updated", "32")
     _kv_rows([
         ("host", owui_raw.get("host", "127.0.0.1")),

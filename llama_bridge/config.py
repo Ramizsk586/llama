@@ -1289,6 +1289,59 @@ def _merge_missing_values(existing: Any, template: Any) -> Any:
     return existing
 
 
+def write_config_data(path: Path, data: dict[str, Any]) -> Path:
+    """Write env.yml data while preserving the commented template when possible."""
+    ensure_default_dirs(path.parent)
+    try:
+        if importlib.util.find_spec("ruamel.yaml") is None:
+            raise ImportError
+        from ruamel.yaml import YAML
+        from ruamel.yaml.comments import CommentedMap
+
+        try:
+            template_text = _default_config_template_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            template_text = DEFAULT_CONFIG_TEMPLATE
+
+        existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        comment_line_count = sum(
+            1 for line in existing_text.splitlines() if line.lstrip().startswith("#")
+        )
+        source_text = existing_text if comment_line_count >= 10 else template_text
+
+        yaml_parser = YAML()
+        yaml_parser.preserve_quotes = True
+        yaml_parser.default_flow_style = False
+        base = yaml_parser.load(source_text) if source_text.strip() else CommentedMap()
+        if base is None:
+            base = CommentedMap()
+        _sync_commented_config(base, data)
+
+        output = io.StringIO()
+        yaml_parser.dump(base, output)
+        path.write_text(output.getvalue(), encoding="utf-8")
+        return path
+    except ImportError:
+        import yaml
+
+        path.write_text(
+            yaml.safe_dump(data, sort_keys=False, allow_unicode=False),
+            encoding="utf-8",
+        )
+        return path
+
+
+def _sync_commented_config(target: Any, source: Any) -> None:
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+
+    for key, source_value in source.items():
+        if key in target and isinstance(target.get(key), dict) and isinstance(source_value, dict):
+            _sync_commented_config(target[key], source_value)
+        else:
+            target[key] = source_value
+
+
 def load_config(path: Path | None = None) -> BridgeConfig:
     import yaml
 

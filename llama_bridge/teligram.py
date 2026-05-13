@@ -85,6 +85,10 @@ def _is_heartbeat_ack_only(text: str) -> bool:
     return any(lowered.startswith(phrase) or phrase in lowered for phrase in ack_phrases)
 
 
+def _is_model_error_reply(text: str) -> bool:
+    return text.lower().strip().startswith("i hit a model/provider error")
+
+
 def _color_enabled() -> bool:
     return sys.stderr.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -467,6 +471,7 @@ GENERATED_FILE_MAX_CHARS = 40_000
 AUTONOMOUS_STATE_KEY = "autonomous"
 SELF_EVOLUTION_STATE_KEY = "self_evolution"
 LLAMA_ROUTINES_STATE_KEY = "llama_routines"
+MISSED_TASK_GRACE_SECONDS = 180
 MAX_EVOLUTION_EVENTS = 120
 EVOLUTION_REPORT_LIMIT = 12
 MEMORY_CHAR_LIMIT = 2200
@@ -1556,8 +1561,6 @@ class TeligramBot:
         if next_run is None:
             return "I could not compute the next run for that schedule."
 
-        state = self.read_telegram_state()
-        routines = state.setdefault(LLAMA_ROUTINES_STATE_KEY, {}).setdefault("jobs", [])
         context = self._send_context(chat_id)
         routine_id = uuid.uuid4().hex[:8]
         routine = {
@@ -1580,8 +1583,7 @@ class TeligramBot:
                 "state_id": context.get("state_id") or chat_id,
             },
         }
-        routines.append(routine)
-        self.write_telegram_state(state)
+        self.write_routine_file(routine)
         return (
             "Created Llama routine.\n\n"
             f"ID: {routine_id}\n"
@@ -1607,29 +1609,92 @@ class TeligramBot:
         return "\n".join(lines)
 
     def routines(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
+        routines = self.read_json_dir(self.jobs_dir())
         state = self.read_telegram_state()
         root = state.get(LLAMA_ROUTINES_STATE_KEY) if isinstance(state.get(LLAMA_ROUTINES_STATE_KEY), dict) else {}
         jobs = root.get("jobs") if isinstance(root.get("jobs"), list) else []
-        routines = [job for job in jobs if isinstance(job, dict)]
+        existing_ids = {str(job.get("id")) for job in routines if isinstance(job, dict)}
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("id") or "")
+            if job_id and job_id not in existing_ids:
+                job["_legacy_state"] = True
+                routines.append(job)
         if not include_disabled:
             routines = [job for job in routines if job.get("enabled", True)]
         return routines
 
-    def update_routine_state(self, routine_id: str, action: str) -> str:
+    def jobs_dir(self) -> Path:
+        path = self.runtime_dir() / "jobs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def schedules_dir(self) -> Path:
+        path = self.runtime_dir() / "schedules"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def json_record_path(self, directory: Path, record_id: str) -> Path:
+        safe_id = safe_filename(record_id, default="record").replace(" ", "-")
+        return directory / f"{safe_id}.json"
+
+    def read_json_dir(self, directory: Path) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                LOGGER.exception("Could not read JSON record: %s", path)
+                continue
+            if isinstance(payload, dict):
+                records.append(payload)
+        return records
+
+    def write_json_record(self, directory: Path, record: dict[str, Any]) -> Path:
+        record_id = str(record.get("id") or uuid.uuid4().hex[:8])
+        record["id"] = record_id
+        path = self.json_record_path(directory, record_id)
+        path.write_text(json.dumps(record, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def write_routine_file(self, routine: dict[str, Any]) -> Path:
+        routine.pop("_legacy_state", None)
+        return self.write_json_record(self.jobs_dir(), routine)
+
+    def delete_routine_file(self, routine_id: str) -> None:
+        path = self.json_record_path(self.jobs_dir(), routine_id)
+        with contextlib.suppress(OSError):
+            path.unlink()
         state = self.read_telegram_state()
-        root = state.setdefault(LLAMA_ROUTINES_STATE_KEY, {})
-        jobs = root.setdefault("jobs", [])
-        for index, routine in enumerate(list(jobs)):
+        root = state.get(LLAMA_ROUTINES_STATE_KEY) if isinstance(state.get(LLAMA_ROUTINES_STATE_KEY), dict) else {}
+        jobs = root.get("jobs") if isinstance(root.get("jobs"), list) else []
+        remaining = [job for job in jobs if not (isinstance(job, dict) and str(job.get("id") or "") == routine_id)]
+        if len(remaining) != len(jobs):
+            root["jobs"] = remaining
+            state[LLAMA_ROUTINES_STATE_KEY] = root
+            self.write_telegram_state(state)
+
+    def write_schedule_file(self, schedule: dict[str, Any]) -> Path:
+        schedule.pop("_legacy_heartbeat", None)
+        return self.write_json_record(self.schedules_dir(), schedule)
+
+    def delete_schedule_file(self, schedule_id: str) -> None:
+        path = self.json_record_path(self.schedules_dir(), schedule_id)
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+    def update_routine_state(self, routine_id: str, action: str) -> str:
+        for routine in self.routines(include_disabled=True):
             if not isinstance(routine, dict) or routine.get("id") != routine_id:
                 continue
             if action in {"remove", "delete", "rm"}:
-                jobs.pop(index)
-                self.write_telegram_state(state)
+                self.delete_routine_file(routine_id)
                 return f"Removed Llama routine {routine_id}."
             if action == "pause":
                 routine["enabled"] = False
                 routine["last_status"] = "paused"
-                self.write_telegram_state(state)
+                self.write_routine_file(routine)
                 return f"Paused Llama routine {routine_id}."
             if action == "resume":
                 routine["enabled"] = True
@@ -1637,18 +1702,16 @@ class TeligramBot:
                 next_run = compute_routine_next_run(schedule)
                 routine["next_run_at"] = next_run.isoformat() if next_run else None
                 routine["last_status"] = "scheduled"
-                self.write_telegram_state(state)
+                self.write_routine_file(routine)
                 return f"Resumed Llama routine {routine_id}."
         return f"No routine found with ID {routine_id}."
 
     async def trigger_routine(self, chat_id: str, routine_id: str, *, manual: bool = False) -> None:
         state = self.read_telegram_state()
-        root = state.setdefault(LLAMA_ROUTINES_STATE_KEY, {})
-        jobs = root.setdefault("jobs", [])
-        for routine in jobs:
+        for routine in self.routines(include_disabled=True):
             if isinstance(routine, dict) and routine.get("id") == routine_id:
                 await self.run_routine(routine, state, manual_chat_id=chat_id if manual else None)
-                self.write_telegram_state(state)
+                self.write_routine_file(routine)
                 await self.send_message(chat_id, f"Ran Llama routine {routine_id}.")
                 return
         await self.send_message(chat_id, f"No routine found with ID {routine_id}.")
@@ -1672,23 +1735,236 @@ class TeligramBot:
         return path
 
     async def handle_schedule_request(self, chat_id: str, text: str) -> None:
+        parts = text.strip().split(maxsplit=1)
+        action = (parts[0] if parts else "").lower()
+        rest = parts[1] if len(parts) > 1 else ""
+        if action in {"list", "ls", "status", "show"}:
+            await self.send_message(chat_id, self.schedule_list_text(include_disabled=self.is_admin_chat(chat_id)))
+            return
+        if action in {"run", "now"}:
+            if not rest:
+                await self.send_message(chat_id, "Use /schedule run <schedule_id>")
+                return
+            await self.trigger_schedule(chat_id, rest.strip())
+            return
+        if action in {"pause", "resume", "remove", "delete", "rm"}:
+            if not rest:
+                await self.send_message(chat_id, f"Use /schedule {action} <schedule_id>")
+                return
+            result = self.update_schedule_state(rest.strip(), action)
+            await self.send_message(chat_id, result)
+            return
+
         task = parse_natural_schedule_request(text)
         if task is None:
             await self.send_message(chat_id, "I can schedule daily tasks like: every morning at 6 am send good morning")
             return
         time_text, action = task
-        path = self.safe_workspace_doc_path("HEARTBEAT.md")
-        original = read_text_or_default(path, _packaged_workspace_template("HEARTBEAT.md") or "# HEARTBEAT.md\n")
-        bullet = f"- Daily {time_text} | {action}"
-        updated = append_bullet_to_section(original.rstrip(), "Scheduled Behaviors", bullet)
-        if updated != original:
-            self.backup_document(path, original)
-            path.write_text(updated, encoding="utf-8")
-            self.reload_workspace()
+        schedule_id = uuid.uuid4().hex[:8]
+        context = self._send_context(chat_id)
+        schedule = {
+            "id": schedule_id,
+            "kind": "daily",
+            "time": time_text,
+            "action": action,
+            "enabled": True,
+            "created_at_utc": datetime.now(UTC).isoformat(),
+            "last_run_key": None,
+            "last_run_at": None,
+            "last_status": "scheduled",
+            "last_error": None,
+            "missed_prompted_for_key": None,
+            "origin": {
+                "chat_id": chat_id,
+                "thread_id": context.get("thread_id"),
+                "state_id": context.get("state_id") or chat_id,
+            },
+        }
+        self.write_schedule_file(schedule)
         await self.send_message(
             chat_id,
-            f"Scheduled it.\n\nDaily at {time_text}, I will {action}.\n\nKeep the bot running so the autonomous heartbeat can trigger it.",
+            f"Scheduled it.\n\nID: {schedule_id}\nDaily at {time_text}, I will {action}.\n\nSaved as JSON in .runtime/schedules.",
         )
+
+    def schedules(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
+        schedules = self.read_json_dir(self.schedules_dir())
+        existing_ids = {str(item.get("id")) for item in schedules if isinstance(item, dict)}
+        heartbeat = self.workspace_documents.get("HEARTBEAT.md", "")
+        for task in parse_heartbeat_tasks(heartbeat):
+            task_time = task.get("time")
+            action = str(task.get("action") or "").strip()
+            if not task_time or not action:
+                continue
+            hour, minute = task_time
+            schedule_id = f"heartbeat-{stable_text_key(f'{hour:02d}:{minute:02d}:{action}')}"
+            if schedule_id in existing_ids:
+                continue
+            schedules.append(
+                {
+                    "id": schedule_id,
+                    "kind": "daily",
+                    "time": f"{hour:02d}:{minute:02d}",
+                    "action": action,
+                    "enabled": True,
+                    "_legacy_heartbeat": True,
+                }
+            )
+        if not include_disabled:
+            schedules = [item for item in schedules if item.get("enabled", True)]
+        return schedules
+
+    def schedule_list_text(self, *, include_disabled: bool = False) -> str:
+        schedules = self.schedules(include_disabled=include_disabled)
+        if not schedules:
+            return "No daily schedules yet.\n\nUse /schedule every morning at 6 am send good morning"
+        lines = ["Daily schedules"]
+        for item in schedules[:30]:
+            status = "on" if item.get("enabled", True) else "paused"
+            legacy = " (from HEARTBEAT.md)" if item.get("_legacy_heartbeat") else ""
+            lines.append(
+                f"\n{item.get('id')} - {status}{legacy}\n"
+                f"Daily {item.get('time') or '?'} | {str(item.get('action') or '')[:160]}"
+            )
+        return "\n".join(lines)
+
+    def update_schedule_state(self, schedule_id: str, action: str) -> str:
+        for schedule in self.schedules(include_disabled=True):
+            if str(schedule.get("id") or "") != schedule_id:
+                continue
+            if schedule.get("_legacy_heartbeat"):
+                return "That schedule comes from HEARTBEAT.md. Move it with /schedule first, or edit HEARTBEAT.md."
+            if action in {"remove", "delete", "rm"}:
+                self.delete_schedule_file(schedule_id)
+                return f"Removed schedule {schedule_id}."
+            if action == "pause":
+                schedule["enabled"] = False
+                schedule["last_status"] = "paused"
+                self.write_schedule_file(schedule)
+                return f"Paused schedule {schedule_id}."
+            if action == "resume":
+                schedule["enabled"] = True
+                schedule["last_status"] = "scheduled"
+                self.write_schedule_file(schedule)
+                return f"Resumed schedule {schedule_id}."
+        return f"No schedule found with ID {schedule_id}."
+
+    async def trigger_schedule(self, chat_id: str, schedule_id: str) -> None:
+        for schedule in self.schedules(include_disabled=True):
+            if str(schedule.get("id") or "") != schedule_id:
+                continue
+            target = str((schedule.get("origin") or {}).get("chat_id") or chat_id)
+            key = self.schedule_run_key(schedule, datetime.now().astimezone())
+            await self.run_schedule_record(schedule, key, [target], manual_chat_id=chat_id)
+            return
+        await self.send_message(chat_id, f"No schedule found with ID {schedule_id}.")
+
+    def schedule_prestart_minutes(self, action: str) -> int:
+        lowered = action.lower()
+        long_keywords = (
+            "research",
+            "search",
+            "summarize",
+            "summary",
+            "briefing",
+            "news",
+            "check",
+            "report",
+            "analyze",
+            "investigate",
+            "find",
+        )
+        return 10 if any(keyword in lowered for keyword in long_keywords) else 5
+
+    def schedule_run_key(self, schedule: dict[str, Any], now: datetime) -> str:
+        return f"{now.strftime('%Y-%m-%d')}:{schedule.get('id')}:{schedule.get('time')}"
+
+    def schedule_due_datetime(self, schedule: dict[str, Any], now: datetime) -> datetime | None:
+        time_text = str(schedule.get("time") or "")
+        match = re.match(r"^(\d{1,2}):(\d{2})$", time_text)
+        if not match:
+            return None
+        return now.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0)
+
+    async def prepare_schedule_record(self, schedule: dict[str, Any], key: str) -> None:
+        action = str(schedule.get("action") or "").strip()
+        if not action:
+            return
+        reply = await self.generate_scheduled_message(action)
+        if _is_model_error_reply(reply):
+            schedule["last_status"] = "prepare_error"
+            schedule["last_error"] = reply
+            if not schedule.get("_legacy_heartbeat"):
+                self.write_schedule_file(schedule)
+            return
+        schedule["prepared_run_key"] = key
+        schedule["prepared_at_utc"] = datetime.now(UTC).isoformat()
+        schedule["prepared_output"] = reply
+        schedule["last_status"] = "prepared"
+        schedule["last_error"] = None
+        if not schedule.get("_legacy_heartbeat"):
+            self.write_schedule_file(schedule)
+
+    async def generate_scheduled_message(self, action: str) -> str:
+        self.reload_workspace()
+        memory = self.workspace_documents.get("MEMORY.md", "")
+        user_prefs = self.workspace_documents.get("USER.md", "")
+        prompt = (
+            "Autonomous scheduled task preparation. Compose only the user-facing message for this task. "
+            "Do not add preamble, system text, or acknowledgement. "
+            "Output only the message the user should receive at the scheduled time.\n\n"
+            f"Task: {action}\n\n"
+            f"USER.md:\n{user_prefs[:2000]}\n\n"
+            f"MEMORY.md:\n{memory[:3000]}"
+        )
+        return (
+            await self.call_model(
+                [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=min(self.telegram.max_output_tokens, 800),
+            )
+        ).strip()
+
+    async def run_schedule_record(
+        self,
+        schedule: dict[str, Any],
+        key: str,
+        targets: list[str],
+        *,
+        manual_chat_id: str | None = None,
+    ) -> None:
+        action = str(schedule.get("action") or "").strip()
+        if not action:
+            return
+        reply = str(schedule.get("prepared_output") or "").strip()
+        if schedule.get("prepared_run_key") != key or not reply:
+            reply = await self.generate_scheduled_message(action)
+        if _is_model_error_reply(reply):
+            schedule["last_status"] = "error"
+            schedule["last_error"] = reply
+            if not schedule.get("_legacy_heartbeat"):
+                self.write_schedule_file(schedule)
+            for target in targets:
+                await self.send_message(
+                    target,
+                    f"I could not complete scheduled task {schedule.get('id')} because the model/provider failed.\n\n"
+                    f"Reply /schedule run {schedule.get('id')} if you want me to try again now.",
+                )
+            return
+        if not reply or reply.upper() == "NOTHING_TO_SEND":
+            schedule["last_status"] = "silent"
+        else:
+            for target in targets:
+                await self.send_message(target, reply)
+            schedule["last_status"] = "sent"
+        schedule["last_run_key"] = key
+        schedule["last_run_at"] = datetime.now(UTC).isoformat()
+        schedule["last_error"] = None
+        if not schedule.get("_legacy_heartbeat"):
+            self.write_schedule_file(schedule)
+        if manual_chat_id:
+            await self.send_message(manual_chat_id, f"Ran schedule {schedule.get('id')}.")
 
     async def handle_poll_request(self, chat_id: str, argument: str) -> None:
         parsed = parse_poll_request(argument)
@@ -1997,6 +2273,8 @@ class TeligramBot:
                 LOGGER.info("Telegram provider response: ok chars=%s", len(content))
                 return content
             LOGGER.warning("Provider returned an empty Telegram response")
+        except (httpx.ConnectError, httpx.NetworkError) as exc:
+            LOGGER.warning("Telegram provider network unavailable: %s", exc)
         except Exception:
             LOGGER.exception("Telegram provider call failed")
         return "I hit a model/provider error. Please try again in a moment."
@@ -2546,6 +2824,11 @@ class TeligramBot:
             if self.autonomous_enabled
             else None
         )
+        heartbeat_task = (
+            asyncio.create_task(self.heartbeat_schedule_loop())
+            if self.autonomous_enabled
+            else None
+        )
         routine_task = asyncio.create_task(self.routine_loop())
         try:
             while True:
@@ -2562,6 +2845,9 @@ class TeligramBot:
                     await asyncio.sleep(self.telegram.poll_interval_seconds)
                 except (httpx.ReadTimeout, httpx.ConnectTimeout, asyncio.TimeoutError):
                     continue
+                except (httpx.ConnectError, httpx.NetworkError) as exc:
+                    LOGGER.warning("Telegram polling network unavailable: %s", exc)
+                    await asyncio.sleep(max(5.0, self.telegram.poll_interval_seconds))
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -2575,6 +2861,10 @@ class TeligramBot:
                 autonomous_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await autonomous_task
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
     async def routine_loop(self) -> None:
         while True:
@@ -2586,16 +2876,24 @@ class TeligramBot:
                 LOGGER.exception("Llama routine tick failed")
             await asyncio.sleep(60)
 
+    async def heartbeat_schedule_loop(self) -> None:
+        while True:
+            try:
+                await self.tick_timed_heartbeat_tasks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Telegram scheduled heartbeat tick failed")
+            await asyncio.sleep(60)
+
     async def tick_routines(self) -> None:
         if self._routine_loop_running:
             return
         self._routine_loop_running = True
         try:
             state = self.read_telegram_state()
-            root = state.setdefault(LLAMA_ROUTINES_STATE_KEY, {})
-            jobs = root.setdefault("jobs", [])
+            jobs = self.routines(include_disabled=True)
             now = datetime.now(UTC)
-            changed = False
             for routine in jobs:
                 if not isinstance(routine, dict) or not routine.get("enabled", True):
                     continue
@@ -2604,13 +2902,11 @@ class TeligramBot:
                     schedule = routine.get("schedule") if isinstance(routine.get("schedule"), dict) else {}
                     next_run = compute_routine_next_run(schedule, last_run_at=str(routine.get("last_run_at") or ""))
                     routine["next_run_at"] = next_run.isoformat() if next_run else None
-                    changed = True
+                    self.write_routine_file(routine)
                 if next_run is None or next_run > now:
                     continue
                 await self.run_routine(routine, state)
-                changed = True
-            if changed:
-                self.write_telegram_state(state)
+                self.write_routine_file(routine)
         finally:
             self._routine_loop_running = False
 
@@ -2747,17 +3043,78 @@ class TeligramBot:
         self.reload_workspace()
         state = self.read_telegram_state()
         heartbeat = self.workspace_documents.get("HEARTBEAT.md", "")
-        memory = self.workspace_documents.get("MEMORY.md", "")
-
-        # Schedule temporary timers for tasks due in the next 10 minutes
         await self._schedule_upcoming_tasks(heartbeat, state)
+        state.setdefault(AUTONOMOUS_STATE_KEY, {})["last_cycle_utc"] = datetime.now(UTC).isoformat()
+        self.write_telegram_state(state)
+
+        evolution_report = ""
+        if self.self_evolution_enabled:
+            evolution_report = await self.run_self_evolution_cycle(force=False)
+        await self.run_scheduled_heartbeat_cycle(evolution_report=evolution_report)
+
+    async def tick_timed_heartbeat_tasks(self) -> None:
+        state = self.read_telegram_state()
+        await self.prepare_upcoming_schedules()
+        due = self.due_timed_scheduled_tasks(state)
+        state.setdefault(AUTONOMOUS_STATE_KEY, {})["last_timed_check_utc"] = datetime.now(UTC).isoformat()
+        self.write_telegram_state(state)
+        if not due:
+            return
+        for item in due:
+            schedule = item["schedule"]
+            targets = self.schedule_targets(schedule)
+            if item.get("missed"):
+                await self.ask_to_run_missed_schedule(schedule, item["key"], targets)
+                continue
+            await self.run_schedule_record(schedule, item["key"], targets)
+            state.setdefault(AUTONOMOUS_STATE_KEY, {}).setdefault("timed_completed", {})[item["key"]] = True
+        self.write_telegram_state(state)
+
+    async def prepare_upcoming_schedules(self) -> None:
+        now = datetime.now().astimezone()
+        for schedule in self.schedules(include_disabled=False):
+            due_at = self.schedule_due_datetime(schedule, now)
+            if due_at is None:
+                continue
+            key = self.schedule_run_key(schedule, now)
+            if schedule.get("last_run_key") == key or schedule.get("prepared_run_key") == key:
+                continue
+            prestart = timedelta(minutes=self.schedule_prestart_minutes(str(schedule.get("action") or "")))
+            if due_at - prestart <= now < due_at:
+                await self.prepare_schedule_record(schedule, key)
+
+    def schedule_targets(self, schedule: dict[str, Any]) -> list[str]:
+        origin = schedule.get("origin") if isinstance(schedule.get("origin"), dict) else {}
+        chat_id = str(origin.get("chat_id") or "")
+        if chat_id:
+            return [chat_id]
+        return self.autonomous_target_chats()
+
+    async def ask_to_run_missed_schedule(self, schedule: dict[str, Any], key: str, targets: list[str]) -> None:
+        if schedule.get("missed_prompted_for_key") == key:
+            return
+        schedule["missed_prompted_for_key"] = key
+        schedule["last_status"] = "missed_waiting_for_user"
+        if not schedule.get("_legacy_heartbeat"):
+            self.write_schedule_file(schedule)
+        schedule_id = schedule.get("id")
+        message = (
+            f"I missed scheduled task {schedule_id} while I was offline or unavailable.\n\n"
+            f"Daily {schedule.get('time')} | {schedule.get('action')}\n\n"
+            f"Reply /schedule run {schedule_id} if you want me to complete it now."
+        )
+        for target in targets:
+            await self.send_message(target, message)
+
+    async def run_scheduled_heartbeat_cycle(self, *, evolution_report: str = "") -> None:
+        self.reload_workspace()
+        state = self.read_telegram_state()
+        heartbeat = self.workspace_documents.get("HEARTBEAT.md", "")
+        memory = self.workspace_documents.get("MEMORY.md", "")
 
         daily_work = self.due_scheduled_work(heartbeat, state)
         state.setdefault(AUTONOMOUS_STATE_KEY, {})["last_cycle_utc"] = datetime.now(UTC).isoformat()
         self.write_telegram_state(state)
-        evolution_report = ""
-        if self.self_evolution_enabled:
-            evolution_report = await self.run_self_evolution_cycle(force=False)
         if not daily_work:
             LOGGER.info("Telegram autonomous cycle: no scheduled work")
             return
@@ -2920,6 +3277,27 @@ class TeligramBot:
                 due.append(f"- {action}")
         return "\n".join(due).strip()
 
+    def due_timed_scheduled_tasks(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        now = datetime.now().astimezone()
+        due: list[dict[str, Any]] = []
+        autonomous = state.setdefault(AUTONOMOUS_STATE_KEY, {})
+        completed = autonomous.setdefault("timed_completed", {})
+        for schedule in self.schedules(include_disabled=False):
+            action = str(schedule.get("action") or "").strip()
+            due_at = self.schedule_due_datetime(schedule, now)
+            if not action or due_at is None or now < due_at:
+                continue
+            key = self.schedule_run_key(schedule, now)
+            if schedule.get("last_run_key") == key or completed.get(key):
+                continue
+            if key in self._dynamic_heartbeat_tasks and not self._dynamic_heartbeat_tasks[key].done():
+                continue
+            missed = (now - due_at).total_seconds() > MISSED_TASK_GRACE_SECONDS
+            if missed:
+                completed[key] = "missed_prompted"
+            due.append({"key": key, "schedule": schedule, "missed": missed})
+        return due
+
     def read_telegram_state(self) -> dict[str, Any]:
         state_path = self.config.source_path.parent / "llama.telegram.json"
         try:
@@ -3013,7 +3391,55 @@ class TeligramBot:
         if len(events) > MAX_EVOLUTION_EVENTS:
             del events[:-MAX_EVOLUTION_EVENTS]
         self.write_telegram_state(state)
+        self.update_user_profile(chat_id, categories, compact_user_signals(text))
         self.update_agents_behavior_memory(counts)
+
+    def user_profile_dir(self) -> Path:
+        path = self.runtime_dir() / "user_profile"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def user_profile_path(self) -> Path:
+        return self.user_profile_dir() / "profile.json"
+
+    def read_user_profile(self) -> dict[str, Any]:
+        path = self.user_profile_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            LOGGER.exception("Could not read user profile")
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def write_user_profile(self, profile: dict[str, Any]) -> None:
+        path = self.user_profile_path()
+        path.write_text(json.dumps(profile, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+    def update_user_profile(self, chat_id: str, categories: list[str], signals: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        profile = self.read_user_profile()
+        profile.setdefault("schema", "llama.user_profile.v1")
+        profile.setdefault("created_at_utc", now.isoformat())
+        last_seen = parse_datetime_or_none(str(profile.get("last_seen_utc") or ""))
+        active_seconds = int(profile.get("estimated_active_seconds") or 0)
+        if last_seen is not None:
+            delta = max(0, int((now - last_seen).total_seconds()))
+            if delta <= 30 * 60:
+                active_seconds += delta
+        profile["last_seen_utc"] = now.isoformat()
+        profile["last_chat_id"] = chat_id
+        profile["interaction_count"] = int(profile.get("interaction_count") or 0) + 1
+        profile["estimated_active_seconds"] = active_seconds
+        active_days = set(profile.get("active_days") or [])
+        active_days.add(now.strftime("%Y-%m-%d"))
+        profile["active_days"] = sorted(active_days)[-180:]
+        counts = profile.setdefault("category_counts", {})
+        for category in categories:
+            counts[category] = int(counts.get(category, 0)) + 1
+        profile["last_signals"] = signals
+        profile["profile_summary"] = build_user_profile_summary(profile)
+        self.write_user_profile(profile)
+        return profile
 
     def update_agents_behavior_memory(self, counts: dict[str, Any]) -> None:
         path = self.safe_workspace_doc_path("AGENTS.md")
@@ -3047,6 +3473,8 @@ class TeligramBot:
         category_counts = count_event_categories(events)
         now = datetime.now(UTC).isoformat()
         changes = []
+        profile_changes = self.curate_user_profile(category_counts)
+        changes.extend(profile_changes)
         memory_changes = self.curate_evolution_memory(category_counts)
         changes.extend(memory_changes)
         skill_changes = self.curate_agent_skills(category_counts)
@@ -3075,6 +3503,24 @@ class TeligramBot:
         if not changes:
             return "Self-evolution checked memory and skills; no durable changes were needed."
         return "Self-evolution updated:\n" + "\n".join(f"- {change}" for change in changes[:12])
+
+    def curate_user_profile(self, category_counts: dict[str, int]) -> list[str]:
+        profile = self.read_user_profile()
+        if not profile:
+            return []
+        profile["self_evolution"] = {
+            "last_curated_utc": datetime.now(UTC).isoformat(),
+            "signal_threshold": self.self_evolution_min_events,
+            "dominant_categories": [
+                category
+                for category, count in sorted(category_counts.items(), key=lambda item: item[1], reverse=True)
+                if count >= self.self_evolution_min_events
+            ][:8],
+            "time_depth": profile_time_depth(profile),
+        }
+        profile["profile_summary"] = build_user_profile_summary(profile)
+        self.write_user_profile(profile)
+        return [f"curated separate user profile {self.user_profile_path().name}"]
 
     def curate_evolution_memory(self, category_counts: dict[str, int]) -> list[str]:
         changes = []
@@ -3989,6 +4435,19 @@ def parse_heartbeat_tasks(heartbeat: str) -> list[dict[str, Any]]:
                 }
             )
             continue
+        normalized = stripped.replace("—", "--").replace("–", "--").replace("â€”", "--")
+        match = re.match(
+            r"(?i)^(?:daily\s+)?(?:at\s+)?(\d{1,2}):(\d{2})\s*(?:\||-|--)\s*(.+)$",
+            normalized,
+        )
+        if match:
+            tasks.append(
+                {
+                    "time": (int(match.group(1)), int(match.group(2))),
+                    "action": match.group(3).strip(),
+                }
+            )
+            continue
         if stripped:
             tasks.append({"time": None, "action": stripped})
     return tasks
@@ -4029,6 +4488,37 @@ def behavior_memory_bullets(counts: dict[str, Any]) -> list[str]:
         elif key == "autonomy_memory":
             bullets.append("User wants autonomous follow-through; maintain a steady, attentive stance using HEARTBEAT.md and MEMORY.md.")
     return bullets
+
+
+def profile_time_depth(profile: dict[str, Any]) -> str:
+    seconds = int(profile.get("estimated_active_seconds") or 0)
+    interactions = int(profile.get("interaction_count") or 0)
+    days = len(profile.get("active_days") or [])
+    if seconds >= 12 * 3600 or interactions >= 200 or days >= 30:
+        return "deep"
+    if seconds >= 3 * 3600 or interactions >= 50 or days >= 7:
+        return "medium"
+    return "early"
+
+
+def build_user_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    counts = profile.get("category_counts") if isinstance(profile.get("category_counts"), dict) else {}
+    dominant = [
+        key
+        for key, _value in sorted(
+            ((str(key), int(value)) for key, value in counts.items()),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:5]
+    ]
+    return {
+        "time_depth": profile_time_depth(profile),
+        "dominant_patterns": dominant,
+        "interaction_count": int(profile.get("interaction_count") or 0),
+        "active_days": len(profile.get("active_days") or []),
+        "estimated_active_minutes": int(int(profile.get("estimated_active_seconds") or 0) / 60),
+        "guidance": behavior_memory_bullets(counts),
+    }
 
 
 def replace_or_append_section(content: str, title: str, replacement: str) -> str:
