@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,9 +21,11 @@ class ResolvedModel:
 
 class OpenAICompatibleProvider:
     _TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+    _DEFAULT_MAX_PARALLEL_MODEL_REQUESTS = 2
 
     def __init__(self, config: ProviderConfig):
         self.config = config
+        self._request_semaphore = asyncio.Semaphore(self._configured_parallel_limit())
         self._client = httpx.AsyncClient(
             timeout=config.timeout,
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
@@ -44,6 +48,23 @@ class OpenAICompatibleProvider:
             request.pop("tool_choice", None)
         return request
 
+    def _configured_parallel_limit(self) -> int:
+        raw = os.environ.get("LLAMA_MAX_PARALLEL_MODEL_REQUESTS")
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+        return self._DEFAULT_MAX_PARALLEL_MODEL_REQUESTS
+
+    @asynccontextmanager
+    async def _provider_request_slot(self):
+        await self._request_semaphore.acquire()
+        try:
+            yield
+        finally:
+            self._request_semaphore.release()
+
     def _chat_completions_url(self) -> str:
         return f"{self.config.base_url}/chat/completions"
 
@@ -61,52 +82,54 @@ class OpenAICompatibleProvider:
 
     async def _post(self, url: str, payload: dict[str, Any]) -> httpx.Response:
         last_exc: Exception | None = None
-        for attempt in range(3):
-            try:
-                response = await self._client.post(
-                    url,
-                    headers=self._headers(),
-                    json=payload,
-                )
-                response.raise_for_status()
-                return response
-            except httpx.HTTPStatusError as exc:
-                last_exc = exc
-                if not self._should_retry_status(exc) or attempt == 2:
-                    raise
-            except httpx.RequestError as exc:
-                last_exc = exc
-                if attempt == 2:
-                    raise
-            await asyncio.sleep(self._retry_delay(attempt))
+        async with self._provider_request_slot():
+            for attempt in range(3):
+                try:
+                    response = await self._client.post(
+                        url,
+                        headers=self._headers(),
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    return response
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    if not self._should_retry_status(exc) or attempt == 2:
+                        raise
+                except httpx.RequestError as exc:
+                    last_exc = exc
+                    if attempt == 2:
+                        raise
+                await asyncio.sleep(self._retry_delay(attempt))
         assert last_exc is not None
         raise last_exc
 
     async def _stream(self, url: str, payload: dict[str, Any]) -> AsyncIterator[str]:
         last_exc: Exception | None = None
-        for attempt in range(3):
-            yielded = False
-            try:
-                async with self._client.stream(
-                    "POST",
-                    url,
-                    headers=self._headers(),
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        yielded = True
-                        yield line
-                    return
-            except httpx.HTTPStatusError as exc:
-                last_exc = exc
-                if not self._should_retry_status(exc) or attempt == 2:
-                    raise
-            except httpx.RequestError as exc:
-                last_exc = exc
-                if yielded or attempt == 2:
-                    raise
-            await asyncio.sleep(self._retry_delay(attempt))
+        async with self._provider_request_slot():
+            for attempt in range(3):
+                yielded = False
+                try:
+                    async with self._client.stream(
+                        "POST",
+                        url,
+                        headers=self._headers(),
+                        json=payload,
+                    ) as response:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            yielded = True
+                            yield line
+                        return
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    if not self._should_retry_status(exc) or attempt == 2:
+                        raise
+                except httpx.RequestError as exc:
+                    last_exc = exc
+                    if yielded or attempt == 2:
+                        raise
+                await asyncio.sleep(self._retry_delay(attempt))
         assert last_exc is not None
         raise last_exc
 

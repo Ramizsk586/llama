@@ -1330,7 +1330,10 @@ class TeligramBot:
             await self.send_message(chat_id, "Unknown command. Send /help to see available commands.")
             return True
 
-        if command in {"start", "help"}:
+        if command == "start":
+            await self.send_message(chat_id, self.start_greeting_text())
+            return True
+        if command == "help":
             await self.send_message(chat_id, self.help_text(chat_id, username))
             return True
         if command == "status":

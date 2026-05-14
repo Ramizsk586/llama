@@ -52,6 +52,6 @@ When routine usage repeats, self-evolution may:
 
 ## Last Evolution Run
 
-- Time: 2026-05-14T11:02:12.010650+00:00
-- Signals: autonomy_memory=1, direct_short_requests=16, visual_work=3
-- Changes: curated separate user profile profile.json, created/updated skill direct-short-requests, created/updated skill visual-work, updated skill usage sidecar, wrote evolution report 20260514T110212Z.md
+- Time: 2026-05-14T15:00:33.599674+00:00
+- Signals: autonomy_memory=1, direct_short_requests=21, visual_work=3
+- Changes: curated separate user profile profile.json, created/updated skill direct-short-requests, updated skill usage sidecar, wrote evolution report 20260514T150033Z.md

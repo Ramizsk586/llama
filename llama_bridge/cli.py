@@ -221,6 +221,7 @@ ENDPOINT_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
             ("GET", "/api/tags", "list available bridge models"),
             ("GET", "/api/ps", "list running models"),
             ("POST", "/api/show", "show model metadata"),
+            ("POST", "/v1/api/chat/api/show", "show model metadata for nested Ollama probes"),
             ("POST", "/api/create", "compatibility shim"),
             ("POST", "/api/pull", "compatibility shim"),
             ("POST", "/api/push", "compatibility shim"),
@@ -1905,11 +1906,13 @@ def _cmd_start(
     if _is_running(pid_path):
         if verbose:
             _print_state("run", f"llama server is already running with pid {pid_path.read_text().strip()}", "32")
+            _print_note(f"MCP server URL: {_server_url(cfg.server.host, cfg.server.port).rstrip('/')}/mcp")
         _write_active_server_state(config_path, pid_path, log_path)
         return
     if already_running and running_url is not None:
         if verbose:
             _print_state("run", f"llama server is already running at {running_url}", "32")
+            _print_note(f"MCP server URL: {running_url.rstrip('/')}/mcp")
         _write_active_server_state(config_path, pid_path, log_path)
         return
 
@@ -1937,6 +1940,7 @@ def _cmd_start(
         if verbose:
             _print_state("ok", f"llama started in background on pid {process_id}", "32")
             _kv_rows([("log", str(log_path)), ("logs", "llama logs")])
+            _print_note(f"MCP server URL: {_server_url(cfg.server.host, cfg.server.port).rstrip('/')}/mcp")
             if idle_timeout_seconds == 0:
                 _print_note("Server will stay up until you run `llama stop`.")
             else:
@@ -1970,6 +1974,7 @@ def _cmd_start(
     if verbose:
         _print_state("ok", f"llama started in background on pid {process.pid}", "32")
         _kv_rows([("log", str(log_path)), ("logs", "llama logs")])
+        _print_note(f"MCP server URL: {_server_url(cfg.server.host, cfg.server.port).rstrip('/')}/mcp")
         if idle_timeout_seconds == 0:
             _print_note("Server will stay up until you run `llama stop`.")
         else:
@@ -1988,6 +1993,7 @@ def _cmd_ngrok_start(config_path: Path) -> None:
         public_url = _wait_for_ngrok_url(timeout_seconds=2.0)
         if public_url:
             _print_state("online", f"public URL: {public_url}", "32")
+            _print_note(f"MCP server URL: {public_url.rstrip('/')}/mcp")
         else:
             _print_state("online", f"ngrok is already running with pid {existing_pid}", "32")
         return
@@ -2047,6 +2053,7 @@ def _cmd_ngrok_start(config_path: Path) -> None:
     if public_url:
         _print_state("online", f"public URL: {public_url}", "32")
         _print_note(f"OpenAI-compatible base URL: {public_url.rstrip('/')}/v1")
+        _print_note(f"MCP server URL: {public_url.rstrip('/')}/mcp")
         _print_note("Use server.auth_token as the API key.")
     elif process.poll() is not None:
         pid_path.unlink(missing_ok=True)
@@ -2595,8 +2602,11 @@ def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
 
     if config is not None:
         rows.append(("url (tools)", f"{main_url} ({main_http})" if main_http else main_url))
+        rows.append(("mcp", f"{main_url.rstrip('/')}/mcp"))
         if ngrok_running:
             rows.append(("url (online)", ngrok_url or "ngrok running, URL not available yet"))
+            if ngrok_url:
+                rows.append(("mcp (online)", f"{ngrok_url.rstrip('/')}/mcp"))
             rows.append(("ngrok pid", ngrok_pid or "unknown"))
         if config.server.openwebui_port is not None:
             owui_url = _server_url(config.server.host, config.server.openwebui_port)

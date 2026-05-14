@@ -992,8 +992,9 @@ def create_app(
         _check_ollama_auth(config, x_api_key, authorization)
         return {"models": []}
 
-    @app.post("/v1/api/show")
     @app.post("/api/show")
+    @app.post("/v1/api/show")
+    @app.post("/v1/api/chat/api/show")
     async def ollama_show(
         request: Request,
         x_api_key: str | None = Header(default=None),
@@ -1242,6 +1243,49 @@ def create_app(
         return await _ollama_web_request(app, config, "web_fetch", body)
 
     if include_tools:
+
+        @app.get("/mcp")
+        async def mcp_info(
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            return {
+                "name": "llama-bridge-tools",
+                "protocol": "mcp",
+                "transport": "streamable-http",
+                "endpoint": "/mcp",
+            }
+
+        @app.post("/mcp")
+        async def mcp_rpc(
+            request: Request,
+            x_api_key: str | None = Header(default=None),
+            authorization: str | None = Header(default=None),
+        ):
+            _check_tools_auth(config, x_api_key, authorization)
+            if not config.tools.expose_http:
+                raise HTTPException(status_code=404, detail="Tool endpoints are disabled")
+            body = await request.json()
+            if isinstance(body, list):
+                responses = [
+                    response
+                    for message in body
+                    if isinstance(message, dict)
+                    for response in [await _handle_mcp_message(app, message)]
+                    if response is not None
+                ]
+                if not responses:
+                    return Response(status_code=202)
+                return JSONResponse(responses)
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="MCP request body must be a JSON-RPC object")
+            response = await _handle_mcp_message(app, body)
+            if response is None:
+                return Response(status_code=202)
+            return JSONResponse(response)
 
         @app.get("/v1/tools")
         @app.get("/api/tools")
@@ -1951,6 +1995,98 @@ def _with_tool_instructions(
     else:
         messages.insert(0, {"role": "system", "content": instructions})
     return {**payload, "messages": messages}
+
+
+async def _handle_mcp_message(app: FastAPI, message: dict[str, Any]) -> dict[str, Any] | None:
+    method = message.get("method")
+    message_id = message.get("id")
+    try:
+        if method == "initialize":
+            params = message.get("params") or {}
+            protocol_version = (
+                params.get("protocolVersion")
+                if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str)
+                else "2025-06-18"
+            )
+            return _mcp_result(
+                message_id,
+                {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "llama-bridge-tools", "version": "0.1.0"},
+                },
+            )
+        if method == "tools/list":
+            return _mcp_result(message_id, {"tools": _mcp_tool_schemas(app)})
+        if method == "tools/call":
+            params = message.get("params") or {}
+            if not isinstance(params, dict):
+                raise ValueError("tools/call params must be an object")
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            if not isinstance(name, str) or not name:
+                raise ValueError("tools/call requires a tool name")
+            if not isinstance(arguments, dict):
+                raise ValueError("tools/call arguments must be an object")
+            return _mcp_result(message_id, await _mcp_call_tool(app, name, arguments))
+        if method and method.startswith("notifications/"):
+            return None
+        if message_id is None:
+            return None
+        return _mcp_error(message_id, -32601, f"Unsupported MCP method: {method}")
+    except Exception as exc:  # noqa: BLE001 - MCP clients need structured JSON-RPC errors.
+        if message_id is None:
+            return None
+        return _mcp_error(message_id, -32000, str(exc))
+
+
+def _mcp_tool_schemas(app: FastAPI) -> list[dict[str, Any]]:
+    registry = getattr(app.state, "tools", None)
+    if registry is None:
+        return []
+    tools = []
+    for tool in registry.openai_tools():
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {"type": "object"}
+        tools.append(
+            {
+                "name": name,
+                "description": str(function.get("description") or ""),
+                "inputSchema": parameters,
+            }
+        )
+    return tools
+
+
+async def _mcp_call_tool(app: FastAPI, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    registry = getattr(app.state, "tools", None)
+    if registry is None:
+        raise ValueError("Bridge tools are not enabled")
+    structured = await registry.call_structured(name, arguments)
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(structured, indent=2, ensure_ascii=False, default=str),
+            }
+        ],
+        "isError": bool(structured.get("ok") is False),
+    }
+
+
+def _mcp_result(message_id: Any, result: dict[str, Any]) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": message_id, "result": result}
+
+
+def _mcp_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": message}}
 
 
 def _bridge_tools_response(registry: ToolRegistry) -> dict[str, Any]:

@@ -1,11 +1,11 @@
 ---
 name: direct-short-requests
-description: Agent-created procedural memory for direct request handling patterns observed 16 times.
+description: Agent-created procedural memory for direct request handling patterns observed 21 times.
 version: 1.0.0
 metadata:
   llama:
     category: agent-created
-    signals: 16
+    signals: 21
 ---
 
 # Direct Request Handling

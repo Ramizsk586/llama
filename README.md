@@ -198,8 +198,15 @@ ngrok:
   region: null
 ```
 
-The command prints both the public root URL and the `/v1` base URL. Public
-clients should use `server.auth_token` as the API key.
+The command prints the public root URL, the `/v1` base URL, and the MCP server
+URL. Public clients should use `server.auth_token` as the API key. To connect an
+external MCP client, add the local URL `http://127.0.0.1:8089/mcp` or the online
+ngrok URL ending in `/mcp`.
+
+Model requests are queued per provider with a default maximum of 2 parallel
+upstream calls, so two clients can use one provider at once while extra
+overlapping calls wait their turn. Set `LLAMA_MAX_PARALLEL_MODEL_REQUESTS`
+before starting the server to override that limit.
 
 `llama cli --list` shows which llama-managed CLI tools are currently usable and
 where they are installed. `llama cli --support` shows all CLI tools supported by
@@ -463,6 +470,47 @@ stdio MCP adapter when launched by `llama claude`, `llama codex`, or
 `llama copilot`. The adapter lists the enabled bridge tools from `/api/tools`
 and calls `/api/tools/{name}` with the configured local bridge API key.
 
+## Onyx Web UI
+
+Onyx is an alternative web UI for LLMs. You can use it with the llama bridge by setting up Ollama with ngrok for external access:
+
+1. Start the llama bridge:
+   ```powershell
+   llama serve
+   ```
+
+2. For external access, start ngrok (configure your auth token in `env.yml`):
+   ```powershell
+   llama start --online --forever 
+   ```
+
+3. Download and run Onyx v3.3.5:
+
+  ``` Install the .exe app and just configure it with the ngrok link ```
+
+4. Configure Onyx to use the llama bridge:
+   - Set the API URL to your ngrok URL or `http://127.0.0.1:8089/v1`
+   - Use the `server.auth_token` from `env.yml` as your API key
+
+## The Onyx will catch the models that are configure in vs_code models 
+
+```
+vs_copilot:
+  models:
+    - name: gemma4:31b
+      provider: ollama_cloud
+      model: gemma4:31b
+      context_size: 65536
+    - name: minimax
+      provider: opencode
+      model: minimax-m2.5-free
+      context_size: 65536
+    - name: openrouter
+      provider: openrouter
+      model: openrouter/free
+      context_size: 65536
+```
+
 ## GitHub Copilot
 
 The bridge can also stand in for an Ollama or LM Studio server for tools that
@@ -532,6 +580,7 @@ POST   /api/embeddings
 GET    /api/tags
 GET    /api/ps
 POST   /api/show
+POST   /v1/api/chat/api/show
 POST   /api/create
 POST   /api/pull
 POST   /api/push
