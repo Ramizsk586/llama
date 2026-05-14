@@ -31,3 +31,4 @@ uv.lock
 .runtime
 llama.ngrok.log
 llama.ngrok.pid
+generated

@@ -354,6 +354,10 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         self._unavailable_tools.pop(tool.name, None)
 
+    def register_runtime_tool(self, tool: ToolDefinition) -> None:
+        self._tools[tool.name] = tool
+        self._unavailable_tools.pop(tool.name, None)
+
     def _register_default_tools(self) -> None:
         self._register(
             ToolDefinition(
@@ -813,6 +817,40 @@ class ToolRegistry:
                     },
                 },
                 handler=self._image_download,
+            )
+        )
+        self._register(
+            ToolDefinition(
+                name="ddg_image_download",
+                description=(
+                    "Search DuckDuckGo Images and download the first sendable public image to a local file.\n"
+                    "USE WHEN: The user asks to send, show, get, find, search, or download an image/photo/picture and a local file is needed for upload or attachment.\n"
+                    "GUARDRAILS: Only downloads public http/https image results from DuckDuckGo candidates. Return the local_path instead of asking the user to open a remote URL.\n"
+                    "RESULT FORMAT: local_path, absolute_path, media_type, bytes, title, image_url, source_url, provider, and attempted candidate URLs."
+                ),
+                parameters={
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "DuckDuckGo image search query for the image/photo/picture the user wants.",
+                        },
+                        "max_candidates": {
+                            "type": "integer",
+                            "description": "Maximum DuckDuckGo candidates to try downloading (1-6).",
+                            "default": 4,
+                            "minimum": 1,
+                            "maximum": 6,
+                        },
+                        "output_dir": {
+                            "type": "string",
+                            "description": "Repo-relative output directory. Defaults to generated/telegram_images.",
+                            "default": "generated/telegram_images",
+                        },
+                    },
+                },
+                handler=self._ddg_image_download,
             )
         )
         self._register(
@@ -1554,6 +1592,45 @@ class ToolRegistry:
             "bytes": len(content),
         }
 
+    async def _ddg_image_download(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        query = _required_string(arguments, "query")
+        max_candidates = _bounded_int(arguments.get("max_candidates"), default=4, minimum=1, maximum=6)
+        output_dir = str(arguments.get("output_dir") or "generated/telegram_images").strip()
+        result = await self._research_duckduckgo_images(query, max_candidates)
+        images = [image for image in result.get("images", []) if isinstance(image, dict)]
+        attempted: list[str] = []
+        errors: list[dict[str, str]] = []
+        for image in images:
+            title = str(image.get("title") or query).strip()
+            source_url = str(image.get("source_url") or "").strip()
+            if source_url and urlparse(source_url).scheme not in {"http", "https"}:
+                source_url = ""
+            for image_url in _image_candidate_urls(image):
+                attempted.append(image_url)
+                try:
+                    downloaded = await self._image_download(
+                        {
+                            "image_url": image_url,
+                            "title": title,
+                            "source_url": source_url,
+                            "output_dir": output_dir,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"image_url": image_url, "error": str(exc)})
+                    continue
+                return {
+                    **downloaded,
+                    "query": query,
+                    "provider": "duckduckgo",
+                    "candidate": image,
+                    "attempted_urls": attempted,
+                    "errors": errors,
+                }
+        raise ValueError(
+            f"DuckDuckGo returned {len(images)} image candidates, but none could be downloaded as a sendable image."
+        )
+
     async def _verify_sources(self, arguments: dict[str, Any]) -> dict[str, Any]:
         urls = arguments.get("urls")
         if not isinstance(urls, list) or not urls:
@@ -1998,13 +2075,16 @@ def validate_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, A
         raise ToolValidationError("Tool arguments must be a JSON object.")
     cleaned = _strip_string_values(arguments)
 
-    if name in {"wikipedia_search", "serpapi_search", "tavily_search", "source_research", "image_research"}:
+    if name in {"wikipedia_search", "serpapi_search", "tavily_search", "source_research", "image_research", "ddg_image_download"}:
         _ensure_non_empty_string(cleaned, "query")
     if name == "image_download":
         _ensure_non_empty_string(cleaned, "image_url")
         cleaned["image_url"] = _validate_public_http_url(_clean_url(str(cleaned["image_url"])))
         if cleaned.get("source_url"):
             cleaned["source_url"] = _validate_public_http_url(_clean_url(str(cleaned["source_url"])))
+        if cleaned.get("output_dir") is not None and not isinstance(cleaned["output_dir"], str):
+            cleaned["output_dir"] = str(cleaned["output_dir"])
+    if name == "ddg_image_download":
         if cleaned.get("output_dir") is not None and not isinstance(cleaned["output_dir"], str):
             cleaned["output_dir"] = str(cleaned["output_dir"])
     if name == "manim_render":
@@ -2018,6 +2098,9 @@ def validate_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, A
                 minimum=30,
                 maximum=600,
             )
+    if name == "telegram_create_job":
+        _ensure_non_empty_string(cleaned, "schedule")
+        _ensure_non_empty_string(cleaned, "task")
     if name == "wikipedia_page":
         _ensure_non_empty_string(cleaned, "title")
     if name == "weather_current":
@@ -2220,6 +2303,15 @@ def _image_candidate(provider: str, item: Any, *, title: str | None = None) -> d
         "source_name": item.get("source_name") or item.get("source"),
         "local_path": item.get("local_path"),
     }
+
+
+def _image_candidate_urls(image: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for key in ("image_url", "thumbnail"):
+        url = str(image.get(key) or "").strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def _dedupe_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2510,12 +2602,14 @@ def _validate_tool_output(name: str, result: Any) -> dict[str, Any]:
             raise ValueError(f"{name} returned no verdict")
     elif name == "image_research":
         _require_list_output(name, result, "images")
-    elif name == "image_download":
+    elif name in {"image_download", "ddg_image_download"}:
         _require_output_keys(name, result, {"local_path", "absolute_path", "bytes"})
     elif name == "master_review":
         _require_output_keys(name, result, {"ok", "tool", "data", "metadata"})
     elif name == "manim_render":
         _require_output_keys(name, result, {"scene_path", "rendered", "video_path"})
+    elif name == "telegram_create_job":
+        _require_output_keys(name, result, {"id", "path", "message"})
 
     return result
 
@@ -2633,12 +2727,16 @@ def _tool_source(name: str) -> str:
         return "serpapi+tavily-images"
     if name == "image_download":
         return "http-image-download"
+    if name == "ddg_image_download":
+        return "duckduckgo-image-download"
     if name == "verify_sources":
         return "parallel-source-verifiers"
     if name == "master_review":
         return "master-review"
     if name == "manim_render":
         return "manim"
+    if name == "telegram_create_job":
+        return "telegram-runtime-jobs"
     if name == "datetime_now":
         return "system-clock"
     return "llama-bridge"
@@ -2686,6 +2784,14 @@ TOOL_KEYWORDS = {
         "keywords": ["download image", "send image", "attach image", "upload photo", "local image"],
         "weight": 3.2,
     },
+    "ddg_image_download": {
+        "keywords": [
+            "image", "images", "photo", "picture", "pic",
+            "send image", "show image", "get image", "find image",
+            "search image", "download image", "send photo", "show photo",
+        ],
+        "weight": 4.2,
+    },
     "verify_sources": {
         "keywords": ["verify", "check source", "validate", "link", "links", "url", "citation", "fact check"],
         "weight": 3.0,
@@ -2702,6 +2808,14 @@ TOOL_KEYWORDS = {
     "manim_render": {
         "keywords": ["manim", "animation", "animated video", "video", "math animation", "visualize", "diagram"],
         "weight": 4.0,
+    },
+    "telegram_create_job": {
+        "keywords": [
+            "job", "jobs", "routine", "routines", "reminder",
+            "schedule", "scheduled", "later", "tomorrow", "every", "daily",
+            "report at", "briefing at",
+        ],
+        "weight": 4.5,
     },
 }
 
@@ -2746,6 +2860,20 @@ def classify_query_intent(query: str) -> dict[str, float]:
         "animation": _phrase_score(
             text,
             ("manim", "/manim", "animation", "animated video", "math animation", "make a video", "generate video", "visualize"),
+        ),
+        "schedule_job": _phrase_score(
+            text,
+            (
+                "create job",
+                "add job",
+                "make job",
+                "set job",
+                "remind me",
+                "notify me",
+                "schedule",
+                "later",
+                "tomorrow",
+            ),
         ),
         "no_tool": no_tool,
     }
@@ -2802,14 +2930,16 @@ def score_tool_for_query(
         "verify_sources": {"verify": 6.0},
         "master_review": {"review": 7.0, "verify": 2.5},
         "image_research": {"image": 7.0},
+        "ddg_image_download": {"image": 8.5},
         "manim_render": {"animation": 8.0, "image": 1.0},
+        "telegram_create_job": {"schedule_job": 8.5},
     }
     for intent, weight in intent_weights.get(tool_name, {}).items():
         score += intents.get(intent, 0.0) * weight
     
     # Exact phrase matches get highest score
     for keyword in keywords:
-        if keyword in query_lower:
+        if _keyword_matches_query(keyword, query_lower):
             score += weight * 1.5
     
     # Individual word matches
@@ -2840,6 +2970,15 @@ def score_tool_for_query(
     return max(0.0, min(score, 10.0))
 
 
+def _keyword_matches_query(keyword: str, query_lower: str) -> bool:
+    keyword = keyword.strip().lower()
+    if not keyword:
+        return False
+    if " " in keyword:
+        return keyword in query_lower
+    return re.search(rf"\b{re.escape(keyword)}\b", query_lower) is not None
+
+
 def _phrase_score(text: str, phrases: tuple[str, ...]) -> float:
     score = 0.0
     for phrase in phrases:
@@ -2868,6 +3007,8 @@ def _forced_tool_bonus(tool_name: str, query_lower: str) -> float:
         for phrase in ("manim", "/manim", "animation", "animated video", "make a video", "generate video")
     ):
         return 5.0
+    if tool_name == "telegram_create_job" and _looks_like_job_request(query_lower):
+        return 5.0
     if tool_name == "weather_current" and any(
         word in query_lower for word in ("weather", "temperature", "rain", "wind", "humid")
     ):
@@ -2886,7 +3027,7 @@ def _forced_tool_bonus(tool_name: str, query_lower: str) -> float:
         for word in ("verify", "source", "sources", "citation", "accurate", "research", "deep research", "current", "latest")
     ):
         return 4.0
-    if tool_name == "image_research" and any(
+    if tool_name in {"image_research", "ddg_image_download"} and any(
         word in query_lower for word in ("image", "images", "photo", "picture", "visual", "markdown")
     ):
         return 4.0
@@ -2917,6 +3058,33 @@ def _forced_tool_bonus(tool_name: str, query_lower: str) -> float:
     ):
         return 3.0
     return 0.0
+
+
+def _looks_like_job_request(query_lower: str) -> bool:
+    if any(
+        phrase in query_lower
+        for phrase in (
+            "create job",
+            "add job",
+            "make job",
+            "set job",
+            "create a job",
+            "add a job",
+            "make a job",
+            "set a job",
+            "remind me",
+            "notify me",
+            "schedule",
+            "scheduled",
+            "tomorrow",
+            "later",
+        )
+    ):
+        return True
+    return bool(
+        re.search(r"\bat\s+(?:(?:sharp|sherp)\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", query_lower)
+        or re.search(r"\bevery\s+(?:\d+\s*(?:m|min|minute|h|hour|day)s?|morning|evening|night|day|week|month)\b", query_lower)
+    )
 
 
 def select_relevant_tools(
@@ -2993,6 +3161,8 @@ def _tool_sort_key(tool: dict[str, Any], scores: dict[str, float], default_searc
         f"{default_search_provider}_search": 70,
         "tavily_search": 65,
         "serpapi_search": 60,
+        "ddg_image_download": 61,
+        "telegram_create_job": 62,
         "image_download": 59,
         "image_research": 58,
         "wikipedia_search": 55,
@@ -3014,6 +3184,8 @@ def _forced_tool_names(query: str, default_search_provider: str = "tavily") -> s
     )
     if any(phrase in query_lower for phrase in creative_or_code):
         return set()
+    if _looks_like_job_request(query_lower):
+        return {"telegram_create_job"}
     if any(word in query_lower for word in ("weather", "temperature", "rain", "wind", "humid")):
         return {"weather_current"}
     if any(word in query_lower for word in ("latest", "news", "current", "recent", "price", "web")):
@@ -3038,7 +3210,7 @@ def _forced_tool_names(query: str, default_search_provider: str = "tavily") -> s
     ):
         return {"datetime_now"}
     if any(word in query_lower for word in ("image", "images", "photo", "picture", "visual")):
-        return {"image_research", "image_download"}
+        return {"ddg_image_download", "image_research", "image_download"}
     if any(
         phrase in query_lower
         for phrase in (

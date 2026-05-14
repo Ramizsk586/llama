@@ -24,16 +24,16 @@ import httpx
 try:
     from .config import BridgeConfig, TelegramBotConfig, load_config
     from .providers import OpenAICompatibleProvider, build_provider
-    from .tools import ToolRegistry, classify_query_intent, select_relevant_tools
+    from .tools import ToolDefinition, ToolRegistry, classify_query_intent, select_relevant_tools
 except ImportError:
     try:
         from llama_bridge.config import BridgeConfig, TelegramBotConfig, load_config
         from llama_bridge.providers import OpenAICompatibleProvider, build_provider
-        from llama_bridge.tools import ToolRegistry, classify_query_intent, select_relevant_tools
+        from llama_bridge.tools import ToolDefinition, ToolRegistry, classify_query_intent, select_relevant_tools
     except ImportError:
         from config import BridgeConfig, TelegramBotConfig, load_config
         from providers import OpenAICompatibleProvider, build_provider
-        from tools import ToolRegistry, classify_query_intent, select_relevant_tools
+        from tools import ToolDefinition, ToolRegistry, classify_query_intent, select_relevant_tools
 
 
 LOGGER = logging.getLogger("uvicorn.error.teligram")
@@ -71,6 +71,7 @@ LOG_MESSAGE_REPLACEMENTS = (
 HARDCODED_HEARTBEAT_INTERVAL_SECONDS = 1800  # 30 minutes — do not expose to user config
 
 
+JOB_CHECK_INTERVAL_SECONDS = 60
 TELEGRAM_MAX_PARALLEL_UPDATES = 8
 _CURRENT_SEND_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "telegram_send_context",
@@ -517,8 +518,8 @@ COMMANDS = [
     ("editdoc", "Edit bot docs (permissions apply)"),
     ("image", "Find and send an image"),
     ("file", "Create and send a file"),
-    ("schedule", "Add a daily autonomous task"),
-    ("jobs", "Manage Llama routines"),
+    ("schedule", "Create a daily job"),
+    ("jobs", "Manage Llama jobs"),
     ("evolve", "Run or inspect self-evolution"),
     ("poll", "Create a Telegram poll"),
     ("web", "Web/search mode"),
@@ -786,6 +787,8 @@ class TeligramBot:
         self._owns_provider = provider is None
         self.tools: ToolRegistry | None = tools or ToolRegistry(config)
         self._owns_tools = tools is None
+        if self.tools is not None:
+            self.register_telegram_tools()
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(35.0, connect=10.0),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
@@ -816,7 +819,6 @@ class TeligramBot:
             self.allow_all_chats = runtime_access.get("allow_all_chats", self.allow_all_chats)
         self.autonomous_enabled = bool(getattr(self.telegram, "autonomous_enabled", True))
         self.autonomous_interval_seconds = HARDCODED_HEARTBEAT_INTERVAL_SECONDS
-        self._dynamic_heartbeat_tasks: dict[str, asyncio.Task] = {}
         self._routine_loop_running = False
         self.self_evolution_enabled = bool(getattr(self.telegram, "self_evolution_enabled", True))
         self.self_evolution_min_events = max(1, int(getattr(self.telegram, "self_evolution_min_events", 3)))
@@ -868,12 +870,6 @@ class TeligramBot:
             conversation.system_prompt = self.system_prompt
 
     async def aclose(self) -> None:
-        for task in self._dynamic_heartbeat_tasks.values():
-            if not task.done():
-                task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(*self._dynamic_heartbeat_tasks.values(), return_exceptions=True)
-        self._dynamic_heartbeat_tasks.clear()
         await self.http.aclose()
         if self._owns_provider:
             await self.provider.aclose()
@@ -1155,16 +1151,72 @@ class TeligramBot:
             await asyncio.sleep(4.0)
 
     async def set_my_commands(self) -> None:
-        enabled_commands = []
-        for command, description in COMMANDS:
-            policy = self.telegram.command_policy.get(command)
-            if policy is None or (policy.enabled and policy.visible):
-                enabled_commands.append({"command": command, "description": description})
         response = await self.http.post(
             f"{self.api_base}/setMyCommands",
-            json={"commands": enabled_commands},
+            json={"commands": []},
         )
         response.raise_for_status()
+
+    def register_telegram_tools(self) -> None:
+        if not self.tools:
+            return
+        self.tools.register_runtime_tool(
+            ToolDefinition(
+                name="telegram_create_job",
+                description=(
+                    "Create a Telegram Llama job JSON file in .runtime/jobs for scheduled autonomous work.\n"
+                    "USE WHEN: The Telegram user asks to do something later, at a time, every day, on a schedule, "
+                    "as a reminder, report, briefing, or recurring job.\n"
+                    "DO NOT USE: For immediate answers. Use only when a job should outlive this chat turn.\n"
+                    "RESULT FORMAT: Created job id, JSON file path, schedule display, next run time, and confirmation message."
+                ),
+                parameters={
+                    "type": "object",
+                    "required": ["schedule", "task"],
+                    "properties": {
+                        "schedule": {
+                            "type": "string",
+                            "description": (
+                                "When to run the job. Use HH:MM for a one-time local time, an ISO timestamp, "
+                                "a duration like 30m or 2h, every 30m, or cron like 0 9 * * *."
+                            ),
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "The work to perform and send to the Telegram user when the job runs.",
+                        },
+                    },
+                },
+                handler=self._telegram_create_job_tool,
+            )
+        )
+
+    async def _telegram_create_job_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        context = _CURRENT_SEND_CONTEXT.get() or {}
+        chat_id = str(context.get("chat_id") or "").strip()
+        if not chat_id:
+            raise ValueError("telegram_create_job requires an active Telegram chat context.")
+        schedule = str(arguments.get("schedule") or "").strip()
+        task = str(arguments.get("task") or "").strip()
+        message = self.create_routine_from_text(f"{schedule} | {task}", chat_id)
+        match = re.search(r"(?m)^ID:\s*([A-Za-z0-9_-]+)\s*$", message)
+        if not match:
+            raise ValueError(message)
+        job_id = match.group(1)
+        path = self.json_record_path(self.jobs_dir(), job_id)
+        job = {}
+        with contextlib.suppress(Exception):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                job = payload
+        return {
+            "id": job_id,
+            "path": str(path),
+            "schedule_display": job.get("schedule_display"),
+            "next_run_at": job.get("next_run_at"),
+            "prompt": job.get("prompt") or task,
+            "message": message,
+        }
 
     def _chat_role(self, chat_id: str, username: str = "") -> str:
         if self.is_owner_chat(chat_id, username):
@@ -1218,6 +1270,10 @@ class TeligramBot:
             return False
         command, argument = parsed
         state_id = str(self._send_context(chat_id).get("state_id") or chat_id)
+        if command == "start":
+            await self.send_message(chat_id, self.start_greeting_text())
+            return True
+        return False
 
         # Check command policy
         role = self._chat_role(chat_id, username)
@@ -1393,6 +1449,33 @@ class TeligramBot:
         return True
 
     async def handle_image_request(self, chat_id: str, query: str) -> None:
+        if self.tools and "ddg_image_download" in self.available_tool_names():
+            LOGGER.info("Telegram deterministic tool call: mode=image tool=ddg_image_download")
+            result = await self.tools.call_structured(
+                "ddg_image_download",
+                {
+                    "query": query,
+                    "max_candidates": 4,
+                    "output_dir": "generated/telegram_images",
+                },
+            )
+            if result.get("ok"):
+                data = result.get("data") or {}
+                local_path = str(data.get("local_path") or "").strip()
+                if local_path:
+                    path = Path(local_path)
+                    if path.exists() and path.is_file():
+                        title = str(data.get("title") or query).strip()
+                        source = str(data.get("source_url") or "").strip()
+                        source_host = urlparse(source).netloc if source else ""
+                        caption = f"{title}\nSource: {source_host}" if source_host else title
+                        await self.send_photo_file(chat_id, path, caption)
+                        return
+            else:
+                LOGGER.info(
+                    "Telegram ddg_image_download failed, falling back to image_research: %s",
+                    result.get("error") if isinstance(result, dict) else "-",
+                )
         images = await self.find_image_candidates(query)
         if not images:
             await self.send_message(chat_id, "I could not find a sendable image for that.")
@@ -1445,7 +1528,7 @@ class TeligramBot:
         return True
 
     async def handle_model_image_reply(self, chat_id: str, user_text: str, reply: str) -> bool:
-        if parse_natural_image_request(user_text) is None:
+        if not looks_like_image_request_text(user_text):
             return False
         url = extract_first_image_url(reply)
         if url is None:
@@ -1606,7 +1689,7 @@ class TeligramBot:
             return
         if action in {"run", "trigger"}:
             if not rest:
-                await self.send_message(chat_id, "Use /jobs run <routine_id>")
+                await self.send_message(chat_id, "Use /jobs run <job_id>")
                 return
             await self.trigger_routine(chat_id, rest.strip(), manual=True)
             return
@@ -1615,7 +1698,7 @@ class TeligramBot:
                 await self.send_message(chat_id, "Routine management requires admin access.")
                 return
             if not rest:
-                await self.send_message(chat_id, f"Use /jobs {action} <routine_id>")
+                await self.send_message(chat_id, f"Use /jobs {action} <job_id>")
                 return
             result = self.update_routine_state(rest.strip(), action)
             await self.send_message(chat_id, result)
@@ -1624,9 +1707,9 @@ class TeligramBot:
 
     def routine_help_text(self) -> str:
         return (
-            "Llama routines\n\n"
-            "/jobs list - show routines\n"
-            "/jobs add <schedule> | <task> - create a routine\n"
+            "Llama jobs\n\n"
+            "/jobs list - show jobs\n"
+            "/jobs add <schedule> | <task> - create a job\n"
             "/jobs run <id> - run now\n"
             "/jobs pause <id> - pause\n"
             "/jobs resume <id> - resume\n"
@@ -1675,7 +1758,7 @@ class TeligramBot:
         }
         self.write_routine_file(routine)
         return (
-            "Created Llama routine.\n\n"
+            "Created Llama job.\n\n"
             f"ID: {routine_id}\n"
             f"Schedule: {routine['schedule_display']}\n"
             f"Next run: {format_local_datetime(next_run)}\n"
@@ -1685,8 +1768,8 @@ class TeligramBot:
     def routine_list_text(self, *, include_disabled: bool = False) -> str:
         routines = self.routines(include_disabled=include_disabled)
         if not routines:
-            return "No Llama routines yet.\n\nUse /jobs add <schedule> | <task>"
-        lines = ["Llama routines"]
+            return "No Llama jobs yet.\n\nUse /jobs add <schedule> | <task>"
+        lines = ["Llama jobs"]
         for routine in routines[:20]:
             status = "on" if routine.get("enabled", True) else "paused"
             next_run = parse_datetime_or_none(str(routine.get("next_run_at") or ""))
@@ -1780,12 +1863,12 @@ class TeligramBot:
                 continue
             if action in {"remove", "delete", "rm"}:
                 self.delete_routine_file(routine_id)
-                return f"Removed Llama routine {routine_id}."
+                return f"Removed Llama job {routine_id}."
             if action == "pause":
                 routine["enabled"] = False
                 routine["last_status"] = "paused"
                 self.write_routine_file(routine)
-                return f"Paused Llama routine {routine_id}."
+                return f"Paused Llama job {routine_id}."
             if action == "resume":
                 routine["enabled"] = True
                 schedule = routine.get("schedule") if isinstance(routine.get("schedule"), dict) else {}
@@ -1793,8 +1876,8 @@ class TeligramBot:
                 routine["next_run_at"] = next_run.isoformat() if next_run else None
                 routine["last_status"] = "scheduled"
                 self.write_routine_file(routine)
-                return f"Resumed Llama routine {routine_id}."
-        return f"No routine found with ID {routine_id}."
+                return f"Resumed Llama job {routine_id}."
+        return f"No job found with ID {routine_id}."
 
     async def trigger_routine(self, chat_id: str, routine_id: str, *, manual: bool = False) -> None:
         state = self.read_telegram_state()
@@ -1802,9 +1885,9 @@ class TeligramBot:
             if isinstance(routine, dict) and routine.get("id") == routine_id:
                 await self.run_routine(routine, state, manual_chat_id=chat_id if manual else None)
                 self.write_routine_file(routine)
-                await self.send_message(chat_id, f"Ran Llama routine {routine_id}.")
+                await self.send_message(chat_id, f"Ran Llama job {routine_id}.")
                 return
-        await self.send_message(chat_id, f"No routine found with ID {routine_id}.")
+        await self.send_message(chat_id, f"No job found with ID {routine_id}.")
 
     def generated_dir(self) -> Path:
         path = self.workspace / "generated"
@@ -1829,19 +1912,19 @@ class TeligramBot:
         action = (parts[0] if parts else "").lower()
         rest = parts[1] if len(parts) > 1 else ""
         if action in {"list", "ls", "status", "show"}:
-            await self.send_message(chat_id, self.schedule_list_text(include_disabled=self.is_admin_chat(chat_id)))
+            await self.send_message(chat_id, self.routine_list_text(include_disabled=self.is_admin_chat(chat_id)))
             return
         if action in {"run", "now"}:
             if not rest:
-                await self.send_message(chat_id, "Use /schedule run <schedule_id>")
+                await self.send_message(chat_id, "Use /schedule run <job_id>")
                 return
-            await self.trigger_schedule(chat_id, rest.strip())
+            await self.trigger_routine(chat_id, rest.strip(), manual=True)
             return
         if action in {"pause", "resume", "remove", "delete", "rm"}:
             if not rest:
-                await self.send_message(chat_id, f"Use /schedule {action} <schedule_id>")
+                await self.send_message(chat_id, f"Use /schedule {action} <job_id>")
                 return
-            result = self.update_schedule_state(rest.strip(), action)
+            result = self.update_routine_state(rest.strip(), action)
             await self.send_message(chat_id, result)
             return
 
@@ -1850,31 +1933,10 @@ class TeligramBot:
             await self.send_message(chat_id, "I can schedule daily tasks like: every morning at 6 am send good morning")
             return
         time_text, action = task
-        schedule_id = uuid.uuid4().hex[:8]
-        context = self._send_context(chat_id)
-        schedule = {
-            "id": schedule_id,
-            "kind": "daily",
-            "time": time_text,
-            "action": action,
-            "enabled": True,
-            "created_at_utc": datetime.now(UTC).isoformat(),
-            "last_run_key": None,
-            "last_run_at": None,
-            "last_status": "scheduled",
-            "last_error": None,
-            "missed_prompted_for_key": None,
-            "origin": {
-                "chat_id": chat_id,
-                "thread_id": context.get("thread_id"),
-                "state_id": context.get("state_id") or chat_id,
-            },
-        }
-        self.write_schedule_file(schedule)
-        await self.send_message(
-            chat_id,
-            f"Scheduled it.\n\nID: {schedule_id}\nDaily at {time_text}, I will {action}.\n\nSaved as JSON in .runtime/schedules.",
-        )
+        hour_text, minute_text = time_text.split(":", maxsplit=1)
+        cron = f"{int(minute_text)} {int(hour_text)} * * *"
+        result = self.create_routine_from_text(f"{cron} | {action}", chat_id)
+        await self.send_message(chat_id, result.replace("Created Llama routine.", "Created Llama job."))
 
     def schedules(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
         schedules = self.read_json_dir(self.schedules_dir())
@@ -2765,14 +2827,14 @@ class TeligramBot:
             await self.handle_file_request(chat_id, natural_file)
             return
         natural_job = parse_natural_job_request(text)
-        if natural_job is not None:
+        if natural_job is not None and "telegram_create_job" not in self.available_tool_names():
             LOGGER.info("Telegram route: natural_job_request")
             schedule_text, action = natural_job
             result = self.create_routine_from_text(f"{schedule_text} | {action}", chat_id)
             await self.send_message(chat_id, result)
             return
         natural_schedule = parse_natural_schedule_request(text)
-        if natural_schedule is not None:
+        if natural_schedule is not None and "telegram_create_job" not in self.available_tool_names():
             LOGGER.info("Telegram route: natural_schedule_request")
             await self.handle_schedule_request(chat_id, text)
             return
@@ -3005,11 +3067,6 @@ class TeligramBot:
             if self.autonomous_enabled
             else None
         )
-        heartbeat_task = (
-            asyncio.create_task(self.heartbeat_schedule_loop())
-            if self.autonomous_enabled
-            else None
-        )
         routine_task = asyncio.create_task(self.routine_loop())
         update_semaphore = asyncio.Semaphore(TELEGRAM_MAX_PARALLEL_UPDATES)
         update_tasks: set[asyncio.Task[None]] = set()
@@ -3057,10 +3114,6 @@ class TeligramBot:
                 autonomous_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await autonomous_task
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat_task
 
     async def routine_loop(self) -> None:
         while True:
@@ -3070,17 +3123,7 @@ class TeligramBot:
                 raise
             except Exception:
                 LOGGER.exception("Llama routine tick failed")
-            await asyncio.sleep(60)
-
-    async def heartbeat_schedule_loop(self) -> None:
-        while True:
-            try:
-                await self.tick_timed_heartbeat_tasks()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOGGER.exception("Telegram scheduled heartbeat tick failed")
-            await asyncio.sleep(60)
+            await asyncio.sleep(JOB_CHECK_INTERVAL_SECONDS)
 
     async def tick_routines(self) -> None:
         if self._routine_loop_running:
@@ -3238,15 +3281,11 @@ class TeligramBot:
     async def run_autonomous_cycle(self) -> None:
         self.reload_workspace()
         state = self.read_telegram_state()
-        heartbeat = self.workspace_documents.get("HEARTBEAT.md", "")
-        await self._schedule_upcoming_tasks(heartbeat, state)
         state.setdefault(AUTONOMOUS_STATE_KEY, {})["last_cycle_utc"] = datetime.now(UTC).isoformat()
         self.write_telegram_state(state)
 
-        evolution_report = ""
         if self.self_evolution_enabled:
-            evolution_report = await self.run_self_evolution_cycle(force=False)
-        await self.run_scheduled_heartbeat_cycle(evolution_report=evolution_report)
+            await self.run_self_evolution_cycle(force=False)
 
     async def tick_timed_heartbeat_tasks(self) -> None:
         state = self.read_telegram_state()
@@ -3360,6 +3399,7 @@ class TeligramBot:
 
     async def _schedule_upcoming_tasks(self, heartbeat: str, state: dict[str, Any]) -> None:
         """Schedule temporary in-memory timers for tasks due within the next 10 minutes."""
+        return
         LOOK_AHEAD_SECONDS = 600  # 10 minutes
         now = datetime.now().astimezone()
         tasks = parse_heartbeat_tasks(heartbeat)
@@ -3485,8 +3525,6 @@ class TeligramBot:
                 continue
             key = self.schedule_run_key(schedule, now)
             if schedule.get("last_run_key") == key or completed.get(key):
-                continue
-            if key in self._dynamic_heartbeat_tasks and not self._dynamic_heartbeat_tasks[key].done():
                 continue
             missed = (now - due_at).total_seconds() > MISSED_TASK_GRACE_SECONDS
             if missed:
@@ -3958,7 +3996,7 @@ class TeligramBot:
             f"Workspace: {self.workspace}\n"
             f"Loaded docs: {docs}\n"
             f"Tools: {tools_count} enabled\n"
-            f"Llama routines: {routine_count} active\n"
+            f"Llama jobs: {routine_count} active\n"
             f"Self-evolution: {'enabled' if self.self_evolution_enabled else 'disabled'}\n"
             f"Core editing: {'enabled' if self.core_editing_enabled else 'disabled'}"
         )
@@ -4047,6 +4085,12 @@ class TeligramBot:
         lines.append("You can also just send a normal message.")
         return "\n".join(lines)
 
+    def start_greeting_text(self) -> str:
+        return (
+            f"Hi, I am {self.agent_name}. Send me what you need, and I will handle it directly. "
+            "If you ask me to do something later, I can create a job for it."
+        )
+
     def tools_available(self) -> bool:
         tools = getattr(self.config, "tools", None)
         if tools is None or not getattr(tools, "enabled", False):
@@ -4119,7 +4163,7 @@ def parse_natural_poll_request(text: str) -> tuple[str, list[str]] | None:
 
 def parse_natural_image_request(text: str) -> str | None:
     patterns = [
-        r"(?is)^\s*i\s+(?:want|need|would\s+like)\s+(?:an?\s+)?(?:image|photo|picture)\s+(?:of|for|about)?\s*(.+)$",
+        r"(?is)^\s*i\s+(?:want|wamt|need|would\s+like)\s+(?:an?\s+)?(?:image|photo|picture)\s+(?:of|for|about)?\s*(.+)$",
         r"(?is)^\s*(?:send|show|find|get)\s+(?:me\s+)?(?:an?\s+)?(?:image|photo|picture)\s+(?:of|for|about)?\s*(.+)$",
         r"(?is)^\s*(?:search|look\s*up)\s+(?:for\s+)?(?:me\s+)?(?:an?\s+)?(?:image|photo|picture)s?\s+(?:of|for|about)?\s*(.+)$",
         r"(?is)^\s*(?:image|photo|picture)\s+(?:search|sarch)\s+(?:of|for|about)?\s*(.+)$",
@@ -4143,6 +4187,18 @@ def parse_natural_image_request(text: str) -> str | None:
         query = re.sub(r"\s+", " ", query).strip(" .")
         return query or None
     return None
+
+
+def looks_like_image_request_text(text: str) -> bool:
+    if parse_natural_image_request(text) is not None:
+        return True
+    lowered = text.lower()
+    has_image_word = any(word in lowered for word in ("image", "photo", "picture", "pic"))
+    has_request_word = any(
+        word in lowered
+        for word in ("want", "wamt", "need", "send", "show", "find", "get", "search", "sarch", "download")
+    )
+    return has_image_word and has_request_word
 
 
 def compact_telegram_dev_payload(value: Any, *, depth: int = 0, key: str | None = None) -> Any:
@@ -4383,10 +4439,10 @@ def improve_routine_prompt(raw_prompt: str) -> str:
 def parse_natural_job_request(text: str) -> tuple[str, str] | None:
     cleaned = text.strip()
     patterns = [
-        r"(?is)^\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:you\s+have\s+to|to|that|for)?\s+(.+?)\s*$",
-        r"(?is)^\s*(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:to\s+)?(.+?)\s*$",
-        r"(?is)^\s*(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(send|message|say|tell|remind|notify)\b\s+(.+?)\s*$",
-        r"(?is)^\s*(?:send|message|say|tell|remind|notify)\b\s+(.+?)\s+(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$",
+        r"(?is)^\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:you\s+have\s+to|to|that|for)?\s+(.+?)\s*$",
+        r"(?is)^\s*(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:to\s+)?(.+?)\s*$",
+        r"(?is)^\s*(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(send|message|say|tell|remind|notify)\b\s+(.+?)\s*$",
+        r"(?is)^\s*(?:send|message|say|tell|remind|notify)\b\s+(.+?)\s+(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$",
     ]
     for pattern in patterns:
         match = re.match(pattern, cleaned)

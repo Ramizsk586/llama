@@ -433,7 +433,9 @@ telegram:
       - wikipedia_search
       - tavily_search
       - source_research
+      - ddg_image_download
     command_tools:
+      - ddg_image_download
       - image_research
       - image_download
       - verify_sources
@@ -443,6 +445,7 @@ telegram:
       - weather_current
       - wikipedia_search
       - tavily_search
+      - ddg_image_download
       - image_research
       - image_download
     require_admin_for:
@@ -482,6 +485,7 @@ tools:
     - serpapi_search
     - tavily_search
     - source_research
+    - ddg_image_download
     - image_research
     - image_download
     - verify_sources
@@ -649,15 +653,15 @@ class CommandPolicy:
 class ToolPolicy:
     ai_auto_tools: list[str] = field(default_factory=lambda: [
         "datetime_now", "weather_current", "wikipedia_search",
-        "tavily_search", "source_research",
+        "tavily_search", "source_research", "ddg_image_download",
     ])
     command_tools: list[str] = field(default_factory=lambda: [
-        "image_research", "image_download", "verify_sources",
+        "ddg_image_download", "image_research", "image_download", "verify_sources",
     ])
     blocked_tools: list[str] = field(default_factory=lambda: ["shell.execute"])
     user_visible_tools: list[str] = field(default_factory=lambda: [
         "weather_current", "wikipedia_search",
-        "tavily_search", "image_research", "image_download",
+        "tavily_search", "ddg_image_download", "image_research", "image_download",
     ])
     require_admin_for: list[str] = field(default_factory=lambda: ["shell.execute", "manim_render"])
     require_owner_for: list[str] = field(default_factory=lambda: ["shell.execute"])
