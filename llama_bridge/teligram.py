@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import contextvars
 import hashlib
@@ -9,6 +10,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import sys
 import time
@@ -38,6 +40,16 @@ except ImportError:
 
 LOGGER = logging.getLogger("uvicorn.error.teligram")
 BOT_DOCS_DIRNAME = "bot_docs"
+
+# Pre-compiled regex patterns for OutputRules (OPT 8)
+_AVOID_ASTERISK_RE = re.compile(
+    r"(do\s*not|don't|dont|never|avoid|without|no)\s+(?:use\s+)?(?:the\s+)?(?:character\s+)?[\"'`]*\*[\"'`]*",
+    re.IGNORECASE,
+)
+_ASTERISK_IN_RESPONSE_RE = re.compile(
+    r"[\"'`]*\*[\"'`]*\s+(?:in|inside)\s+(?:the\s+)?response",
+    re.IGNORECASE,
+)
 
 LOG_MESSAGE_PREFIXES = (
     ("Telegram ", ""),
@@ -98,6 +110,19 @@ def _is_model_error_reply(text: str) -> bool:
     return text.lower().strip().startswith("i hit a model/provider error")
 
 
+def _validate_admin_pin_hash(pin_hash: str | None) -> str | None:
+    value = str(pin_hash or "").strip()
+    if not value:
+        return None
+    if len(value) < 32:
+        LOGGER.warning("Telegram admin_pin_hash looks too short; ignoring it")
+        return None
+    if re.fullmatch(r"\d{4,12}", value):
+        LOGGER.warning("Telegram admin_pin_hash appears to be a plaintext PIN; ignoring it")
+        return None
+    return value
+
+
 def _color_enabled() -> bool:
     return sys.stderr.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -113,10 +138,21 @@ def _compact_log_message(message: str) -> str:
         if message.startswith(prefix):
             message = replacement + message[len(prefix) :]
             break
+    # Apply every known phrase rewrite, but only once per phrase so repeated
+    # content remains visible in diagnostic messages.
     for old, new in LOG_MESSAGE_REPLACEMENTS:
         message = message.replace(old, new, 1)
     message = re.sub(r"\s+", " ", message).strip()
     return message
+
+
+class Role:
+    """Role constants for access control (Q4)."""
+    EVERYONE = "everyone"
+    ALLOWED = "allowed"
+    ADMIN = "admin"
+    OWNER = "owner"
+    ORDER = {EVERYONE: 0, ALLOWED: 1, ADMIN: 2, OWNER: 3}
 
 
 class TeligramLogFormatter(logging.Formatter):
@@ -155,6 +191,7 @@ WORKSPACE_DOC_ORDER = [
     "MEMORY.md",
     "HEARTBEAT.md",
     "EVOLUTION.md",
+    "PROJECT.md",
 ]
 
 REQUIRED_WORKSPACE_TEMPLATES = {
@@ -730,11 +767,8 @@ class OutputRules:
             for name in ("USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md")
         ).lower()
         avoid_asterisk = bool(
-            re.search(
-                r"(do\s*not|don't|dont|never|avoid|without|no)\s+(?:use\s+)?(?:the\s+)?(?:character\s+)?[\"'`]*\*[\"'`]*",
-                combined,
-            )
-            or re.search(r"[\"'`]*\*[\"'`]*\s+(?:in|inside)\s+(?:the\s+)?response", combined)
+            _AVOID_ASTERISK_RE.search(combined)
+            or _ASTERISK_IN_RESPONSE_RE.search(combined)
         )
         return cls(avoid_asterisk=avoid_asterisk)
 
@@ -798,7 +832,7 @@ class TeligramBot:
         self.sent_polls: dict[str, str] = {}
         self.bot_username = ""
         self._send_context_by_chat: dict[str, dict[str, Any]] = {}
-        self._recent_update_keys: list[str] = []
+        self._recent_update_keys: collections.deque[str] = collections.deque(maxlen=RECENT_UPDATE_CACHE_SIZE)
         self._recent_update_key_set: set[str] = set()
         self._state_locks: dict[str, asyncio.Lock] = {}
         self.output_rules = OutputRules.from_documents(self.workspace_documents)
@@ -807,7 +841,7 @@ class TeligramBot:
         self.owner_chat_ids = {str(item).strip() for item in self.telegram.owner_chat_ids if str(item).strip()}
         self.admin_chat_ids = {str(item).strip() for item in self.telegram.admin_chat_ids if str(item).strip()}
         self.allow_all_chats = self.telegram.allow_all_chats
-        self.admin_pin_hash = self.telegram.admin_pin_hash
+        self.admin_pin_hash = _validate_admin_pin_hash(self.telegram.admin_pin_hash)
         self.core_editing_enabled = self.telegram.core_editing_enabled
         self.require_owner_approval_for_core_changes = self.telegram.require_owner_approval_for_core_changes
         # Load runtime access control if exists
@@ -908,7 +942,8 @@ class TeligramBot:
                     await asyncio.sleep(min(max(retry_after, 1.0), 10.0))
                     continue
                 if response.status_code >= 500 and attempt + 1 < retries:
-                    await asyncio.sleep(2**attempt)
+                    delay = min(2 ** attempt + random.uniform(0, 0.5), 8.0)
+                    await asyncio.sleep(delay)
                     continue
                 response.raise_for_status()
                 data = response.json()
@@ -919,7 +954,8 @@ class TeligramBot:
                 last_error = exc
                 if attempt + 1 >= retries:
                     break
-                await asyncio.sleep(2**attempt)
+                delay = min(2 ** attempt + random.uniform(0, 0.5), 8.0)
+                await asyncio.sleep(delay)
             except Exception:
                 raise
         raise RuntimeError(f"Telegram {endpoint} failed: {last_error}") from last_error
@@ -964,11 +1000,12 @@ class TeligramBot:
         key = f"u:{update_id}" if update_id is not None else f"m:{message.get('chat', {}).get('id')}:{message_id}:{edit_date or message.get('date')}"
         if key in self._recent_update_key_set:
             return True
-        self._recent_update_key_set.add(key)
+        # If deque is full, it auto-evicts the oldest item - sync the set
+        if len(self._recent_update_keys) == RECENT_UPDATE_CACHE_SIZE:
+            oldest = self._recent_update_keys[0]  # peek before append
+            self._recent_update_key_set.discard(oldest)
         self._recent_update_keys.append(key)
-        if len(self._recent_update_keys) > RECENT_UPDATE_CACHE_SIZE:
-            old = self._recent_update_keys.pop(0)
-            self._recent_update_key_set.discard(old)
+        self._recent_update_key_set.add(key)
         return False
 
     def _message_mentions_bot(self, message: dict[str, Any], text: str) -> bool:
@@ -1218,6 +1255,22 @@ class TeligramBot:
             "message": message,
         }
 
+    async def create_telegram_job_from_natural_request(self, chat_id: str, schedule: str, task: str) -> str:
+        if self.tools and "telegram_create_job" in self.available_tool_names():
+            result = await self.tools.call_structured(
+                "telegram_create_job",
+                {"schedule": schedule, "task": task},
+            )
+            if result.get("ok"):
+                data = result.get("data") or {}
+                message = str(data.get("message") or "").strip()
+                if message:
+                    return message
+            error = str(result.get("error") or result.get("message") or "").strip()
+            if error:
+                return error
+        return self.create_routine_from_text(f"{schedule} | {task}", chat_id)
+
     def _chat_role(self, chat_id: str, username: str = "") -> str:
         if self.is_owner_chat(chat_id, username):
             return "owner"
@@ -1270,10 +1323,6 @@ class TeligramBot:
             return False
         command, argument = parsed
         state_id = str(self._send_context(chat_id).get("state_id") or chat_id)
-        if command == "start":
-            await self.send_message(chat_id, self.start_greeting_text())
-            return True
-        return False
 
         # Check command policy
         role = self._chat_role(chat_id, username)
@@ -2827,16 +2876,20 @@ class TeligramBot:
             await self.handle_file_request(chat_id, natural_file)
             return
         natural_job = parse_natural_job_request(text)
-        if natural_job is not None and "telegram_create_job" not in self.available_tool_names():
+        if natural_job is not None:
             LOGGER.info("Telegram route: natural_job_request")
             schedule_text, action = natural_job
-            result = self.create_routine_from_text(f"{schedule_text} | {action}", chat_id)
+            result = await self.create_telegram_job_from_natural_request(chat_id, schedule_text, action)
             await self.send_message(chat_id, result)
             return
         natural_schedule = parse_natural_schedule_request(text)
-        if natural_schedule is not None and "telegram_create_job" not in self.available_tool_names():
+        if natural_schedule is not None:
             LOGGER.info("Telegram route: natural_schedule_request")
-            await self.handle_schedule_request(chat_id, text)
+            time_text, action = natural_schedule
+            hour_text, minute_text = time_text.split(":", maxsplit=1)
+            cron = f"{int(minute_text)} {int(hour_text)} * * *"
+            result = await self.create_telegram_job_from_natural_request(chat_id, cron, action)
+            await self.send_message(chat_id, result)
             return
         if await self.handle_command(chat_id, text, username):
             LOGGER.info("Telegram route: command/canned command=%s", parse_command(text)[0] if parse_command(text) else "-")
@@ -3182,12 +3235,14 @@ class TeligramBot:
             memory = self.workspace_documents.get("MEMORY.md", "")
             user_prefs = self.workspace_documents.get("USER.md", "")
             job_context = self.routine_context_text(routine)
+            current_research_context = await self.scheduled_report_evidence(prompt_text)
             request = (
                 "Llama routine run. Compose only the user-facing output for this scheduled routine. "
                 "If there is nothing useful to send, output exactly: [SILENT]\n\n"
                 f"Routine name: {routine.get('name') or routine_id}\n"
                 f"Task: {prompt_text}\n\n"
                 f"{job_context}"
+                f"{current_research_context}"
                 f"USER.md:\n{user_prefs[:2000]}\n\n"
                 f"MEMORY.md:\n{memory[:3000]}"
             )
@@ -3222,6 +3277,89 @@ class TeligramBot:
                 self._send_context_by_chat.pop(target_chat_id, None)
             else:
                 self._send_context_by_chat[target_chat_id] = prior_context
+
+    async def scheduled_report_evidence(self, prompt_text: str) -> str:
+        if not self.tools or not looks_like_report_research_task(prompt_text):
+            return ""
+        names = self.available_tool_names()
+        blocks: list[str] = []
+        if "datetime_now" in names:
+            datetime_args = {"country": getattr(self.config.tools, "country", None) or "India"}
+            LOGGER.info("Telegram scheduled report tool call: datetime_now")
+            datetime_result = await self.tools.call_structured("datetime_now", datetime_args)
+            self.write_dev_log(
+                "telegram.tool.call",
+                {
+                    "name": "datetime_now",
+                    "arguments": datetime_args,
+                    "ok": datetime_result.get("ok") if isinstance(datetime_result, dict) else None,
+                    "for": "scheduled_report",
+                },
+            )
+            blocks.append("Device date/time tool result:\n" + json.dumps(datetime_result, ensure_ascii=True, indent=2))
+
+        research_tool = self.scheduled_report_research_tool(names)
+        if research_tool is not None:
+            research_args = self.scheduled_report_research_args(research_tool, prompt_text)
+            LOGGER.info("Telegram scheduled report tool call: %s", research_tool)
+            research_result = await self.tools.call_structured(research_tool, research_args)
+            self.write_dev_log(
+                "telegram.tool.call",
+                {
+                    "name": research_tool,
+                    "arguments": research_args,
+                    "ok": research_result.get("ok") if isinstance(research_result, dict) else None,
+                    "error": research_result.get("error") if isinstance(research_result, dict) else None,
+                    "for": "scheduled_report",
+                },
+            )
+            blocks.append("Current research/search tool result:\n" + json.dumps(research_result, ensure_ascii=True, indent=2))
+
+        if not blocks:
+            return ""
+        evidence = "\n\n".join(blocks)
+        if len(evidence) > 16_000:
+            evidence = f"{evidence[:16_000].rstrip()}\n... [scheduled report evidence truncated]"
+        return (
+            "CURRENT REPORT EVIDENCE:\n"
+            "Use the device date/time first to frame the report's as-of date. "
+            "Use the research/search result as the source of current facts. "
+            "Do not invent current claims that are not supported by this evidence. "
+            "If current research failed, say that current verification was unavailable.\n\n"
+            f"{evidence}\n\n"
+        )
+
+    def scheduled_report_research_tool(self, names: set[str]) -> str | None:
+        for tool_name in ("source_research", "tavily_search", "serpapi_search"):
+            if tool_name in names:
+                return tool_name
+        return None
+
+    def scheduled_report_research_args(self, tool_name: str, prompt_text: str) -> dict[str, Any]:
+        query = prompt_text.strip()
+        if tool_name == "source_research":
+            return {
+                "query": query,
+                "max_results": 6,
+                "required_verified_sources": 2,
+                "include_images": False,
+            }
+        if tool_name == "tavily_search":
+            return {
+                "query": query,
+                "search_depth": "advanced",
+                "topic": "news" if looks_news_like(query) else "general",
+                "max_results": 6,
+                "include_answer": True,
+                "include_raw_content": False,
+            }
+        return {
+            "query": query,
+            "engine": "google",
+            "num": 6,
+            "gl": "in",
+            "hl": "en",
+        }
 
     def routine_context_text(self, routine: dict[str, Any]) -> str:
         context_ids = routine.get("context_from")
@@ -4201,6 +4339,24 @@ def looks_like_image_request_text(text: str) -> bool:
     return has_image_word and has_request_word
 
 
+def looks_like_report_research_task(text: str) -> bool:
+    lowered = text.lower()
+    report_markers = (
+        "report",
+        "briefing",
+        "detailed update",
+        "current situation",
+        "latest",
+        "current",
+        "web search",
+        "research",
+        "source",
+        "pandemic",
+        "outbreak",
+    )
+    return any(marker in lowered for marker in report_markers)
+
+
 def compact_telegram_dev_payload(value: Any, *, depth: int = 0, key: str | None = None) -> Any:
     if depth >= 6:
         return "<nested value omitted>"
@@ -4441,8 +4597,8 @@ def parse_natural_job_request(text: str) -> tuple[str, str] | None:
     patterns = [
         r"(?is)^\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:you\s+have\s+to|to|that|for)?\s+(.+?)\s*$",
         r"(?is)^\s*(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:to\s+)?(.+?)\s*$",
-        r"(?is)^\s*(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(send|message|say|tell|remind|notify)\b\s+(.+?)\s*$",
-        r"(?is)^\s*(?:send|message|say|tell|remind|notify)\b\s+(.+?)\s+(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$",
+        r"(?is)^\s*(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(send|message|say|tell|remind|notify|do)\b\s+(.+?)\s*$",
+        r"(?is)^\s*(?:send|message|say|tell|remind|notify|do)\b\s+(.+?)\s+(?:at\s+)?(?:(?:sharp|sherp)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$",
     ]
     for pattern in patterns:
         match = re.match(pattern, cleaned)
@@ -4453,12 +4609,12 @@ def parse_natural_job_request(text: str) -> tuple[str, str] | None:
             hour, minute, meridiem, action = groups
         elif len(groups) == 5 and groups[0] and str(groups[0]).isdigit():
             hour, minute, meridiem, verb, action_body = groups
-            action = f"{verb} {action_body}"
+            action = action_body if str(verb).lower() == "do" else f"{verb} {action_body}"
         else:
             action_body, hour, minute, meridiem = groups
-            verb_match = re.match(r"(?is)^\s*(send|message|say|tell|remind|notify)\b", cleaned)
+            verb_match = re.match(r"(?is)^\s*(send|message|say|tell|remind|notify|do)\b", cleaned)
             verb = verb_match.group(1) if verb_match else "send"
-            action = f"{verb} {action_body}"
+            action = action_body if str(verb).lower() == "do" else f"{verb} {action_body}"
         time_text = normalize_schedule_time(hour, minute, meridiem)
         action = normalize_scheduled_action(action)
         if time_text and action:
@@ -5203,7 +5359,28 @@ def should_use_deep_research(query: str) -> bool:
 
 
 def should_use_wikipedia(query: str) -> bool:
-    return not should_use_current_web(query)
+    """Use Wikipedia only for encyclopedic/factual queries."""
+    text = query.lower().strip()
+    encyclopedic_markers = (
+        "what is",
+        "who is",
+        "who was",
+        "what was",
+        "history of",
+        "definition of",
+        "define",
+        "biography of",
+        "explain",
+        "what does",
+        "meaning of",
+        "origin of",
+        "when did",
+        "where is",
+        "where did",
+        "capital of",
+        "population of",
+    )
+    return any(marker in text for marker in encyclopedic_markers)
 
 
 def extract_weather_location(query: str) -> str | None:
@@ -5241,21 +5418,26 @@ def split_telegram_message(text: str) -> list[str]:
     if len(text) <= TELEGRAM_MESSAGE_LIMIT:
         return [text]
 
+    min_chunk_threshold = max(1, SAFE_MESSAGE_CHUNK_SIZE // 4)
     chunks: list[str] = []
-    remaining = text
-    while remaining:
-        if len(remaining) <= SAFE_MESSAGE_CHUNK_SIZE:
-            chunks.append(remaining)
+    start = 0
+    text_length = len(text)
+    while start < text_length:
+        end = min(start + SAFE_MESSAGE_CHUNK_SIZE, text_length)
+        if end >= text_length:
+            chunks.append(text[start:].strip())
             break
-        split_at = remaining.rfind("\n\n", 0, SAFE_MESSAGE_CHUNK_SIZE)
-        if split_at < 1000:
-            split_at = remaining.rfind("\n", 0, SAFE_MESSAGE_CHUNK_SIZE)
-        if split_at < 1000:
-            split_at = remaining.rfind(" ", 0, SAFE_MESSAGE_CHUNK_SIZE)
-        if split_at < 1000:
-            split_at = SAFE_MESSAGE_CHUNK_SIZE
-        chunks.append(remaining[:split_at].strip())
-        remaining = remaining[split_at:].strip()
+        split_at = text.rfind("\n\n", start, end)
+        if split_at - start < min_chunk_threshold:
+            split_at = text.rfind("\n", start, end)
+        if split_at - start < min_chunk_threshold:
+            split_at = text.rfind(" ", start, end)
+        if split_at <= start:
+            split_at = end
+        chunks.append(text[start:split_at].strip())
+        start = split_at
+        while start < text_length and text[start].isspace():
+            start += 1
     return [chunk for chunk in chunks if chunk]
 
 
@@ -5319,15 +5501,18 @@ def _configure_teligram_logging(level_name: str) -> None:
     level = getattr(logging, level_name.upper(), logging.INFO)
     handler = logging.StreamHandler()
     handler.setFormatter(TeligramLogFormatter())
+    handler.setLevel(level)
+
+    logger = logging.getLogger("uvicorn.error.teligram")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
 
     root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(handler)
-    root.setLevel(level)
-
-    logging.getLogger("uvicorn.error").handlers.clear()
-    LOGGER.setLevel(level)
-    LOGGER.propagate = True
+    if not root.handlers:
+        root.addHandler(handler)
+        root.setLevel(level)
 
     if level > logging.DEBUG:
         logging.getLogger("httpx").setLevel(logging.WARNING)

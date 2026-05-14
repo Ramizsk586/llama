@@ -32,3 +32,4 @@ uv.lock
 llama.ngrok.log
 llama.ngrok.pid
 generated
+.usage.json

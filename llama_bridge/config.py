@@ -382,6 +382,8 @@ telegram:
   allowed_chat_ids: []
   owner_chat_ids: []
   admin_chat_ids: []
+  # Secure default: if allow_all_chats is false and all access lists are empty,
+  # the Telegram bot rejects every chat until an owner/admin/allowed chat is set.
   allow_all_chats: false
   admin_pin_hash: null
   core_editing_enabled: false

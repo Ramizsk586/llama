@@ -1,11 +1,11 @@
 ---
 name: visual-work
-description: Agent-created procedural memory for visual workflow patterns observed 4 times.
+description: Agent-created procedural memory for visual workflow patterns observed 3 times.
 version: 1.0.0
 metadata:
   llama:
     category: agent-created
-    signals: 4
+    signals: 3
 ---
 
 # Visual Workflow
