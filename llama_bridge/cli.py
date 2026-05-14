@@ -2291,9 +2291,14 @@ def _cmd_agent_start(home: Path, pid_path: Path, log_path: Path, *, foreground: 
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "close_fds": True,
+        "env": {**os.environ, "LLAMA_AGENT_BACKGROUND": "1"},
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = _background_creationflags()
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        popen_kwargs["startupinfo"] = startupinfo
     else:
         popen_kwargs["start_new_session"] = True
     with log_path.open("a", encoding="utf-8") as handle:
@@ -2427,14 +2432,22 @@ def _find_npm() -> str:
 def _npm_agent_command(npm: str, home: Path) -> list[str]:
     """Return a Windows-safe command for the full llama_agent stack."""
     script = "start"
+    script_command = ""
     package_path = home / "package.json"
     try:
         package = json.loads(package_path.read_text(encoding="utf-8"))
         scripts = package.get("scripts") if isinstance(package, dict) else {}
         if isinstance(scripts, dict) and "dev" in scripts:
             script = "dev"
+        if isinstance(scripts, dict):
+            script_command = str(scripts.get(script) or "")
     except Exception:
         script = "start"
+        script_command = ""
+
+    direct_command = _direct_agent_node_command(home, script_command)
+    if direct_command is not None:
+        return direct_command
 
     if os.name == "nt" and Path(npm).suffix.lower() in {".cmd", ".bat"}:
         node = _find_node()
@@ -2444,6 +2457,24 @@ def _npm_agent_command(npm: str, home: Path) -> list[str]:
         comspec = os.environ.get("COMSPEC") or "cmd.exe"
         return [comspec, "/d", "/s", "/c", subprocess.list2cmdline([npm, "run", script])]
     return [npm, "run", script]
+
+
+def _direct_agent_node_command(home: Path, script_command: str) -> list[str] | None:
+    """Bypass npm for simple Node scripts so Windows does not leave a shell window open."""
+    node = _find_node()
+    if not node:
+        return None
+    match = re.fullmatch(r"\s*node\s+([^\s]+\.mjs)\s*", script_command)
+    if not match:
+        return None
+    script_path = (home / match.group(1)).resolve()
+    try:
+        script_path.relative_to(home.resolve())
+    except ValueError:
+        return None
+    if not script_path.exists():
+        return None
+    return [node, str(script_path)]
 
 
 def _find_node() -> str | None:

@@ -1626,7 +1626,10 @@ class TeligramBot:
         parsed = parse_routine_create_request(text)
         if parsed is None:
             return "Use /jobs add <schedule> | <task>\nExample: /jobs add every 2h | check the server status"
-        schedule_text, prompt = parsed
+        schedule_text, raw_prompt = parsed
+        prompt = improve_routine_prompt(raw_prompt)
+        if not prompt:
+            return "Routine task is required."
         try:
             schedule = parse_routine_schedule(schedule_text)
             next_run = compute_routine_next_run(schedule)
@@ -1641,6 +1644,7 @@ class TeligramBot:
             "id": routine_id,
             "name": safe_filename(prompt[:48], default="routine").replace("_", " "),
             "prompt": prompt,
+            "original_prompt": raw_prompt,
             "schedule": schedule,
             "schedule_display": schedule.get("display", schedule_text),
             "enabled": True,
@@ -4273,17 +4277,100 @@ def normalize_scheduled_action(action: str) -> str:
     return f"send {action}"
 
 
+def improve_routine_prompt(raw_prompt: str) -> str:
+    prompt = re.sub(r"\s+", " ", raw_prompt).strip(" .")
+    if not prompt:
+        return ""
+
+    prompt = re.sub(
+        r"(?i)^(?:please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+|you\s+have\s+to\s+)+",
+        "",
+        prompt,
+    ).strip(" .")
+    prompt = re.sub(r"(?i)^to\s+", "", prompt).strip(" .")
+    command_body = re.sub(
+        r"(?is)^(?:send|message|say|tell\s+me)\s+(?:me\s+)?(?:that\s+)?",
+        "",
+        prompt,
+        count=1,
+    ).strip(" .")
+
+    reminder_match = re.match(r"(?is)^(?:remind\s+me\s+to|reminder\s+to)\s+(.+)$", prompt)
+    if reminder_match is None and command_body != prompt:
+        reminder_match = re.match(r"(?is)^(?:remind\s+me\s+to|reminder\s+to)\s+(.+)$", command_body)
+    if reminder_match:
+        reminder = reminder_match.group(1).strip(" .")
+        return f"Send the user a clear, concise reminder to {reminder}."
+
+    reminder_about_match = re.match(r"(?is)^(?:remind\s+me\s+about|reminder\s+about)\s+(.+)$", prompt)
+    if reminder_about_match is None and command_body != prompt:
+        reminder_about_match = re.match(r"(?is)^(?:remind\s+me\s+about|reminder\s+about)\s+(.+)$", command_body)
+    if reminder_about_match:
+        reminder = reminder_about_match.group(1).strip(" .")
+        return f"Send the user a clear, concise reminder about {reminder}."
+
+    research_match = re.match(
+        r"(?is)^(check|monitor|look\s+up|search|find|research|get|summarize)\s+(.+)$",
+        prompt,
+    )
+    if research_match is None and command_body != prompt:
+        research_match = re.match(
+            r"(?is)^(check|monitor|look\s+up|search|find|research|get|summarize)\s+(.+)$",
+            command_body,
+        )
+    if research_match:
+        verb = research_match.group(1).lower()
+        topic = research_match.group(2).strip(" .")
+        if verb == "summarize":
+            return f"Summarize {topic} for the user in a concise, well-structured Telegram update."
+        return (
+            f"Check {topic} for the user and send a concise, well-structured Telegram update "
+            "with the key details and any useful next action."
+        )
+
+    report_match = re.match(
+        r"(?is)^(?:a\s+)?(?:report|briefing|update|summary)\s+(?:on|about)\s+(.+)$",
+        command_body,
+    )
+    if report_match:
+        topic = report_match.group(1).strip(" .")
+        return (
+            f"Research {topic} for the user and send a concise, well-structured Telegram report "
+            "with the current situation, key points, and any important caveats."
+        )
+
+    message_match = re.match(r"(?is)^(?:send|message|say|tell\s+me)\s+(?:me\s+)?(?:that\s+)?(.+)$", prompt)
+    if message_match:
+        message = message_match.group(1).strip(" .")
+        if message:
+            return f"Compose and send a polished Telegram message for the user that says: {message}."
+
+    return f"Complete this scheduled task for the user and send a concise, useful Telegram update: {prompt}."
+
+
 def parse_natural_job_request(text: str) -> tuple[str, str] | None:
     cleaned = text.strip()
     patterns = [
         r"(?is)^\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:you\s+have\s+to|to|that|for)?\s+(.+?)\s*$",
         r"(?is)^\s*(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:creat(?:e)?|add|make|set)\s+(?:a\s+)?(?:job|routine|reminder|task)\s+(?:to\s+)?(.+?)\s*$",
+        r"(?is)^\s*(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(send|message|say|tell|remind|notify)\b\s+(.+?)\s*$",
+        r"(?is)^\s*(?:send|message|say|tell|remind|notify)\b\s+(.+?)\s+(?:at\s+)?(?:sharp\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$",
     ]
     for pattern in patterns:
         match = re.match(pattern, cleaned)
         if not match:
             continue
-        hour, minute, meridiem, action = match.groups()
+        groups = match.groups()
+        if len(groups) == 4 and str(groups[0]).isdigit():
+            hour, minute, meridiem, action = groups
+        elif len(groups) == 5 and groups[0] and str(groups[0]).isdigit():
+            hour, minute, meridiem, verb, action_body = groups
+            action = f"{verb} {action_body}"
+        else:
+            action_body, hour, minute, meridiem = groups
+            verb_match = re.match(r"(?is)^\s*(send|message|say|tell|remind|notify)\b", cleaned)
+            verb = verb_match.group(1) if verb_match else "send"
+            action = f"{verb} {action_body}"
         time_text = normalize_schedule_time(hour, minute, meridiem)
         action = normalize_scheduled_action(action)
         if time_text and action:
