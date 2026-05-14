@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -68,6 +69,13 @@ LOG_MESSAGE_REPLACEMENTS = (
 )
 
 HARDCODED_HEARTBEAT_INTERVAL_SECONDS = 1800  # 30 minutes — do not expose to user config
+
+
+TELEGRAM_MAX_PARALLEL_UPDATES = 8
+_CURRENT_SEND_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "telegram_send_context",
+    default=None,
+)
 
 
 def _is_heartbeat_ack_only(text: str) -> bool:
@@ -789,6 +797,7 @@ class TeligramBot:
         self._send_context_by_chat: dict[str, dict[str, Any]] = {}
         self._recent_update_keys: list[str] = []
         self._recent_update_key_set: set[str] = set()
+        self._state_locks: dict[str, asyncio.Lock] = {}
         self.output_rules = OutputRules.from_documents(self.workspace_documents)
         # Load access control from config and runtime
         self.allowed_chat_ids = {str(item).strip() for item in self.telegram.allowed_chat_ids if str(item).strip()}
@@ -931,6 +940,9 @@ class TeligramBot:
         return {"message_thread_id": numeric}
 
     def _send_context(self, chat_id: str) -> dict[str, Any]:
+        current = _CURRENT_SEND_CONTEXT.get()
+        if current and str(current.get("chat_id") or "") == str(chat_id):
+            return current
         return self._send_context_by_chat.get(chat_id, {})
 
     def _message_thread_id(self, message: dict[str, Any]) -> str | None:
@@ -2674,13 +2686,16 @@ class TeligramBot:
         user_id = str(from_user.get("id") or "") if isinstance(from_user, dict) else ""
         prior_context = self._send_context_by_chat.get(chat_id)
         self._send_context_by_chat[chat_id] = {
+            "chat_id": chat_id,
             "thread_id": thread_id,
             "reply_to_message_id": message_id,
             "state_id": state_id,
         }
+        token = _CURRENT_SEND_CONTEXT.set(dict(self._send_context_by_chat[chat_id]))
         try:
             await self._handle_update_in_context(update, message, chat_id, state_id, username, user_id)
         finally:
+            _CURRENT_SEND_CONTEXT.reset(token)
             if prior_context is None:
                 self._send_context_by_chat.pop(chat_id, None)
             else:
@@ -2704,7 +2719,6 @@ class TeligramBot:
 
         if not self.is_allowed_chat(chat_id, username):
             LOGGER.warning("Telegram message rejected: unauthorized chat=%s username=%s", chat_id, username or "-")
-            await self.send_message(chat_id, "This chat is not allowed.")
             return
         self.write_last_chat(chat_id, username)
 
@@ -2782,28 +2796,31 @@ class TeligramBot:
 
         conversation = self.conversation(state_id)
         trimmed = text[: self.telegram.max_input_chars]
-        conversation.user(trimmed)
-        typing_task = asyncio.create_task(self.typing_loop(chat_id))
-        try:
-            messages = conversation.export()
-            auto_mode = self.autonomous_tool_mode(trimmed)
-            if auto_mode:
-                LOGGER.info("Telegram autonomous tool mode: mode=%s", auto_mode)
-                evidence = await self.collect_tool_evidence(auto_mode, trimmed)
-                if evidence:
-                    messages = with_last_user_evidence(messages, auto_mode, evidence)
-            reply = await self.call_model(messages)
-            conversation.assistant(reply)
-        finally:
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing_task
+        lock = self._state_locks.setdefault(state_id, asyncio.Lock())
+        async with lock:
+            conversation.user(trimmed)
+            typing_task = asyncio.create_task(self.typing_loop(chat_id))
+            try:
+                messages = conversation.export()
+                auto_mode = self.autonomous_tool_mode(trimmed)
+                if auto_mode:
+                    LOGGER.info("Telegram autonomous tool mode: mode=%s", auto_mode)
+                    evidence = await self.collect_tool_evidence(auto_mode, trimmed)
+                    if evidence:
+                        messages = with_last_user_evidence(messages, auto_mode, evidence)
+                reply = await self.call_model(messages)
+                conversation.assistant(reply)
+            finally:
+                typing_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await typing_task
         if await self.handle_model_image_reply(chat_id, trimmed, reply):
             return
         await self.send_message(chat_id, reply)
 
     def latest_conversation_image_url(self, chat_id: str) -> str | None:
-        state_id = str(self._send_context(chat_id).get("state_id") or chat_id)
+        context = self._send_context(chat_id)
+        state_id = str(context.get("state_id") or chat_id)
         conversation = self.conversations.get(state_id) or self.conversations.get(chat_id)
         if conversation is None:
             return None
@@ -2994,6 +3011,16 @@ class TeligramBot:
             else None
         )
         routine_task = asyncio.create_task(self.routine_loop())
+        update_semaphore = asyncio.Semaphore(TELEGRAM_MAX_PARALLEL_UPDATES)
+        update_tasks: set[asyncio.Task[None]] = set()
+
+        async def run_update(update: dict[str, Any]) -> None:
+            async with update_semaphore:
+                try:
+                    await self.handle_update(update)
+                except Exception:
+                    LOGGER.exception("Telegram update handling failed")
+
         try:
             while True:
                 try:
@@ -3002,10 +3029,9 @@ class TeligramBot:
                         update_id = update.get("update_id")
                         if isinstance(update_id, int):
                             offset = update_id + 1
-                        try:
-                            await self.handle_update(update)
-                        except Exception:
-                            LOGGER.exception("Telegram update handling failed")
+                        task = asyncio.create_task(run_update(update))
+                        update_tasks.add(task)
+                        task.add_done_callback(update_tasks.discard)
                     await asyncio.sleep(self.telegram.poll_interval_seconds)
                 except (httpx.ReadTimeout, httpx.ConnectTimeout, asyncio.TimeoutError):
                     continue
@@ -3018,6 +3044,12 @@ class TeligramBot:
                     LOGGER.exception("Telegram polling loop error")
                     await asyncio.sleep(self.telegram.poll_interval_seconds)
         finally:
+            for task in update_tasks:
+                if not task.done():
+                    task.cancel()
+            if update_tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.gather(*update_tasks, return_exceptions=True)
             routine_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await routine_task
