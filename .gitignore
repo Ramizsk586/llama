@@ -30,3 +30,4 @@ uv.lock
 .ruff_cache
 .runtime
 llama.ngrok.log
+llama.ngrok.pid

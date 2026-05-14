@@ -2279,22 +2279,29 @@ def _cmd_agent_start(home: Path, pid_path: Path, log_path: Path, *, foreground: 
             verbose=False,
         )
     npm = _find_npm()
-    command, use_shell = _npm_agent_command(npm, home)
+    command = _npm_agent_command(npm, home)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if foreground:
         _print_state("run", "starting llama_agent in the current terminal", "36")
-        raise SystemExit(subprocess.run(command, cwd=home, check=False, shell=use_shell).returncode)
+        raise SystemExit(subprocess.run(command, cwd=home, check=False).returncode)
     log_path.write_text("", encoding="utf-8")
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(home),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = _background_creationflags()
+    else:
+        popen_kwargs["start_new_session"] = True
     with log_path.open("a", encoding="utf-8") as handle:
+        popen_kwargs["stdout"] = handle
+        popen_kwargs["stderr"] = handle
         process = subprocess.Popen(
             command,
-            cwd=home,
-            stdin=subprocess.DEVNULL,
-            stdout=handle,
-            stderr=handle,
-            close_fds=True,
-            creationflags=_background_creationflags(),
-            shell=use_shell,
+            **popen_kwargs,
         )
     env = _read_agent_env(home)
     port = env.get("PORT", "3456")
@@ -2341,6 +2348,7 @@ def _cmd_agent_logs(log_path: Path, pid_path: Path, *, follow: bool = True, tail
     if not running and follow:
         _print_state("stop", "llama_agent is not running; showing saved log and exiting", "33")
         follow = False
+    log_path = _resolve_agent_log_path(log_path)
     if not log_path.exists():
         _print_state("warn", f"no llama_agent log found at {log_path}", "33")
         return
@@ -2416,7 +2424,7 @@ def _find_npm() -> str:
     return npm
 
 
-def _npm_agent_command(npm: str, home: Path) -> tuple[list[str] | str, bool]:
+def _npm_agent_command(npm: str, home: Path) -> list[str]:
     """Return a Windows-safe command for the full llama_agent stack."""
     script = "start"
     package_path = home / "package.json"
@@ -2429,8 +2437,71 @@ def _npm_agent_command(npm: str, home: Path) -> tuple[list[str] | str, bool]:
         script = "start"
 
     if os.name == "nt" and Path(npm).suffix.lower() in {".cmd", ".bat"}:
-        return subprocess.list2cmdline([npm, "run", script]), True
-    return [npm, "run", script], False
+        node = _find_node()
+        npm_cli = _npm_cli_js(Path(npm))
+        if node and npm_cli is not None:
+            return [node, str(npm_cli), "run", script]
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        return [comspec, "/d", "/s", "/c", subprocess.list2cmdline([npm, "run", script])]
+    return [npm, "run", script]
+
+
+def _find_node() -> str | None:
+    """Return the Node executable path when available."""
+    node = shutil.which("node") or shutil.which("node.exe")
+    if node:
+        return node
+    if os.name == "nt":
+        node_path = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "nodejs" / "node.exe"
+        if node_path.exists():
+            return str(node_path)
+    return None
+
+
+def _npm_cli_js(npm_cmd: Path) -> Path | None:
+    """Resolve npm.cmd to npm's JS entrypoint so no command shell window is needed."""
+    candidates = [
+        npm_cmd.parent / "node_modules" / "npm" / "bin" / "npm-cli.js",
+    ]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "npm" / "node_modules" / "npm" / "bin" / "npm-cli.js")
+    program_files = os.environ.get("ProgramFiles")
+    if program_files:
+        candidates.append(Path(program_files) / "nodejs" / "node_modules" / "npm" / "bin" / "npm-cli.js")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    try:
+        text = npm_cmd.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    match = re.search(r"(?i)([^\"\r\n]*node_modules[\\/]+npm[\\/]+bin[\\/]+npm-cli\.js)", text)
+    if match:
+        candidate = (npm_cmd.parent / match.group(1)).resolve()
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_agent_log_path(log_path: Path) -> Path:
+    """Prefer the configured capture log, then common app-created logs."""
+    if log_path.exists() and log_path.stat().st_size > 0:
+        return log_path
+    home = log_path.parent
+    for candidate in (
+        log_path,
+        home / "llama-agent.log",
+        home / "llama_agent.log",
+        home / "agent.log",
+        home / "logs" / "agent.log",
+        home / "logs" / "dev.log",
+    ):
+        if candidate.exists() and candidate.stat().st_size > 0:
+            if candidate != log_path:
+                _print_state("info", f"showing agent log at {candidate}", "36")
+            return candidate
+    return log_path
 
 
 def _background_creationflags() -> int:
