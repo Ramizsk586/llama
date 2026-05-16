@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import hmac
 import json
 import logging
@@ -50,6 +51,80 @@ from .tool_management import ToolManager
 DEV_LOG_ENABLED = os.environ.get("LLAMA_DEV_LOG") == "1"
 LOGGER = logging.getLogger("uvicorn.error.llama_bridge.server")
 
+_request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="")
+
+
+def get_request_id() -> str:
+    return _request_id_var.get()
+
+
+class TokenBucketRateLimiter:
+    """Simple token bucket rate limiter for per-IP rate limiting."""
+
+    def __init__(self, rate: float = 60.0, burst: int = 10):
+        self.rate = rate
+        self.burst = burst
+        self._buckets: dict[str, tuple[float, float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def is_allowed(self, key: str) -> bool:
+        now = time.monotonic()
+        async with self._lock:
+            last_check, tokens = self._buckets.get(key, (now, float(self.burst)))
+            elapsed = now - last_check
+            tokens = min(self.burst, tokens + elapsed * self.rate)
+            if tokens >= 1.0:
+                self._buckets[key] = (now, tokens - 1.0)
+                return True
+            self._buckets[key] = (now, tokens)
+            return False
+
+    def get_retry_after(self) -> float:
+        return 1.0 / self.rate
+
+
+_rate_limiter: TokenBucketRateLimiter | None = None
+
+_usage_lock = asyncio.Lock()
+
+
+async def _record_usage(
+    config: BridgeConfig,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    """Append token counts to llama.usage.json. Fire-and-forget safe."""
+    if not model or (input_tokens == 0 and output_tokens == 0):
+        return
+    try:
+        async with _usage_lock:
+            path = config.source_path.parent / "llama.usage.json"
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except (OSError, json.JSONDecodeError):
+                data = {}
+
+            data.setdefault("schema_version", 1)
+            models = data.setdefault("models", {})
+            entry = models.setdefault(model, {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "request_count": 0,
+            })
+            entry["input_tokens"] += input_tokens
+            entry["output_tokens"] += output_tokens
+            entry["total_tokens"] = entry["input_tokens"] + entry["output_tokens"]
+            entry["request_count"] += 1
+            data["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+            tmp = path.with_suffix(".usage.tmp")
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+    except Exception:
+        pass
+
 
 def create_app(
     config_path: Path | None = None,
@@ -82,9 +157,47 @@ def create_app(
     app.state.telegram_task = None
 
     @app.middleware("http")
+    async def request_id_middleware(request: Request, call_next):
+        request_id = str(uuid.uuid4())
+        _request_id_var.set(request_id)
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    @app.middleware("http")
     async def track_activity(request: Request, call_next):
         app.state.last_request_at = time.monotonic()
-        return await call_next(request)
+        start_time = time.monotonic()
+        response = await call_next(request)
+        duration_ms = int((time.monotonic() - start_time) * 1000)
+        if DEV_LOG_ENABLED:
+            LOGGER.info(
+                "request_completed request_id=%s method=%s path=%s status_code=%s duration_ms=%s",
+                get_request_id(),
+                request.method,
+                request.url.path,
+                response.status_code,
+                duration_ms,
+            )
+        return response
+
+    rate_limit_enabled = getattr(config.server, "rate_limit_enabled", False)
+    if rate_limit_enabled:
+        global _rate_limiter
+        rate = getattr(config.server, "rate_limit_rpm", 60.0)
+        burst = getattr(config.server, "rate_limit_burst", 10)
+        _rate_limiter = TokenBucketRateLimiter(rate=rate, burst=burst)
+
+        @app.middleware("http")
+        async def rate_limit_middleware(request: Request, call_next):
+            client_ip = request.client.host if request.client else "unknown"
+            if _rate_limiter and not await _rate_limiter.is_allowed(client_ip):
+                return JSONResponse(
+                    status_code=429,
+                    headers={"Retry-After": str(int(_rate_limiter.get_retry_after()))},
+                    content={"detail": "Rate limit exceeded"},
+                )
+            return await call_next(request)
 
     if idle_timeout_seconds > 0:
         @app.on_event("startup")
@@ -244,6 +357,13 @@ def create_app(
                     _safe_stream(_stream_buffered_openai_completion(data)),
                     media_type="text/event-stream",
                 )
+            _usage = data.get("usage") or {}
+            asyncio.create_task(_record_usage(
+                config,
+                str(body.get("model", "")),
+                int(_usage.get("prompt_tokens", 0)),
+                int(_usage.get("completion_tokens", 0)),
+            ))
             _write_dev_log(config, "openai_chat_response", data)
             return JSONResponse(data)
 
@@ -289,6 +409,13 @@ def create_app(
         except httpx.RequestError as exc:
             _write_dev_log(config, "openai_chat_response_error", {"message": str(exc)})
             return _request_error(exc)
+        _usage = data.get("usage") or {}
+        asyncio.create_task(_record_usage(
+            config,
+            str(body.get("model", "")),
+            int(_usage.get("prompt_tokens", 0)),
+            int(_usage.get("completion_tokens", 0)),
+        ))
         _write_dev_log(config, "openai_chat_response", data)
         return JSONResponse(data)
 
@@ -1467,7 +1594,11 @@ def create_app(
                     },
                 )
                 return StreamingResponse(
-                    _safe_stream(_stream_anthropic_response(provider, body, resolved.upstream_model)),
+                    _safe_stream(_stream_anthropic_response(
+                        provider, body, resolved.upstream_model,
+                        requested_model=body.get("model", resolved.alias),
+                        config=config,
+                    )),
                     media_type="text/event-stream",
                 )
             try:
@@ -1485,7 +1616,15 @@ def create_app(
             except httpx.RequestError as exc:
                 _write_dev_log(config, "anthropic_messages_error", {"message": str(exc)})
                 return _request_error(exc)
-            return JSONResponse(response.json())
+            resp_data = response.json()
+            _usage = resp_data.get("usage") or {}
+            asyncio.create_task(_record_usage(
+                config,
+                body.get("model", resolved.alias),
+                int(_usage.get("input_tokens", 0)),
+                int(_usage.get("output_tokens", 0)),
+            ))
+            return JSONResponse(resp_data)
 
         payload = _with_bridge_tools(
             anthropic_request_to_openai(body, resolved.upstream_model),
@@ -1517,6 +1656,13 @@ def create_app(
         except httpx.RequestError as exc:
             _write_dev_log(config, "anthropic_messages_error", {"message": str(exc)})
             return _request_error(exc)
+        _usage = data.get("usage") or {}
+        asyncio.create_task(_record_usage(
+            config,
+            body.get("model", resolved.alias),
+            int(_usage.get("prompt_tokens", 0)),
+            int(_usage.get("completion_tokens", 0)),
+        ))
         _write_dev_log(config, "anthropic_messages_response", data)
         return JSONResponse(openai_response_to_anthropic(data, resolved.alias, body["model"]))
 
@@ -3955,11 +4101,27 @@ def _ollama_api_base_url(provider: ProviderConfig) -> str:
 
 
 async def _stream_anthropic_response(
-    provider, body: dict[str, Any], upstream_model: str
+    provider, body: dict[str, Any], upstream_model: str,
+    *, requested_model: str = "", config: BridgeConfig | None = None,
 ) -> AsyncIterator[str]:
+    input_tokens = 0
+    output_tokens = 0
     try:
         async for chunk in provider.stream_anthropic_message(body, upstream_model):
             yield chunk
+            if chunk.startswith("data:"):
+                raw = chunk.removeprefix("data:").strip()
+                try:
+                    event = json.loads(raw)
+                    if event.get("type") == "message_stop":
+                        _u = event.get("usage") or {}
+                        input_tokens = int(_u.get("input_tokens", input_tokens))
+                        output_tokens = int(_u.get("output_tokens", output_tokens))
+                    elif event.get("type") == "message_delta":
+                        _u = event.get("usage") or {}
+                        output_tokens = int(_u.get("output_tokens", output_tokens))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
     except httpx.HTTPStatusError as exc:
         message = await _response_error_message(exc.response)
         yield _stream_error_event(message)
@@ -3967,6 +4129,9 @@ async def _stream_anthropic_response(
     except httpx.RequestError as exc:
         yield _stream_error_event(str(exc))
         return
+    finally:
+        if config is not None and requested_model:
+            asyncio.create_task(_record_usage(config, requested_model, input_tokens, output_tokens))
 
 
 async def _stream_openai_response(
@@ -4845,6 +5010,8 @@ async def _stream_response(
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         },
     )
+    if config is not None and requested_model:
+        asyncio.create_task(_record_usage(config, requested_model, input_tokens, output_tokens))
 
 
 async def _response_error_message(response: httpx.Response) -> str:
@@ -4948,20 +5115,20 @@ async def _handle_embedded_telegram_update(
     ):
         await _telegram_send_message(client, telegram.bot_token or "", chat_id, "This chat is not allowed.")
         return
-    _write_telegram_last_chat(app.state.bridge_config, chat_id, chat_username)
+    await _write_telegram_last_chat(app.state.bridge_config, chat_id, chat_username)
 
     canned_response = _telegram_canned_response(text)
     if canned_response is not None:
         await _telegram_send_message(client, telegram.bot_token or "", chat_id, canned_response)
         return
 
-    pending_command = _telegram_pending_command(app.state.bridge_config, chat_id)
+    pending_command = await _telegram_pending_command(app.state.bridge_config, chat_id)
     command_text = text
     if pending_command is not None and not text.startswith("/"):
         command_text = f"/{pending_command} {text}"
-        _clear_telegram_pending_command(app.state.bridge_config, chat_id)
+        await _clear_telegram_pending_command(app.state.bridge_config, chat_id)
 
-    command_response, body, restart_requested = _telegram_command_response(
+    command_response, body, restart_requested = await _telegram_command_response(
         app,
         telegram.system_prompt,
         command_text,
@@ -5161,7 +5328,7 @@ def _telegram_polish_text(text: str) -> str:
     return cleaned or "I couldn't produce a reply."
 
 
-def _telegram_command_response(
+async def _telegram_command_response(
     app: FastAPI,
     system_prompt: str,
     text: str,
@@ -5189,13 +5356,13 @@ def _telegram_command_response(
     if command == "restart":
         return "Restarting the llama server now. Give me a few seconds, then send your next message.", None, True
     if command == "clear":
-        _clear_telegram_pending_command(app.state.bridge_config, chat_id)
+        await _clear_telegram_pending_command(app.state.bridge_config, chat_id)
         return (
             "Done. I cleared the pending command and reset the next request."
         ), None, False
     if command in {"web", "search"}:
         if not argument:
-            _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
+            await _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
             return (
                 "Web search mode is ready.\n\n"
                 "Send the query you want me to search for."
@@ -5213,7 +5380,7 @@ def _telegram_command_response(
         ), False
     if command in {"deep", "deepresearch", "research"}:
         if not argument:
-            _set_telegram_pending_command(app.state.bridge_config, chat_id, "deepresearch")
+            await _set_telegram_pending_command(app.state.bridge_config, chat_id, "deepresearch")
             return (
                 "Deep research mode is ready.\n\n"
                 "Send the topic, question, or problem you want me to research."
@@ -5232,7 +5399,7 @@ def _telegram_command_response(
         ), False
     if command == "summarize":
         if not argument:
-            _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
+            await _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
             return "Summarize mode is ready.\n\nSend the text or topic you want summarized.", None, False
         return None, _telegram_command_body(
             system_prompt,
@@ -5243,7 +5410,7 @@ def _telegram_command_response(
         ), False
     if command == "explain":
         if not argument:
-            _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
+            await _set_telegram_pending_command(app.state.bridge_config, chat_id, command)
             return "Explain mode is ready.\n\nSend the topic you want me to explain.", None, False
         return None, _telegram_command_body(
             system_prompt,
@@ -5342,41 +5509,55 @@ def _write_telegram_state(config: BridgeConfig, payload: dict[str, Any]) -> None
     )
 
 
-def _write_telegram_last_chat(config: BridgeConfig, chat_id: str, chat_username: str) -> None:
-    payload = _read_telegram_state(config)
-    chats = payload.setdefault("chats", {})
-    chat_entry = chats.setdefault(chat_id, {})
-    chat_entry["chat_id"] = chat_id
-    chat_entry["chat_username"] = chat_username
-    chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    payload["chat_id"] = chat_id
-    payload["chat_username"] = chat_username
-    payload["updated_at"] = chat_entry["updated_at"]
-    _write_telegram_state(config, payload)
+_telegram_state_lock = asyncio.Lock()
 
 
-def _set_telegram_pending_command(config: BridgeConfig, chat_id: str, command: str) -> None:
-    payload = _read_telegram_state(config)
-    chats = payload.setdefault("chats", {})
-    chat_entry = chats.setdefault(chat_id, {"chat_id": chat_id})
-    chat_entry["pending_command"] = command
-    chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    _write_telegram_state(config, payload)
+async def _read_telegram_state_async(config: BridgeConfig) -> dict[str, Any]:
+    return await asyncio.to_thread(_read_telegram_state, config)
 
 
-def _clear_telegram_pending_command(config: BridgeConfig, chat_id: str) -> None:
-    payload = _read_telegram_state(config)
-    chats = payload.get("chats") or {}
-    chat_entry = chats.get(chat_id)
-    if not isinstance(chat_entry, dict):
-        return
-    chat_entry.pop("pending_command", None)
-    chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    _write_telegram_state(config, payload)
+async def _write_telegram_state_async(config: BridgeConfig, payload: dict[str, Any]) -> None:
+    await asyncio.to_thread(_write_telegram_state, config, payload)
 
 
-def _telegram_pending_command(config: BridgeConfig, chat_id: str) -> str | None:
-    payload = _read_telegram_state(config)
+async def _write_telegram_last_chat(config: BridgeConfig, chat_id: str, chat_username: str) -> None:
+    async with _telegram_state_lock:
+        payload = await _read_telegram_state_async(config)
+        chats = payload.setdefault("chats", {})
+        chat_entry = chats.setdefault(chat_id, {})
+        chat_entry["chat_id"] = chat_id
+        chat_entry["chat_username"] = chat_username
+        chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        payload["chat_id"] = chat_id
+        payload["chat_username"] = chat_username
+        payload["updated_at"] = chat_entry["updated_at"]
+        await _write_telegram_state_async(config, payload)
+
+
+async def _set_telegram_pending_command(config: BridgeConfig, chat_id: str, command: str) -> None:
+    async with _telegram_state_lock:
+        payload = await _read_telegram_state_async(config)
+        chats = payload.setdefault("chats", {})
+        chat_entry = chats.setdefault(chat_id, {"chat_id": chat_id})
+        chat_entry["pending_command"] = command
+        chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        await _write_telegram_state_async(config, payload)
+
+
+async def _clear_telegram_pending_command(config: BridgeConfig, chat_id: str) -> None:
+    async with _telegram_state_lock:
+        payload = await _read_telegram_state_async(config)
+        chats = payload.get("chats") or {}
+        chat_entry = chats.get(chat_id)
+        if not isinstance(chat_entry, dict):
+            return
+        chat_entry.pop("pending_command", None)
+        chat_entry["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        await _write_telegram_state_async(config, payload)
+
+
+async def _telegram_pending_command(config: BridgeConfig, chat_id: str) -> str | None:
+    payload = await _read_telegram_state_async(config)
     chats = payload.get("chats") or {}
     chat_entry = chats.get(chat_id)
     if not isinstance(chat_entry, dict):

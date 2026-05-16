@@ -17,8 +17,6 @@ import warnings
 from dataclasses import dataclass, replace
 from collections.abc import Callable
 from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 from pathlib import Path
 
 import httpx
@@ -545,6 +543,9 @@ def main() -> None:
                 _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
             )
             return
+        if args.command == "usage":
+            _cmd_usage(_arg_path(args.config), args.watch, args.json)
+            return
         if args.command == "api":
             if args.limits or args.limets or args.api_command == "limits":
                 _cmd_api_limits(_arg_path(args.config))
@@ -909,6 +910,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="show intent, selected tools, rejected tools, and provider availability",
     )
     tools_diagnose_cmd.add_argument("query")
+
+    usage_cmd = subparsers.add_parser("usage", help="show token usage per model")
+    usage_cmd.add_argument("--config")
+    usage_cmd.add_argument("--watch", action="store_true", help="refresh every 2 seconds")
+    usage_cmd.add_argument("--json", action="store_true", help="print raw JSON and exit")
 
     subparsers.add_parser("mcp-tools", help="run the bridge tools MCP adapter")
 
@@ -2482,6 +2488,118 @@ def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
     if log_path.exists():
         rows.append(("log size", f"{log_path.stat().st_size} bytes"))
     _kv_rows(rows)
+
+
+def _cmd_usage(config_path: Path | None, watch: bool, json_output: bool) -> None:
+    if config_path is None:
+        config_path = _default_config_path()
+    usage_file = config_path.parent / "llama.usage.json"
+
+    if json_output:
+        if not usage_file.exists():
+            print("{}")
+            return
+        try:
+            print(usage_file.read_text(encoding="utf-8"))
+        except Exception:
+            print("{}")
+        return
+
+    if not usage_file.exists() or usage_file.stat().st_size == 0:
+        print("No usage data yet. Run some requests first.")
+        return
+
+    try:
+        data = json.loads(usage_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        print("No usage data yet. Run some requests first.")
+        return
+
+    models = data.get("models", {})
+    if not models:
+        print("No usage data yet. Run some requests first.")
+        return
+
+    if watch:
+        _run_usage_watch(usage_file)
+    else:
+        _print_usage_table(data)
+
+
+def _run_usage_watch(usage_file: Path) -> None:
+    import time
+
+    try:
+        while True:
+            os.system("cls" if os.name == "nt" else "clear")
+            print("llama usage  (refreshing every 2s — press Ctrl+C to stop)\n")
+            if usage_file.exists():
+                try:
+                    data = json.loads(usage_file.read_text(encoding="utf-8"))
+                    _print_usage_table(data)
+                except (json.JSONDecodeError, OSError):
+                    print("No usage data yet. Run some requests first.")
+            else:
+                print("No usage data yet. Run some requests first.")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        return
+
+
+def _print_usage_table(data: dict[str, Any]) -> None:
+    models = data.get("models", {})
+    if not models:
+        print("No usage data yet. Run some requests first.")
+        return
+
+    def fmt_num(n: int) -> str:
+        return f"{n:,}"
+
+    col_widths = {
+        "model": 30,
+        "input": 14,
+        "output": 14,
+        "total": 14,
+        "requests": 12,
+    }
+
+    rows = []
+    totals = {"input": 0, "output": 0, "total": 0, "requests": 0}
+    for name, info in sorted(models.items()):
+        input_t = info.get("input_tokens", 0)
+        output_t = info.get("output_tokens", 0)
+        total_t = info.get("total_tokens", 0)
+        reqs = info.get("request_count", 0)
+        rows.append((name, input_t, output_t, total_t, reqs))
+        totals["input"] += input_t
+        totals["output"] += output_t
+        totals["total"] += total_t
+        totals["requests"] += reqs
+
+    name_width = col_widths["model"]
+    for name, _, _, _, _ in rows:
+        name_width = max(name_width, len(name) + 2)
+    col_widths["model"] = name_width
+
+    bar = "═" * (name_width + 1 + col_widths["input"] + 1 + col_widths["output"] + 1 + col_widths["total"] + 1 + col_widths["requests"] + 1)
+
+    print(f"╔{bar}╗")
+    header = f"║ {'Model':<{name_width}} ║ {'Input Tokens':^{col_widths['input']}} ║ {'Output Tokens':^{col_widths['output']}} ║ {'Total Tokens':^{col_widths['total']}} ║ {'Requests':^{col_widths['requests']}} ║"
+    print(header)
+    print(f"╠{bar}╣")
+
+    for name, input_t, output_t, total_t, reqs in rows:
+        row = f"║ {name:<{name_width}} ║ {fmt_num(input_t):>{col_widths['input']}} ║ {fmt_num(output_t):>{col_widths['output']}} ║ {fmt_num(total_t):>{col_widths['total']}} ║ {fmt_num(reqs):>{col_widths['requests']}} ║"
+        print(row)
+
+    print(f"╠{bar}╣")
+    total_row = f"║ {'TOTAL':<{name_width}} ║ {fmt_num(totals['input']):>{col_widths['input']}} ║ {fmt_num(totals['output']):>{col_widths['output']}} ║ {fmt_num(totals['total']):>{col_widths['total']}} ║ {fmt_num(totals['requests']):>{col_widths['requests']}} ║"
+    print(total_row)
+    print(f"╚{bar}╝")
+
+    updated_at = data.get("updated_at", "")
+    if updated_at:
+        print(f"Updated: {updated_at}")
 
 
 def _cmd_info(config_path: Path) -> None:
@@ -6611,18 +6729,19 @@ def _server_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
 
-def _http_status(url: str, path: str = "/health") -> str:
+async def _http_status_async(url: str, path: str = "/health") -> str:
     try:
-        request = Request(f"{url.rstrip('/')}{path}", method="GET")
-        with urlopen(request, timeout=1) as response:
-            return f"ok ({response.status})"
-    except URLError as exc:
-        reason = getattr(exc, "reason", exc)
-        return f"unreachable ({reason})"
-    except TimeoutError:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            response = await client.get(f"{url.rstrip('/')}{path}")
+            return f"ok ({response.status_code})"
+    except httpx.TimeoutException:
         return "unreachable (timeout)"
-    except OSError as exc:
+    except httpx.RequestError as exc:
         return f"unreachable ({exc})"
+
+
+def _http_status(url: str, path: str = "/health") -> str:
+    return asyncio.run(_http_status_async(url, path))
 
 
 def _serve_command(

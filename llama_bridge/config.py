@@ -87,9 +87,6 @@ server:
   # Set to 0 to keep running until `llama stop`.
   idle_timeout_seconds: 180
 
-  # Optional second port without built-in tools (for Open Web UI etc.)
-  # openwebui_port: 8090
-
 
 # =============================================================================
 #                           NGROK CONFIG
@@ -114,6 +111,11 @@ ngrok:
 #    openai_compatible | sarvamai | kilo | opencode
 #
 #  Use ${VAR_NAME} for sensitive values (API keys, tokens).
+#
+#  Fallback API (optional):
+#    - fallback_url: Backup API endpoint (used when primary returns 429 rate limit)
+#    - fallback_api_key: API key for the fallback endpoint
+#    Server automatically switches to fallback when primary hits rate limit.
 # =============================================================================
 
 providers:
@@ -140,6 +142,8 @@ providers:
     type: ollama_cloud
     base_url: https://ollama.com
     api_key: ${OLLAMA_API_KEY}
+    fallback_url: null
+    fallback_api_key: ${OLLAMA_FALLBACK_API_KEY}
     supports_tools: true
     default_model: gemma4:31b
     usage_limits:
@@ -238,6 +242,8 @@ providers:
     type: opencode
     base_url: https://opencode.ai/zen
     api_key: ${OPENCODE_API_KEY}
+    fallback_url: null
+    fallback_api_key: ${OPENCODE_FALLBACK_API_KEY}
     supports_tools: true
     default_model: opencode/auto
 
@@ -553,6 +559,8 @@ class ProviderConfig:
     extra_body: dict[str, Any] = field(default_factory=dict)
     usage_limits: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_limits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    fallback_url: str | None = None
+    fallback_api_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -1387,6 +1395,8 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             extra_body=value.get("extra_body", {}) or {},
             usage_limits=value.get("usage_limits", {}) or {},
             model_limits=value.get("model_limits", {}) or {},
+            fallback_url=value.get("fallback_url"),
+            fallback_api_key=value.get("fallback_api_key"),
         )
 
     aliases: dict[str, ModelAlias] = {}

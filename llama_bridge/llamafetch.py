@@ -235,7 +235,6 @@ def _get_info_rows(config_path: Path, max_width: int) -> list[str]:
         *_row("Models", str(len(models)) if cfg else "not loaded", max_width),
         *_row("Providers", _summarize_names(providers) if providers else "not loaded", max_width),
         *_row("Ollama", _check_service("ollama"), max_width),
-        *_row("OpenClaw", _check_service("openclaw"), max_width),
         *_row("CPU", _get_cpu(), max_width),
     ]
     memory = _get_memory()
@@ -361,13 +360,6 @@ def _check_service(name: str) -> str:
         if not shutil.which("ollama"):
             return f"{GRAY}not found{RESET}"
         if _http_ok("http://127.0.0.1:11434/api/version"):
-            return f"{GREEN}running {CHECK}{RESET}"
-        return f"{RED}stopped {CROSS}{RESET}"
-
-    if name == "openclaw":
-        if not shutil.which("openclaw"):
-            return f"{GRAY}not found{RESET}"
-        if _process_running("openclaw"):
             return f"{GREEN}running {CHECK}{RESET}"
         return f"{RED}stopped {CROSS}{RESET}"
 

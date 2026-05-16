@@ -441,7 +441,6 @@ class LlamaControlCenter:
             ("Codex", "codex", ["provider", "model", "config_path"]),
             ("Copilot CLI", "copilot_cli", ["provider", "model"]),
             ("OpenCode", "opencode", ["provider", "model"]),
-            ("OpenClaw", "openclaw", ["provider", "model"]),
             ("Poolside", "poolside", ["provider", "model"]),
         ]
         self._cli_vars: dict[str, dict[str, Any]] = {}
@@ -673,7 +672,7 @@ class LlamaControlCenter:
                 if provider.api_key and not provider.api_key.startswith("${")
             )
             tools_ready = sum(
-                1 for tool in [cfg.pi, cfg.codex, cfg.copilot_cli, cfg.opencode, cfg.openclaw, cfg.poolside]
+                1 for tool in [cfg.pi, cfg.codex, cfg.copilot_cli, cfg.opencode, cfg.poolside]
                 if tool.provider and tool.provider in cfg.providers
             )
             values = {
@@ -923,7 +922,7 @@ class LlamaControlCenter:
         tools_configured = 0
         tool_names = []
         for name, tool in [("Pi", cfg.pi), ("Codex", cfg.codex), ("Copilot", cfg.copilot_cli),
-                           ("OpenCode", cfg.opencode), ("OpenClaw", cfg.openclaw), ("Poolside", cfg.poolside)]:
+                           ("OpenCode", cfg.opencode), ("Poolside", cfg.poolside)]:
             if tool.provider and tool.provider in cfg.providers:
                 tools_configured += 1
                 tool_names.append(name)
@@ -1264,7 +1263,6 @@ class CliToolsDialog:
             ("Codex", "codex", ["provider", "model", "config_path", "profile"]),
             ("Copilot CLI", "copilot_cli", ["provider", "model", "wire_api", "max_prompt_tokens", "max_output_tokens"]),
             ("OpenCode", "opencode", ["provider", "model", "config_path", "context_size", "output_tokens"]),
-            ("OpenClaw", "openclaw", ["provider", "model", "config_path", "workspace", "sandbox_backend"]),
             ("Poolside", "poolside", ["provider", "model", "api_url", "config_path"]),
         ]
 
