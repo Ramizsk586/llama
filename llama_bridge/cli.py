@@ -17,8 +17,6 @@ import warnings
 from dataclasses import dataclass, replace
 from collections.abc import Callable
 from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 from pathlib import Path
 
 import httpx
@@ -36,24 +34,15 @@ from .config import (
     load_config,
     codex_model_error,
     copilot_cli_model_error,
-    openclaw_model_error,
     opencode_model_error,
     pi_model_error,
     resolve_codex_model,
     resolve_copilot_cli_model,
-    resolve_openclaw_model,
     resolve_opencode_model,
     resolve_pi_model,
     write_claude_api_settings,
     write_config_data,
     write_default_config,
-)
-from .llama_claw import (
-    ensure_openclaw_safety_config,
-    find_ollama_executable,
-    find_openclaw_executable,
-    run_ollama_openclaw,
-    run_openclaw_command,
 )
 from .llamafetch import print_llamafetch
 from .master import MasterReviewer
@@ -533,19 +522,7 @@ def main() -> None:
                 0 if args.forever else _configured_idle_timeout_seconds(config),
             )
             return
-        if args.command == "logs":
-            config_path = _arg_path(args.config) if args.config else _default_config_path()
-            _cmd_logs(
-                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-                args.follow,
-                args.clear,
-                args.dev,
-                config_path,
-                args.tail,
-                use_active=not args.config and not args.log_file and not args.pid_file,
-            )
-            return
+
         if args.command == "status":
             config_path = _arg_path(args.config)
             _cmd_status(
@@ -553,6 +530,9 @@ def main() -> None:
                 _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
                 _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
             )
+            return
+        if args.command == "usage":
+            _cmd_usage(_arg_path(args.config), args.watch, args.json)
             return
         if args.command == "api":
             if args.limits or args.limets or args.api_command == "limits":
@@ -581,16 +561,6 @@ def main() -> None:
             return
         if args.command == "mcp-tools":
             mcp_tools_main()
-            return
-        if args.command == "master-review":
-            _cmd_master_review(
-                _arg_path(args.config),
-                report_path=Path(args.report_json) if args.report_json else None,
-                mode=args.mode,
-                use_stdin=args.stdin,
-                check_keys=args.check_keys,
-                write_reviewed=Path(args.write_reviewed) if args.write_reviewed else None,
-            )
             return
         if args.command == "pi":
             config_path = _arg_path(args.config)
@@ -656,22 +626,6 @@ def main() -> None:
                 dev=args.dev,
             )
             return
-        if args.command == "openclaw":
-            config_path = _arg_path(args.config)
-            _cmd_openclaw(
-                config_path,
-                openclaw_command=args.openclaw_command,
-                openclaw_args=args.openclaw_args,
-                provider_override=args.provider,
-                model_override=args.model,
-                config_path_override=args.openclaw_config,
-                workspace_override=args.workspace,
-                workspace_access=args.workspace_access,
-                sandbox_backend=args.sandbox_backend,
-                yes=not args.no_yes,
-                prepare_only=args.prepare_only,
-            )
-            return
         if args.command == "poolside":
             config_path = _arg_path(args.config)
             _cmd_poolside(
@@ -700,17 +654,10 @@ def main() -> None:
                 remove_target=args.rm,
             )
             return
-        if args.command in ("gui", "control-center", "cc"):
-            config_path = _arg_path(args.config)
-            _cmd_llama_gui(config_path)
-            return
         if args.command == "bot":
             config_path = _arg_path(getattr(args, "bot_run_config", None) or args.config)
             if args.bot_command in {None, "setup"}:
                 _cmd_bot_setup(config_path)
-                return
-            if args.bot_command == "gui":
-                _cmd_bot_gui(config_path)
                 return
             if args.bot_command == "run":
                 from .teligram import run_teligram
@@ -748,36 +695,6 @@ def main() -> None:
                 _cmd_openapi_validate(config_path)
                 return
             parser.print_help()
-            return
-
-        if args.command in ("openwebui", "webui", "owui"):
-            config_path = _arg_path(args.config)
-            sub = args.owui_command
-            if sub is None or sub == "gui":
-                _cmd_openwebui_gui(config_path)
-                return
-            if sub == "start":
-                _cmd_openwebui_start(config_path, auth=args.auth, web_search=args.web_search, provider=args.provider)
-                return
-            if sub == "stop":
-                _cmd_openwebui_stop(config_path)
-                return
-            if sub == "restart":
-                _cmd_openwebui_restart(config_path)
-                return
-            if sub == "status":
-                _cmd_openwebui_status(config_path)
-                return
-            if sub == "logs":
-                _cmd_openwebui_logs(config_path)
-                return
-            if sub == "test-search":
-                _cmd_openwebui_test_search(config_path, args.query)
-                return
-            if sub == "configure":
-                _cmd_openwebui_configure(config_path)
-                return
-            _print_state("warn", f"Unknown openwebui subcommand: {sub}", "33")
             return
 
         parser.print_help()
@@ -871,19 +788,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="show Pi request and model response developer logs",
     )
     logs_cmd.add_argument(
-        "-f",
-        "--follow",
-        action="store_true",
-        default=True,
-        help="keep printing new log lines (default)",
-    )
-    logs_cmd.add_argument(
-        "--no-follow",
-        dest="follow",
-        action="store_false",
-        help="show the current log and exit",
-    )
-    logs_cmd.add_argument(
         "--tail",
         type=int,
         default=200,
@@ -975,30 +879,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     tools_diagnose_cmd.add_argument("query")
 
-    subparsers.add_parser("mcp-tools", help="run the bridge tools MCP adapter")
+    usage_cmd = subparsers.add_parser("usage", help="show token usage per model")
+    usage_cmd.add_argument("--config")
+    usage_cmd.add_argument("--watch", action="store_true", help="refresh every 2 seconds")
+    usage_cmd.add_argument("--json", action="store_true", help="print raw JSON and exit")
 
-    master_cmd = subparsers.add_parser(
-        "master-review",
-        help="review a deep/source research JSON report and print final improvement instructions",
-    )
-    master_cmd.add_argument("report_json", nargs="?", help="path to deep/source research JSON")
-    master_cmd.add_argument("--config")
-    master_cmd.add_argument(
-        "--mode",
-        choices=["fast", "balanced", "strict"],
-        default=None,
-        help="review depth override",
-    )
-    master_cmd.add_argument("--stdin", action="store_true", help="read research JSON from stdin")
-    master_cmd.add_argument(
-        "--check-keys",
-        action="store_true",
-        help="show configured Groq key slots without revealing key values",
-    )
-    master_cmd.add_argument(
-        "--write-reviewed",
-        help="write the revised draft to this path when the review produces one",
-    )
+    subparsers.add_parser("mcp-tools", help="run the bridge tools MCP adapter")
 
     subparsers.add_parser(
         "endpoints",
@@ -1133,50 +1019,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="extra arguments passed to opencode",
     )
 
-    openclaw_cmd = subparsers.add_parser(
-        "openclaw",
-        help="configure and launch OpenClaw through Ollama with llama safety defaults",
-    )
-    openclaw_cmd.add_argument(
-        "openclaw_command",
-        nargs="?",
-        choices=["launch", "configure", "channels", "stop", "status", "sandbox-explain"],
-        default="launch",
-        help="OpenClaw action to run (default: launch)",
-    )
-    openclaw_cmd.add_argument("--config")
-    openclaw_cmd.add_argument("--openclaw-config", help="managed OpenClaw config path")
-    openclaw_cmd.add_argument("--provider", help="provider name from env.yml to choose the OpenClaw model")
-    openclaw_cmd.add_argument("--model", help="Ollama model name to use for OpenClaw")
-    openclaw_cmd.add_argument("--workspace", help="dedicated OpenClaw workspace directory")
-    openclaw_cmd.add_argument(
-        "--workspace-access",
-        choices=["none", "ro", "rw"],
-        default=None,
-        help="sandbox access to the OpenClaw workspace (default: env.yml openclaw.workspace_access)",
-    )
-    openclaw_cmd.add_argument(
-        "--sandbox-backend",
-        choices=["docker", "ssh", "openshell"],
-        default=None,
-        help="OpenClaw sandbox backend (default: env.yml openclaw.sandbox_backend)",
-    )
-    openclaw_cmd.add_argument(
-        "--no-yes",
-        action="store_true",
-        help="do not pass --yes to ollama launch openclaw",
-    )
-    openclaw_cmd.add_argument(
-        "--prepare-only",
-        action="store_true",
-        help="write the managed OpenClaw safety config and exit",
-    )
-    openclaw_cmd.add_argument(
-        "openclaw_args",
-        nargs=argparse.REMAINDER,
-        help="extra arguments passed to Ollama/OpenClaw after --",
-    )
-
     poolside_cmd = subparsers.add_parser(
         "poolside",
         help="install and launch Poolside Agent CLI",
@@ -1252,11 +1094,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     bot_cmd = subparsers.add_parser(
         "bot",
-        help="Telegram bot setup and GUI",
+        help="Telegram bot setup",
     )
     bot_cmd.add_argument("--config")
     bot_subparsers = bot_cmd.add_subparsers(dest="bot_command")
-    bot_subparsers.add_parser("gui", help="launch the Telegram Bot Setup Center GUI")
     bot_subparsers.add_parser("setup", help="run the Telegram bot setup workflow")
     bot_run_cmd = bot_subparsers.add_parser("run", help="run the Teligram polling bot")
     bot_run_cmd.add_argument("--config", dest="bot_run_config", help="path to env.yml")
@@ -1270,33 +1111,6 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_send_ai.add_argument("message", nargs="+", help="prompt for the AI message")
     bot_subparsers.add_parser("test-token", help="test Telegram bot token via getMe")
     bot_subparsers.add_parser("logs", help="show last 50 lines of Telegram bot log")
-
-    gui_cmd = subparsers.add_parser(
-        "gui",
-        help="Llama Bridge Control Center - manage server, providers, CLI tools via compact GUI",
-        aliases=["control-center", "cc"],
-    )
-    gui_cmd.add_argument("--config")
-
-    owui_cmd = subparsers.add_parser(
-        "openwebui",
-        help="Open WebUI Setup Center - manage Open WebUI and bridge together",
-        aliases=["webui", "owui"],
-    )
-    owui_cmd.add_argument("--config")
-    owui_sub = owui_cmd.add_subparsers(dest="owui_command")
-    owui_sub.add_parser("gui", help="launch the Open WebUI Setup Center GUI")
-    owui_start = owui_sub.add_parser("start", help="start Open WebUI (with bridge if needed)")
-    owui_start.add_argument("--auth", choices=["on", "off"], default=None, help="enable/disable authentication")
-    owui_start.add_argument("--web-search", choices=["on", "off"], default=None, help="enable/disable web search")
-    owui_start.add_argument("--provider", choices=["ollama", "tavily", "serpapi", "searchapi", "disabled"], default=None, help="web search provider")
-    owui_sub.add_parser("stop", help="stop Open WebUI")
-    owui_sub.add_parser("restart", help="restart Open WebUI")
-    owui_sub.add_parser("status", help="show Open WebUI and bridge status")
-    owui_sub.add_parser("logs", help="show Open WebUI logs")
-    owui_test = owui_sub.add_parser("test-search", help="test web search provider connectivity")
-    owui_test.add_argument("query", nargs="?", default="Open WebUI test search", help="search query to test with")
-    owui_sub.add_parser("configure", help="interactive Open WebUI configuration (CLI)")
 
     return parser
 
@@ -1390,7 +1204,7 @@ def _cmd_configure(config_path: Path) -> None:
         for alias_name in ("haiku", "sonnet", "opus"):
             aliases[alias_name] = {"provider": selected_provider, "model": model_value}
 
-    for section_name in ("pi", "codex", "copilot_cli", "opencode", "openclaw", "poolside", "telegram"):
+    for section_name in ("pi", "codex", "copilot_cli", "opencode", "poolside", "telegram"):
         section = raw.setdefault(section_name, {})
         if _prompt_yes_no(f"Use {selected_provider} for {section_name}?", default=False):
             section["provider"] = selected_provider
@@ -2636,6 +2450,118 @@ def _cmd_status(config_path: Path, pid_path: Path, log_path: Path) -> None:
     _kv_rows(rows)
 
 
+def _cmd_usage(config_path: Path | None, watch: bool, json_output: bool) -> None:
+    if config_path is None:
+        config_path = _default_config_path()
+    usage_file = config_path.parent / "llama.usage.json"
+
+    if json_output:
+        if not usage_file.exists():
+            print("{}")
+            return
+        try:
+            print(usage_file.read_text(encoding="utf-8"))
+        except Exception:
+            print("{}")
+        return
+
+    if not usage_file.exists() or usage_file.stat().st_size == 0:
+        print("No usage data yet. Run some requests first.")
+        return
+
+    try:
+        data = json.loads(usage_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        print("No usage data yet. Run some requests first.")
+        return
+
+    models = data.get("models", {})
+    if not models:
+        print("No usage data yet. Run some requests first.")
+        return
+
+    if watch:
+        _run_usage_watch(usage_file)
+    else:
+        _print_usage_table(data)
+
+
+def _run_usage_watch(usage_file: Path) -> None:
+    import time
+
+    try:
+        while True:
+            os.system("cls" if os.name == "nt" else "clear")
+            print("llama usage  (refreshing every 2s — press Ctrl+C to stop)\n")
+            if usage_file.exists():
+                try:
+                    data = json.loads(usage_file.read_text(encoding="utf-8"))
+                    _print_usage_table(data)
+                except (json.JSONDecodeError, OSError):
+                    print("No usage data yet. Run some requests first.")
+            else:
+                print("No usage data yet. Run some requests first.")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        return
+
+
+def _print_usage_table(data: dict[str, Any]) -> None:
+    models = data.get("models", {})
+    if not models:
+        print("No usage data yet. Run some requests first.")
+        return
+
+    def fmt_num(n: int) -> str:
+        return f"{n:,}"
+
+    col_widths = {
+        "model": 30,
+        "input": 14,
+        "output": 14,
+        "total": 14,
+        "requests": 12,
+    }
+
+    rows = []
+    totals = {"input": 0, "output": 0, "total": 0, "requests": 0}
+    for name, info in sorted(models.items()):
+        input_t = info.get("input_tokens", 0)
+        output_t = info.get("output_tokens", 0)
+        total_t = info.get("total_tokens", 0)
+        reqs = info.get("request_count", 0)
+        rows.append((name, input_t, output_t, total_t, reqs))
+        totals["input"] += input_t
+        totals["output"] += output_t
+        totals["total"] += total_t
+        totals["requests"] += reqs
+
+    name_width = col_widths["model"]
+    for name, _, _, _, _ in rows:
+        name_width = max(name_width, len(name) + 2)
+    col_widths["model"] = name_width
+
+    bar = "═" * (name_width + 1 + col_widths["input"] + 1 + col_widths["output"] + 1 + col_widths["total"] + 1 + col_widths["requests"] + 1)
+
+    print(f"╔{bar}╗")
+    header = f"║ {'Model':<{name_width}} ║ {'Input Tokens':^{col_widths['input']}} ║ {'Output Tokens':^{col_widths['output']}} ║ {'Total Tokens':^{col_widths['total']}} ║ {'Requests':^{col_widths['requests']}} ║"
+    print(header)
+    print(f"╠{bar}╣")
+
+    for name, input_t, output_t, total_t, reqs in rows:
+        row = f"║ {name:<{name_width}} ║ {fmt_num(input_t):>{col_widths['input']}} ║ {fmt_num(output_t):>{col_widths['output']}} ║ {fmt_num(total_t):>{col_widths['total']}} ║ {fmt_num(reqs):>{col_widths['requests']}} ║"
+        print(row)
+
+    print(f"╠{bar}╣")
+    total_row = f"║ {'TOTAL':<{name_width}} ║ {fmt_num(totals['input']):>{col_widths['input']}} ║ {fmt_num(totals['output']):>{col_widths['output']}} ║ {fmt_num(totals['total']):>{col_widths['total']}} ║ {fmt_num(totals['requests']):>{col_widths['requests']}} ║"
+    print(total_row)
+    print(f"╚{bar}╝")
+
+    updated_at = data.get("updated_at", "")
+    if updated_at:
+        print(f"Updated: {updated_at}")
+
+
 def _cmd_info(config_path: Path) -> None:
     print_llamafetch(config_path)
 
@@ -3272,36 +3198,6 @@ def _cmd_bot_logs(config_path: Path) -> None:
         print(line)
 
 
-def _cmd_bot_gui(config_path: Path) -> None:
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.kernel32.FreeConsole()
-        except Exception:
-            pass
-    from .telegram_setup_gui import HAS_TK as _HAS_TK
-    if not _HAS_TK:
-        raise SystemExit("Tkinter is not available. Install python-tk or python3-tk.")
-    from .telegram_setup_gui import TelegramSetupCenter
-    app = TelegramSetupCenter(config_path)
-    app.run()
-
-
-def _cmd_llama_gui(config_path: Path) -> None:
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.kernel32.FreeConsole()
-        except Exception:
-            pass
-    from .llama_gui import HAS_TK as _HAS_TK
-    if not _HAS_TK:
-        raise SystemExit("Tkinter is not available. Install python-tk or python3-tk.")
-    from .llama_gui import LlamaControlCenter
-    app = LlamaControlCenter(config_path)
-    app.run()
-
-
 def _render_api_limits_screen(config) -> None:
     _clear_screen()
     _title("llama api limits")
@@ -3602,98 +3498,6 @@ def _cmd_tools_diagnose(config_path: Path, query: str) -> None:
         asyncio.run(registry.aclose())
 
 
-def _cmd_master_review(
-    config_path: Path,
-    *,
-    report_path: Path | None,
-    mode: str | None,
-    use_stdin: bool,
-    check_keys: bool,
-    write_reviewed: Path | None = None,
-) -> None:
-    config = load_config(config_path)
-    if check_keys:
-        _title("Master Review Keys")
-        keys = config.master_review.groq.api_keys
-        rows: list[tuple[str, str | int]] = [
-            ("enabled", str(config.master_review.enabled)),
-            ("groq enabled", str(config.master_review.groq.enabled)),
-            ("model", config.master_review.groq.model),
-            ("configured keys", len(keys)),
-        ]
-        _kv_rows(rows)
-        for index, key in enumerate(keys, start=1):
-            print(f"- groq_key_{index}: {_configured_label(key)}")
-        if not keys:
-            _print_state("warn", "no Groq keys configured; fallback review will be used", "33")
-        return
-
-    if use_stdin:
-        raw_text = sys.stdin.read()
-        output_dir = Path.cwd()
-    elif report_path is not None:
-        raw_text = report_path.read_text(encoding="utf-8")
-        output_dir = report_path.resolve().parent
-    else:
-        raise SystemExit("Provide report_json, use --stdin, or pass --check-keys.")
-
-    try:
-        research_result = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"research JSON is invalid: {exc}") from exc
-    if not isinstance(research_result, dict):
-        raise SystemExit("research JSON must be an object")
-
-    review = asyncio.run(_run_master_review_once(config.master_review, research_result, mode))
-
-    data = review.get("data", {}) if isinstance(review.get("data"), dict) else {}
-    final_review = data.get("final_review", {}) if isinstance(data.get("final_review"), dict) else {}
-    metadata = review.get("metadata", {}) if isinstance(review.get("metadata"), dict) else {}
-    instructions = str(data.get("final_llm_instructions") or "")
-    instructions_path = output_dir / "master_review_instructions.txt"
-    instructions_path.write_text(instructions + "\n", encoding="utf-8")
-    if write_reviewed is not None and data.get("revised_draft"):
-        write_reviewed.write_text(str(data.get("revised_draft")) + "\n", encoding="utf-8")
-
-    _title("Master Review")
-    _kv_rows(
-        [
-            ("Quality score", f"{data.get('quality_score', 'n/a')} / 10"),
-            ("Risk level", str(data.get("risk_level", "unknown"))),
-            ("Groq keys configured", len(config.master_review.groq.api_keys)),
-            ("Groq keys used", ", ".join(metadata.get("groq_keys_used") or []) or "none"),
-            ("Fallback used", str(metadata.get("fallback_used", False)).lower()),
-        ]
-    )
-    _print_cli_list("Must fix", final_review.get("must_fix", []))
-    _print_cli_list("Weak sources", final_review.get("weak_sources", []))
-    _print_cli_list("Unsupported claims", final_review.get("unsupported_claims", []))
-    print()
-    print("Final LLM instructions:")
-    print(instructions or "none")
-    print()
-    print(f"Final LLM instructions written to: {instructions_path}")
-    if write_reviewed is not None and data.get("revised_draft"):
-        print(f"Reviewed answer written to: {write_reviewed}")
-
-
-def _print_cli_list(title: str, values: Any, *, limit: int = 8) -> None:
-    items = values if isinstance(values, list) else []
-    print()
-    print(f"{title}:")
-    if not items:
-        print("- none")
-        return
-    for item in items[:limit]:
-        print(f"- {str(item)[:500]}")
-
-
-async def _run_master_review_once(master_config, research_result: dict[str, Any], mode: str | None) -> dict[str, Any]:
-    reviewer = MasterReviewer(master_config)
-    try:
-        return await reviewer.review_deep_research(research_result, mode=mode)
-    finally:
-        await reviewer.aclose()
 
 
 def _configured_label(value: str | None) -> str:
@@ -4410,7 +4214,7 @@ def _verify_mcp_server_tools(config) -> None:
 def _bridge_tools_skill(host_name: str) -> str:
     return f"""---
 name: llama-bridge-tools
-description: Use when {host_name} needs llama bridge MCP tools for deep research, current web search, source verification, image research, weather, Wikipedia, or date/time lookups.
+description: Use when {host_name} needs llama bridge MCP tools for current web search, source verification, image research, weather, Wikipedia, or date/time lookups.
 ---
 
 # Llama Bridge Tools
@@ -4421,19 +4225,6 @@ lookups.
 
 Prefer the highest-level bridge tool that fits the task:
 
-- For `/deep` and deep research, only call tools whose names contain `deep`.
-  Start with `deep` or `deep_plan_agent`; do not use normal search, source,
-  image, Wikipedia, weather, or time tools for `/deep`. Use the staged flow:
-  `deep_plan_agent`, then
-  `deep_collect_agent` for single-agent collection calls, then each listed
-  collection agent separately, then `deep_collect_agent` with
-  `subagent_briefs`, then use the returned `temp_files`, then `deep_review_agent` for
-  single-agent verification calls, then each listed verifier separately, then
-  `deep_review_agent` with `verification_briefs`, then `deep_master_review_agent`
-  to get 8 master-review calls, optionally `deep_image_agent` to download
-  report-ready image files, then each listed `deep_master_*` call separately,
-  then `deep_master_review_agent` with `master_review_briefs`, then write the
-  final `report.md` using any returned image `local_path` values.
 - `source_research` for cited factual research and evidence gathering.
 - `image_research` for compact sourced image candidates.
 - `tavily_search` or `serpapi_search` for current web results.
@@ -4473,20 +4264,6 @@ def _write_claude_short_commands() -> Path:
 
 
 def _claude_bridge_commands() -> dict[str, tuple[str, str, str]]:
-    deep = (
-        "Run deep sourced research through the llama bridge.",
-        "[topic]",
-        _bridge_command_body(
-            "research topic",
-            (
-                "Start the deep workflow by calling a llama bridge tool whose name contains `deep`, preferably "
-                "`mcp__llama_bridge_tools__deep` or `mcp__llama_bridge_tools__deep_plan_agent`. For `/deep`, you are "
-                "only allowed to call tools with `deep` in the tool name; do not call normal search, source, image, "
-                "Wikipedia, weather, or time tools. Follow the returned staged workflow: plan, collect with deep "
-                "collector tools, review with deep reviewer tools, then produce the final cited brief."
-            ),
-        ),
-    )
     serp = (
         "Run a SerpAPI web search through the llama bridge.",
         "[query]",
@@ -4528,7 +4305,6 @@ def _claude_bridge_commands() -> dict[str, tuple[str, str, str]]:
         ),
     )
     return {
-        "deep.md": deep,
         "serp.md": serp,
         "web.md": web,
         "fetch.md": fetch,
@@ -4937,102 +4713,6 @@ def _cmd_opencode(
     raise SystemExit(return_code)
 
 
-def _cmd_openclaw(
-    config_path: Path,
-    openclaw_command: str,
-    openclaw_args: list[str],
-    provider_override: str | None = None,
-    model_override: str | None = None,
-    config_path_override: str | None = None,
-    workspace_override: str | None = None,
-    workspace_access: str | None = None,
-    sandbox_backend: str | None = None,
-    yes: bool = True,
-    prepare_only: bool = False,
-) -> None:
-    _ensure_setup(config_path)
-    config = load_config(config_path)
-
-    provider_name = provider_override or config.openclaw.provider
-    if provider_name not in config.providers:
-        available = ", ".join(sorted(config.providers))
-        raise SystemExit(
-            f"Unknown OpenClaw provider '{provider_name}'. Available providers: {available}"
-        )
-
-    model = resolve_openclaw_model(
-        config,
-        provider_name=provider_name,
-        model_override=model_override,
-    )
-    if not model:
-        raise SystemExit(openclaw_model_error(config, provider_name))
-
-    safety = ensure_openclaw_safety_config(
-        config_path=config_path_override or config.openclaw.config_path,
-        workspace=workspace_override or config.openclaw.workspace,
-        workspace_access=workspace_access or config.openclaw.workspace_access,
-        sandbox_backend=sandbox_backend or config.openclaw.sandbox_backend,
-        model=model,
-    )
-
-    _title("llama openclaw")
-    _print_state("ok", "OpenClaw safety config is ready", "32")
-    _kv_rows(
-        [
-            ("provider", provider_name),
-            ("model", model),
-            ("config", str(safety.config_path)),
-            ("workspace", str(safety.workspace)),
-            ("sandbox", f"{safety.sandbox_backend}, mode=all, access={safety.workspace_access}"),
-            ("host binds", "disabled"),
-            ("network", "none"),
-        ]
-    )
-
-    if prepare_only:
-        _print_note("Prepared only. Run `llama openclaw` to launch.")
-        return
-
-    command = openclaw_command or "launch"
-    if command == "status":
-        _print_state("tool", f"ollama: {find_ollama_executable() or 'missing'}", "36")
-        _print_state("tool", f"openclaw: {find_openclaw_executable() or 'missing'}", "36")
-        _print_note("This command reports llama's managed OpenClaw config without contacting the gateway.")
-        return
-    if command == "launch":
-        raise SystemExit(
-            run_ollama_openclaw(
-                model=model,
-                safety=safety,
-                passthrough_args=openclaw_args,
-                yes=yes,
-            )
-        )
-    if command == "configure":
-        raise SystemExit(
-            run_ollama_openclaw(
-                model=model,
-                safety=safety,
-                passthrough_args=openclaw_args,
-                config_only=True,
-                yes=False,
-            )
-        )
-    if command == "channels":
-        raise SystemExit(
-            run_openclaw_command(
-                ["configure", "--section", "channels", *openclaw_args],
-                safety=safety,
-            )
-        )
-    if command == "stop":
-        raise SystemExit(run_openclaw_command(["gateway", "stop", *openclaw_args], safety=safety))
-    if command == "sandbox-explain":
-        raise SystemExit(run_openclaw_command(["sandbox", "explain", *openclaw_args], safety=safety))
-    raise SystemExit(f"Unknown OpenClaw command: {command}")
-
-
 def _cmd_poolside(
     config_path: Path,
     pid_path: Path,
@@ -5195,7 +4875,6 @@ def _cmd_poolside_acp_proxy(poolside_acp_args: list[str]) -> None:
                         with pending_lock:
                             pending_session_requests.add(message_id)
                 if isinstance(message, dict):
-                    message = _with_poolside_deep_research_prompt(message)
                     line = json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n"
                 proc.stdin.write(line)
                 proc.stdin.flush()
@@ -5317,7 +4996,6 @@ def _poolside_bridge_available_commands() -> list[dict[str, Any]]:
         ("web", "Search the web through llama bridge.", "search query"),
         ("image", "Find sourced image candidates through llama bridge.", "image query"),
         ("wiki", "Search Wikipedia through llama bridge.", "Wikipedia query"),
-        ("deep", "Research the topic with web/wiki/image tools, verify sources, and write report.md.", "research topic"),
         ("manim", "Generate a short Manim animation video from text.", "animation prompt"),
     ]
     available_commands = []
@@ -5365,70 +5043,6 @@ def _with_poolside_bridge_commands(message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _with_poolside_deep_research_prompt(message: dict[str, Any]) -> dict[str, Any]:
-    if message.get("method") != "session/prompt":
-        return message
-    params = message.get("params")
-    if not isinstance(params, dict):
-        return message
-    prompt_key = "prompt" if "prompt" in params else "Prompt" if "Prompt" in params else None
-    prompt = params.get(prompt_key) if prompt_key else None
-    if not isinstance(prompt, list):
-        return message
-
-    rewritten_prompt: list[Any] = []
-    changed = False
-    for block in prompt:
-        if not isinstance(block, dict):
-            rewritten_prompt.append(block)
-            continue
-        text_key = "text" if "text" in block else "Text" if "Text" in block else None
-        text_value = block.get(text_key) if text_key else None
-        if not isinstance(text_value, str):
-            rewritten_prompt.append(block)
-            continue
-        rewritten = _poolside_deep_research_prompt(text_value)
-        if rewritten == text_value:
-            rewritten_prompt.append(block)
-            continue
-        changed = True
-        rewritten_prompt.append({**block, text_key: rewritten})
-
-    if not changed:
-        return message
-    return {**message, "params": {**params, prompt_key: rewritten_prompt}}
-
-
-def _poolside_deep_research_prompt(text: str) -> str:
-    stripped = text.strip()
-    lowered = stripped.lower()
-    prefixes = ("/deep ",)
-    if lowered == "/deep":
-        topic = "the requested research topic"
-    else:
-        matched = next((prefix for prefix in prefixes if lowered.startswith(prefix)), None)
-        if not matched:
-            return text
-        topic = stripped[len(matched) :].strip() or "the requested research topic"
-
-    return f"""Run deep research for: {topic}
-
-Use the llama bridge deep research workflow in normal mode. For `/deep`, only call tools whose names contain `deep`; do not call normal search, source, image, Wikipedia, weather, or time tools.
-
-Required tool order:
-1. Call `llama_bridge_tools__deep` or `llama_bridge_tools__deep_plan_agent` first.
-2. Call `deep_collect_agent` to get the separate specialist `agent_calls`.
-3. Call each returned `deep_tavily_agent`, `deep_serp_agent`, and `deep_wiki_agent` separately.
-4. Call `deep_collect_agent` again with `subagent_briefs`, then use the returned `temp_files` checkpoints.
-5. Call `deep_review_agent` to get separate verification `agent_calls`.
-6. Call each returned `deep_verify_agent` separately.
-7. Call `deep_review_agent` again with `verification_briefs`.
-8. Call `deep_image_agent` to download report-ready image files when images help.
-9. Call `deep_master_review_agent` to get the 8 master-review `agent_calls`.
-10. Call each returned `deep_master_*` review agent separately.
-11. Call `deep_master_review_agent` again with `master_review_briefs`, then write `report.md`.
-
-If the model thinks a deep tool is unavailable, call `llama_bridge_tools__deep` or `llama_bridge_tools__deep_plan_agent` anyway and report the deep-tool failure instead of switching to normal tools. Do not finish with only an inline answer; `report.md` is required."""
 
 
 def _write_poolside_agent_config() -> Path:
@@ -5534,7 +5148,7 @@ def _write_poolside_bridge_skill(config) -> Path:
 def _poolside_bridge_tools_skill() -> str:
     return """---
 name: llama-bridge-tools
-description: Use when Poolside needs llama bridge MCP tools for current web search, SerpAPI, Tavily, source verification, image search, Wikipedia, Manim animation videos, weather, or date/time lookups. Use when the user types shortcut-style prompts such as /serp, /tavily, /web, /image, /wiki, /deep, or /manim.
+description: Use when Poolside needs llama bridge MCP tools for current web search, SerpAPI, Tavily, source verification, image search, Wikipedia, Manim animation videos, weather, or date/time lookups. Use when the user types shortcut-style prompts such as /serp, /tavily, /web, /image, /wiki, or /manim.
 ---
 
 # Llama Bridge Tools
@@ -5556,18 +5170,8 @@ MCP tool:
 - `/manim`: use `manim_render` to create a short Manim Community animation
   video from the user's text. Return the generated scene path and video path.
   If Manim is missing, show the install guidance returned by the tool.
-- `/deep`: use only llama bridge tools whose names contain `deep`.
-  First call `deep` or `deep_plan_agent`; then follow the returned staged
-  workflow with `deep_collect_agent`, the listed deep specialist agents,
-  `deep_review_agent`, the listed deep verification agents, and finally
-  `deep_image_agent` for attachments plus `deep_master_review_agent` and the
-  8 returned `deep_master_*` review agents.
-  Do not call normal search, source, image, Wikipedia, weather, or time tools for `/deep`.
+Prefer the highest-level bridge tool that fits the task:
 
-Prefer the highest-level bridge tool that fits the task. For `/deep`, the
-highest-level tool is `deep`; if `deep` is not selected, use `deep_plan_agent`.
-
-- `deep` or `deep_plan_agent` for `/deep` and deep research workflows.
 - `source_research` for cited factual research and evidence gathering.
 - `image_research` for compact sourced image candidates.
 - `tavily_search` or `serpapi_search` for current web results.
@@ -5925,9 +5529,6 @@ def _ensure_pi_extensions(config, verbose: bool = True) -> list[Path]:
     web_tools = _ensure_pi_web_tools(config, verbose=verbose)
     if web_tools is not None:
         paths.append(web_tools)
-    deep_research = _ensure_pi_deep_research(config, verbose=verbose)
-    if deep_research is not None:
-        paths.append(deep_research)
     return paths
 
 
@@ -5957,34 +5558,10 @@ def _ensure_pi_web_tools(config, verbose: bool = True) -> Path | None:
     return extension_path
 
 
-def _ensure_pi_deep_research(config, verbose: bool = True) -> Path | None:
-    if not config.pi.web_search:
-        return
-    config_dir = Path(os.path.expanduser(config.pi.config_dir))
-    extension_dir = config_dir / "extensions" / "llama_bridge_deep_research"
-    extension_path = extension_dir / "index.ts"
-    extension_dir.mkdir(parents=True, exist_ok=True)
-    content = _pi_deep_research_extension(config)
-    if not extension_path.exists() or extension_path.read_text(encoding="utf-8") != content:
-        extension_path.write_text(content, encoding="utf-8")
-    if verbose:
-        _print_state("ok", f"Pi deep research extension: {extension_path}", "32")
-    return extension_path
-
-
-def _deep_research_timeout_seconds(config, key: str = "tool_timeout_seconds") -> float:
-    deep = getattr(getattr(config, "tools", None), "deep_research", None)
-    value = getattr(deep, key, 10.0)
-    try:
-        return max(1.0, float(value))
-    except (TypeError, ValueError):
-        return 10.0
-
-
 def _pi_web_tools_extension(config) -> str:
     bridge_url = _server_url(config.server.host, config.server.port)
     api_key = config.server.auth_token
-    timeout_seconds = _deep_research_timeout_seconds(config)
+    timeout_seconds = 10.0
     timeout_ms = int(timeout_seconds * 1000)
     return f"""import type {{ ExtensionAPI }} from "@mariozechner/pi-coding-agent";
 import {{ Type }} from "typebox";
@@ -6365,8 +5942,7 @@ export default function (pi: ExtensionAPI) {{
       sendAutoFollowUp(
         pi as any,
         [
-          "Image research is complete. Continue the deep research workflow now: synthesize the report from the verified sources and selected images, then write the finished markdown file.",
-          "Use the write tool exactly like this JSON shape: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. The path field is required; do not call write with content only."
+          "Image research is complete. Use the images to help answer the user's query."
         ].join("\\n")
       );
       return {{
@@ -6522,950 +6098,6 @@ export default function (pi: ExtensionAPI) {{
 """
 
 
-def _pi_deep_research_extension(config) -> str:
-    bridge_url = _server_url(config.server.host, config.server.port)
-    api_key = config.server.auth_token
-    timeout_seconds = _deep_research_timeout_seconds(config)
-    timeout_ms = int(timeout_seconds * 1000)
-    verify_timeout = int(_deep_research_timeout_seconds(config, "verify_agent_timeout_seconds"))
-    return f"""import type {{ ExtensionAPI }} from "@mariozechner/pi-coding-agent";
-import {{ Type }} from "typebox";
-
-const BRIDGE_URL = {json.dumps(bridge_url)};
-const API_KEY = {json.dumps(api_key)};
-const BRIDGE_TOOL_TIMEOUT_MS = {timeout_ms};
-
-function bridgeTimeoutSignal(parentSignal: AbortSignal) {{
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new Error("llama bridge tool timed out after {timeout_seconds:g} seconds")), BRIDGE_TOOL_TIMEOUT_MS);
-  const abort = () => controller.abort(parentSignal.reason);
-  if (parentSignal.aborted) abort();
-  else parentSignal.addEventListener("abort", abort, {{ once: true }});
-  return {{ signal: controller.signal, cleanup: () => {{
-    clearTimeout(timeout);
-    parentSignal.removeEventListener("abort", abort);
-  }} }};
-}}
-const SOLID_SOURCE_GUIDE = [
-  "Prefer primary/official sources: government departments, election commissions, courts, regulators, police/health/education agencies, company filings, official datasets, parliamentary records, central-bank/statistics offices, and original reports.",
-  "Prefer international institutions when relevant: UN agencies, World Bank, IMF, OECD, WHO, WTO, IEA, IPCC, ILO, UNESCO, and recognized regional bodies.",
-  "Prefer academic and research sources when relevant: peer-reviewed papers, university pages, SSRN/arXiv with caution, think-tank reports with named authors and methodology, official survey datasets, and reputable fact-checkers.",
-  "Prefer established news/wire sources for current events: Reuters, Associated Press, AFP, BBC, NPR, PBS, Financial Times, The Economist, The Guardian, New York Times, Washington Post, Wall Street Journal, Bloomberg, CNBC, Al Jazeera, DW, France24, Nikkei Asia, The Hindu, Indian Express, Hindustan Times, NDTV, India Today, Scroll, The Wire, Frontline, LiveMint, Business Standard, and Economic Times when relevant.",
-  "Avoid using low-quality sources as main evidence: SEO pages, copied press releases, anonymous blogs, social-media posts, YouTube-only commentary, forums, content farms, AI-generated summaries, and pages without author/date/source transparency.",
-].join("\\n");
-
-const PREFERRED_SOURCE_DOMAINS = [
-  "reuters.com", "apnews.com", "afp.com", "bbc.com", "bbc.co.uk", "npr.org", "pbs.org",
-  "ft.com", "economist.com", "theguardian.com", "nytimes.com", "washingtonpost.com",
-  "wsj.com", "bloomberg.com", "cnbc.com", "aljazeera.com", "dw.com", "france24.com",
-  "nikkei.com", "thehindu.com", "indianexpress.com", "hindustantimes.com", "ndtv.com",
-  "indiatoday.in", "scroll.in", "thewire.in", "frontline.thehindu.com", "livemint.com",
-  "business-standard.com", "economictimes.indiatimes.com", "pib.gov.in", "eci.gov.in",
-  "rbi.org.in", "mospi.gov.in", "data.gov.in", "prsindia.org", "adrindia.org",
-  "worldbank.org", "imf.org", "oecd.org", "who.int", "un.org", "unesco.org", "ilo.org",
-  "wto.org", "iea.org", "ipcc.ch", "nature.com", "science.org", "nejm.org", "thelancet.com",
-  "jamanetwork.com", "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "scholar.google.com",
-];
-
-const DEEP_RESEARCH_REPORT_INSTRUCTIONS = [
-  "Deep research reporting workflow:",
-  "- Prefer the staged subagent workflow: call deep_plan_agent first, then deep_collect_agent to get agent_calls, then call each listed collection agent as its own separate MCP call, then call deep_collect_agent again with subagent_briefs, then use returned temp_files, then call deep_review_agent to get verification agent_calls, then call each deep_verify_agent separately, then call deep_review_agent again with verification_briefs, then call deep_image_agent to download image assets when useful, then call deep_master_review_agent to get 8 master-review agent_calls, then call each deep_master_* review agent separately, then call deep_master_review_agent again with master_review_briefs before writing the final report.md.",
-  "- The collection stage must be split into separate MCP calls: exactly 2 Tavily calls, 2 SerpAPI calls, and 3 Wikipedia calls. Do not make deep_collect_agent run the whole collection in one call.",
-  "- Use the specialist extension tools deep_tavily_agent, deep_serp_agent, deep_wiki_agent, and deep_verify_agent as single-purpose MCP calls; collect their compact JSON results and pass them back as subagent_briefs or verification_briefs.",
-  "- The legacy deep_research tool can still be used as fallback, but the staged subagent flow is preferred for Pi /deep.",
-  "- After collection/review, verify important claims and sources with separate web_search, serpapi_search, and tavily_search calls when those tools are available; compare providers instead of treating one provider as enough.",
-  "- Source quality matters more than search rank. Prefer official/primary sources, international institutions, academic/research sources, reputable fact-checkers, and established news/wire outlets. Use weak sources only as leads, not as main citations.",
-  SOLID_SOURCE_GUIDE,
-  "- For /deep, do not call image_research directly; use deep_image_agent so report.md can attach downloaded local image files.",
-  "- After all deep collection, verification, and master-review calls are complete, create report.md in the current working directory.",
-  "- When using the write tool, call it with BOTH required fields: path and content. Correct shape: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. Never call write with content only.",
-  "- Use a relative path such as report.md unless the user explicitly asks for a different filename.",
-  "- Write report.md as a detailed prepared research report, not a short answer or bullet-only summary.",
-  "- Match this report structure: H1 title beginning with 'Research brief:' or 'Research report:', Executive summary, 5-8 numbered analytical sections, Evidence gaps/limitations/recommended sources, Conclusion (synthesis), and References.",
-  "- Number analytical headings like '## 1. ...', '## 2. ...'; use paragraphs plus focused bullets inside sections when they improve readability.",
-  "- Use inline numbered citations such as [1], [2], [3] throughout the report; every major factual claim, date, statistic, quote, or contested point needs a nearby citation.",
-  "- End with a clean, well-structured References section. Put every source on its own line as a numbered Markdown list item: '1. [Source title](https://example.com/full-url) - publisher or site, date if known.' Never place multiple references on one paragraph line.",
-  "- Keep citation numbers consistent: inline [1] must map to References item 1, inline [2] to item 2, and so on. Do not skip numbers unless the skipped source was removed everywhere.",
-  "- Use descriptive link text in References, not raw bare URLs as the visible text. The URL must still be inside the Markdown link target.",
-  "- Explicitly call out uncertainty, conflicting figures, missing official datasets, and evidence limitations instead of smoothing them over.",
-  "- Write report.md like a normal sourced article: use the search/source data for article text, headings, citations, and claims; use images only as compact supporting visuals near the relevant section.",
-  "- Include image blocks from deep_image_agent in report.md using downloaded local_path values when present.",
-  "- Attach images only if they are clean, clear, readable, well sourced, and help the report: maps, timelines, locations, people, products, charts, event photos, or visual comparisons. Skip blurry thumbnails, low-resolution previews, cropped charts/maps, decorative stock images, or weakly sourced images.",
-  "- Prefer downloaded local_path values from deep_image_agent over remote URLs. Do not use an image if the source page is missing unless the report explicitly warns that provenance is weak.",
-  "- For each image, include a short caption and a source link/citation beside or inside the figure caption.",
-  "- The report.md file must be detailed, include inline source URLs/citations, embed selected compact images with nearby source links, and clearly separate verified findings from uncertain or conflicting evidence.",
-  "- End report.md with this exact warning: Warning: This report only uses available sources and may contain wrong or incomplete information. Do not blindly believe it; verify important claims independently.",
-].join("\\n");
-
-const DEEP_RESEARCH_REPORT_TEMPLATE = [
-  "# Research brief: <specific topic>",
-  "",
-  "Executive summary",
-  "<3-6 dense paragraphs summarizing the answer, the strongest evidence, major caveats, and what could not be verified. Use numbered citations like [1].>",
-  "",
-  "<!-- If images are useful, embed downloaded local_path values returned by deep_image_agent. -->",
-  "<!-- Then embed 2-3 clean, readable, sourced figures inside <div class=\\\"image-grid\\\">...</div> near the relevant section. Skip unclear or weakly sourced images. -->",
-  "",
-  "## 1. Background and context",
-  "<Explain the baseline facts, timeline, actors, and why the topic matters.>",
-  "",
-  "## 2. Main findings",
-  "<Develop the central findings with evidence, dates, figures, and citations.>",
-  "",
-  "## 3. Key actors, mechanisms, or causes",
-  "<Explain stakeholders, causes, incentives, technical mechanisms, policy forces, or market dynamics as relevant.>",
-  "",
-  "## 4. Timeline, geography, data, or operational details",
-  "<Use whichever dimensions fit the topic. Include compact tables only when they add clarity.>",
-  "",
-  "## 5. Results, implications, and consequences",
-  "<Explain outcomes, short-term effects, long-term implications, and who is affected.>",
-  "",
-  "## Evidence gaps, limitations and recommended data sources",
-  "<List missing primary data, conflicting reports, weak sources, and what should be checked next.>",
-  "",
-  "## Conclusion (synthesis)",
-  "<Pull the evidence together without adding unsupported claims.>",
-  "",
-  "## References",
-  "1. [Descriptive source title](https://example.com/source) - publisher/site, date if known.",
-  "2. [Descriptive source title](https://example.com/source) - publisher/site, date if known.",
-].join("\\n");
-
-async function postJson(path: string, body: unknown, signal: AbortSignal) {{
-  const timed = bridgeTimeoutSignal(signal);
-  let response: Response;
-  try {{
-    response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
-      method: "POST",
-      headers: {{
-        "Content-Type": "application/json",
-        "x-api-key": API_KEY,
-      }},
-      body: JSON.stringify(body),
-      signal: timed.signal,
-    }});
-  }} catch (error) {{
-    return {{ ok: false, error: String(error), timeout_budget_seconds: {timeout_seconds:g}, path }};
-  }} finally {{
-    timed.cleanup();
-  }}
-  const text = await response.text().catch(() => "");
-  let data: any = null;
-  try {{
-    data = text ? JSON.parse(text) : null;
-  }} catch (error) {{
-    data = null;
-  }}
-  if (!response.ok) {{
-    if (data && typeof data === "object") return data;
-    throw new Error(`llama bridge ${{path}} failed (${{response.status}}): ${{text || response.statusText}}`);
-  }}
-  return data;
-}}
-
-async function getJson(path: string, signal: AbortSignal) {{
-  const timed = bridgeTimeoutSignal(signal);
-  let response: Response;
-  try {{
-    response = await fetch(`${{BRIDGE_URL}}${{path}}`, {{
-      method: "GET",
-      headers: {{
-        "x-api-key": API_KEY,
-      }},
-      signal: timed.signal,
-    }});
-  }} catch (error) {{
-    return {{ ok: false, error: String(error), timeout_budget_seconds: {timeout_seconds:g}, path }};
-  }} finally {{
-    timed.cleanup();
-  }}
-  if (!response.ok) {{
-    const text = await response.text().catch(() => "");
-    throw new Error(`llama bridge ${{path}} failed (${{response.status}}): ${{text || response.statusText}}`);
-  }}
-  return await response.json();
-}}
-
-async function callBridgeTool(name: string, args: unknown, signal: AbortSignal) {{
-  const data = await postJson(`/api/tools/${{name}}`, args, signal);
-  return data.data ?? data.result?.data ?? data.result ?? data;
-}}
-
-function pretty(value: unknown) {{
-  return JSON.stringify(value, null, 2);
-}}
-
-function toolErrorText(toolName: string, result: any) {{
-  if (!result || result.ok !== false) return null;
-  const error = result.error?.message ?? result.error ?? "unknown error";
-  return `${{toolName}} failed: ${{String(error)}}\\n\\n${{pretty(result)}}`;
-}}
-
-function asNumber(value: unknown, fallback: number, min: number, max: number) {{
-  const number = typeof value === "number" && Number.isFinite(value) ? value : fallback;
-  return Math.max(min, Math.min(max, Math.floor(number)));
-}}
-
-function compactText(value: unknown, maxLength = 900) {{
-  const text = String(value ?? "").replace(/\\s+/g, " ").trim();
-  return text.length > maxLength ? `${{text.slice(0, maxLength)}}...` : text;
-}}
-
-function callMaybe(owner: any, method: unknown, args: unknown[]) {{
-  if (typeof method !== "function") return false;
-  try {{
-    method.apply(owner, args);
-    return true;
-  }} catch (error) {{
-    return false;
-  }}
-}}
-
-function createResearchProgress(piApi: any, toolCallId: string) {{
-  type StepState = "queued" | "running" | "done" | "error";
-  type Step = {{ id: string; title: string; detail: string; state: StepState; startedAt: number; endedAt?: number }};
-  const frames = ["|", "/", "-", "\\\\"];
-  const steps: Step[] = [];
-  let frame = 0;
-  let lastText = "";
-  let lastNotifyKey = "";
-
-  function upsert(id: string, title: string, detail: string, state: StepState) {{
-    let step = steps.find((item) => item.id === id);
-    if (!step) {{
-      step = {{ id, title, detail, state, startedAt: Date.now() }};
-      steps.push(step);
-    }}
-    step.title = title;
-    step.detail = detail;
-    step.state = state;
-    if (state === "done" || state === "error") step.endedAt = Date.now();
-  }}
-
-  function render() {{
-    frame = (frame + 1) % frames.length;
-    const lines = steps.slice(-8).map((step) => {{
-      const marker = step.state === "running" ? frames[frame] : step.state === "done" ? "OK" : step.state === "error" ? "!!" : "..";
-      const elapsed = Math.max(0, Math.round(((step.endedAt ?? Date.now()) - step.startedAt) / 1000));
-      return `${{marker}} ${{step.title}}${{step.detail ? ` - ${{step.detail}}` : ""}} (${{elapsed}}s)`;
-    }});
-    return ["Deep research is working", ...lines].join("\\n");
-  }}
-
-  function emit() {{
-    const text = render();
-    if (text === lastText) return;
-    lastText = text;
-    const payload = {{
-      status: "running",
-      title: "Deep research",
-      text,
-      content: text,
-      details: {{ steps: snapshot() }},
-    }};
-    const sent =
-      callMaybe(piApi, piApi?.updateToolCall, [toolCallId, payload]) ||
-      callMaybe(piApi?.ui, piApi?.ui?.updateToolCall, [toolCallId, payload]) ||
-      callMaybe(piApi?.toolCalls, piApi?.toolCalls?.update, [toolCallId, payload]) ||
-      callMaybe(piApi, piApi?.setToolStatus, [toolCallId, text]) ||
-      callMaybe(piApi?.ui, piApi?.ui?.setStatus, [text]);
-    if (!sent) {{
-      const latest = steps[steps.length - 1];
-      const notifyKey = latest ? `${{latest.id}}:${{latest.state}}:${{latest.detail}}` : text;
-      if (notifyKey !== lastNotifyKey) {{
-        lastNotifyKey = notifyKey;
-        const level = latest?.state === "error" ? "error" : latest?.state === "done" ? "success" : "info";
-        callMaybe(piApi?.ui, piApi?.ui?.notify, [latest ? `${{latest.title}}${{latest.detail ? ` - ${{latest.detail}}` : ""}}` : text, level]);
-      }}
-    }}
-  }}
-
-  function step(id: string, title: string, detail = "", state: StepState = "running") {{
-    upsert(id, title, detail, state);
-    emit();
-  }}
-
-  function pulse(id: string, detail?: string) {{
-    const step = steps.find((item) => item.id === id);
-    if (!step) return;
-    if (detail !== undefined) step.detail = detail;
-    emit();
-  }}
-
-  async function track<T>(id: string, title: string, detail: string, task: Promise<T>) {{
-    step(id, title, detail, "running");
-    const timer = setInterval(() => pulse(id), 700);
-    try {{
-      const value = await task;
-      step(id, title, detail, "done");
-      return value;
-    }} catch (error) {{
-      step(id, title, String(error), "error");
-      throw error;
-    }} finally {{
-      clearInterval(timer);
-    }}
-  }}
-
-  function snapshot() {{
-    return steps.map((step) => ({{
-      title: step.title,
-      detail: step.detail,
-      state: step.state,
-      elapsed_seconds: Math.max(0, Math.round(((step.endedAt ?? Date.now()) - step.startedAt) / 1000)),
-    }}));
-  }}
-
-  return {{ step, pulse, track, snapshot }};
-}}
-
-function pushUnique(values: string[], value: unknown) {{
-  const text = String(value ?? "").trim();
-  if (text && !values.some((existing) => existing.toLowerCase() === text.toLowerCase())) {{
-    values.push(text);
-  }}
-}}
-
-function hasProvider(providers: string[], provider: string) {{
-  return providers.some((item) => item === provider);
-}}
-
-function expandQueries(baseQueries: string[], topic: string, minimum: number, variants: string[]) {{
-  const expanded: string[] = [];
-  for (const query of baseQueries) pushUnique(expanded, query);
-  for (const variant of variants) pushUnique(expanded, variant.replaceAll("{{topic}}", topic));
-  let index = 1;
-  while (expanded.length < minimum) {{
-    pushUnique(expanded, `${{topic}} verification angle ${{index}}`);
-    index += 1;
-  }}
-  return expanded.slice(0, Math.max(minimum, baseQueries.length));
-}}
-
-function normalizeSearchResults(provider: string, query: string, data: any) {{
-  const rawResults =
-    Array.isArray(data?.results) ? data.results :
-    Array.isArray(data?.organic_results) ? data.organic_results :
-    Array.isArray(data?.search_results) ? data.search_results :
-    [];
-  return rawResults.map((item: any) => ({{
-    provider,
-    query,
-    title: item.title ?? item.name ?? item.heading ?? "Untitled",
-    url: item.url ?? item.link ?? item.source_url ?? "",
-    snippet: compactText(item.snippet ?? item.content ?? item.summary ?? item.extract ?? ""),
-  }})).filter((item: any) => item.title || item.url || item.snippet);
-}}
-
-function sourceDomain(url: string) {{
-  try {{
-    return new URL(url).hostname.replace(/^www\\./, "").toLowerCase();
-  }} catch (error) {{
-    return "";
-  }}
-}}
-
-function sourceQualityScore(item: any) {{
-  const domain = sourceDomain(String(item?.url || ""));
-  const text = `${{item?.title || ""}} ${{item?.snippet || ""}} ${{item?.url || ""}}`.toLowerCase();
-  let score = 0;
-  if (domain) score += 1;
-  if (PREFERRED_SOURCE_DOMAINS.some((preferred) => domain === preferred || domain.endsWith(`.${{preferred}}`))) score += 8;
-  if (/\\.(gov|edu)(\\.|$)/i.test(domain) || domain.endsWith(".gov.in") || domain.endsWith(".ac.in")) score += 7;
-  if (/(official|government|commission|ministry|department|regulator|court|parliament|dataset|statistics|filing|annual report)/i.test(text)) score += 4;
-  if (/(reuters|associated press|\\bap news\\b|afp|bbc|bloomberg|financial times|the hindu|indian express|associated)/i.test(text)) score += 3;
-  if (/(wikipedia|youtube|facebook|twitter|x\\.com|reddit|quora|medium\\.com|blogspot|wordpress|pinterest)/i.test(domain)) score -= 5;
-  if (/(liveblog|live updates|opinion|editorial|youtube|watch\\?v=|viral|rumor|rumour)/i.test(text)) score -= 2;
-  return score;
-}}
-
-function sortFindingsByQuality(findings: any[]) {{
-  findings.sort((left, right) => {{
-    const quality = sourceQualityScore(right) - sourceQualityScore(left);
-    if (quality !== 0) return quality;
-    return String(left.title || "").localeCompare(String(right.title || ""));
-  }});
-  return findings;
-}}
-
-async function searchProvider(provider: string, query: string, maxResults: number, signal: AbortSignal) {{
-  if (provider === "web_search") {{
-    const data = await postJson("/api/web_search", {{ query, max_results: maxResults }}, signal);
-    if (data?.error || data?.ok === false) throw new Error(String(data?.error?.message ?? data?.error ?? "web_search failed"));
-    return normalizeSearchResults(provider, query, data);
-  }}
-  if (provider === "serpapi_search") {{
-    const data = await callBridgeTool("serpapi_search", {{ query, num: maxResults }}, signal);
-    const errorText = toolErrorText("serpapi_search", data);
-    if (errorText) throw new Error(errorText);
-    return normalizeSearchResults(provider, query, data);
-  }}
-  if (provider === "tavily_search") {{
-    const data = await callBridgeTool("tavily_search", {{
-      query,
-      max_results: maxResults,
-      include_answer: true,
-    }}, signal);
-    const errorText = toolErrorText("tavily_search", data);
-    if (errorText) throw new Error(errorText);
-    const results = normalizeSearchResults(provider, query, data);
-    if (data?.answer) {{
-      results.unshift({{
-        provider,
-        query,
-        title: "Tavily synthesized answer",
-        url: "",
-        snippet: compactText(data.answer, 1200),
-      }});
-    }}
-    return results;
-  }}
-  if (provider === "wikipedia_search") {{
-    const data = await callBridgeTool("wikipedia_search", {{
-      query,
-      limit: Math.min(maxResults, 10),
-      language: "en",
-    }}, signal);
-    return normalizeSearchResults(provider, query, data);
-  }}
-  return [];
-}}
-
-async function defaultSearchProviders(signal: AbortSignal) {{
-  const providers = ["web_search"];
-  try {{
-    const data = await getJson("/api/tools", signal);
-    const enabledTools = new Set((Array.isArray(data?.tools) ? data.tools : [])
-      .map((tool: any) => tool?.name)
-      .filter((name: unknown): name is string => typeof name === "string"));
-    for (const provider of ["serpapi_search", "tavily_search", "wikipedia_search"]) {{
-      if (enabledTools.has(provider)) providers.push(provider);
-    }}
-  }} catch (error) {{
-    providers.push("wikipedia_search");
-  }}
-  return providers;
-}}
-
-async function fetchPageEvidence(url: string, signal: AbortSignal) {{
-  if (!url || !/^https?:\\/\\//i.test(url)) return null;
-  try {{
-    const data = await postJson("/api/web_fetch", {{ url }}, signal);
-    if (data?.error || data?.ok === false) {{
-      const error = data?.error?.message ?? data?.error?.error ?? data?.error ?? data?.result?.error ?? "Fetch failed";
-      return {{ url, title: url, content: `Fetch failed: ${{String(error)}}` }};
-    }}
-    return {{
-      url,
-      title: data?.title ?? url,
-      content: compactText(data?.content ?? data?.text ?? "", 2400),
-    }};
-  }} catch (error) {{
-    return {{ url, title: url, content: `Fetch failed: ${{String(error)}}` }};
-  }}
-}}
-
-export default function (pi: ExtensionAPI) {{
-  pi.registerTool({{
-    name: "deep_research",
-    label: "Deep Research",
-    description: "Legacy Pi research fallback: run many search passes, fetch top pages, and return a structured evidence brief for report.md. Prefer deep_plan_agent -> deep_collect_agent -> deep_review_agent for Pi /deep.",
-    parameters: Type.Object({{
-      topic: Type.String({{ description: "Research topic, question, or claim to investigate." }}),
-      questions: Type.Optional(Type.Array(Type.String({{ description: "Optional sub-questions to investigate in parallel." }}))),
-      depth: Type.Optional(Type.Number({{ description: "1 quick, 2 balanced, 3 deep. Higher depth creates more query variants.", default: 2 }})),
-      max_results_per_query: Type.Optional(Type.Number({{ description: "Results to request from each provider for each query.", default: 5 }})),
-      fetch_top_pages: Type.Optional(Type.Number({{ description: "How many discovered URLs to fetch for deeper evidence.", default: 6 }})),
-      providers: Type.Optional(Type.Array(Type.String({{ description: "Optional providers: web_search, serpapi_search, tavily_search, wikipedia_search." }}))),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const progress = createResearchProgress(pi as any, String(_toolCallId ?? "deep_research"));
-      progress.step("plan", "Building research plan", String(params.topic ?? ""));
-      const depth = asNumber(params.depth, 2, 1, 3);
-      const maxResults = asNumber(params.max_results_per_query, 5, 1, 10);
-      const fetchTopPages = asNumber(params.fetch_top_pages, 6, 0, 12);
-      const providers = Array.isArray(params.providers) && params.providers.length
-        ? params.providers
-        : await progress.track("providers", "Checking available providers", "web, SerpAPI, Tavily, Wikipedia", defaultSearchProviders(signal));
-
-      const queries: string[] = [];
-      pushUnique(queries, params.topic);
-      for (const question of Array.isArray(params.questions) ? params.questions : []) {{
-        pushUnique(queries, question);
-      }}
-      if (depth >= 2) {{
-        pushUnique(queries, `${{params.topic}} background evidence`);
-        pushUnique(queries, `${{params.topic}} recent developments`);
-        pushUnique(queries, `${{params.topic}} criticism limitations`);
-      }}
-      if (depth >= 3) {{
-        pushUnique(queries, `${{params.topic}} primary sources data`);
-        pushUnique(queries, `${{params.topic}} official report data`);
-        pushUnique(queries, `${{params.topic}} Reuters OR AP OR BBC`);
-        pushUnique(queries, `${{params.topic}} expert analysis`);
-        pushUnique(queries, `${{params.topic}} timeline`);
-        pushUnique(queries, `${{params.topic}} site:gov OR site:edu`);
-      }}
-      const baseQueries = queries.slice(0, 12);
-      const serpapiQueries = hasProvider(providers, "serpapi_search")
-        ? expandQueries(baseQueries, String(params.topic), 10, [
-          "{{topic}} evidence",
-          "{{topic}} sources",
-          "{{topic}} facts",
-          "{{topic}} latest",
-          "{{topic}} expert analysis",
-          "{{topic}} criticism",
-          "{{topic}} timeline",
-          "{{topic}} statistics",
-          "{{topic}} official source",
-          "{{topic}} official report data",
-          "{{topic}} Reuters AP BBC",
-          "{{topic}} site:gov OR site:edu",
-          "{{topic}} independent source",
-        ])
-        : [];
-      const tavilyQueries = hasProvider(providers, "tavily_search")
-        ? expandQueries(baseQueries, String(params.topic), 5, [
-          "{{topic}} research evidence",
-          "{{topic}} recent developments",
-          "{{topic}} primary sources",
-          "{{topic}} official data reputable news",
-          "{{topic}} analysis",
-          "{{topic}} limitations controversy",
-        ])
-        : [];
-      const wikipediaQueries = hasProvider(providers, "wikipedia_search") ? baseQueries.slice(0, 3) : [];
-      progress.step(
-        "plan",
-        "Building research plan",
-        `${{serpapiQueries.length}} SerpAPI, ${{tavilyQueries.length}} Tavily, ${{wikipediaQueries.length}} Wikipedia primary passes`,
-        "done"
-      );
-
-      const searchJobs = [
-        ...serpapiQueries.map((query) => progress.track(
-          `search:serpapi_search:${{query}}`,
-          "Searching serpapi_search",
-          query,
-          searchProvider("serpapi_search", query, maxResults, signal)
-        )),
-        ...tavilyQueries.map((query) => progress.track(
-          `search:tavily_search:${{query}}`,
-          "Searching tavily_search",
-          query,
-          searchProvider("tavily_search", query, maxResults, signal)
-        )),
-        ...wikipediaQueries.map((query) => progress.track(
-          `search:wikipedia_search:${{query}}`,
-          "Searching wikipedia_search",
-          query,
-          searchProvider("wikipedia_search", query, maxResults, signal)
-        )),
-      ];
-      progress.step("parallel-search", "Running parallel searches", `${{searchJobs.length}} searches in flight`);
-      const settled = await Promise.allSettled(searchJobs);
-      progress.step("parallel-search", "Running parallel searches", `${{searchJobs.length}} searches complete`, "done");
-      const searchErrors: string[] = [];
-      const seenUrls = new Set<string>();
-      const findings: any[] = [];
-      progress.step("merge", "Merging and deduplicating sources", "Normalizing provider results");
-      for (const result of settled) {{
-        if (result.status === "rejected") {{
-          searchErrors.push(String(result.reason));
-          continue;
-        }}
-        for (const item of result.value) {{
-          const key = String(item.url || `${{item.provider}}:${{item.title}}`).toLowerCase();
-          if (seenUrls.has(key)) continue;
-          seenUrls.add(key);
-          findings.push(item);
-        }}
-      }}
-      sortFindingsByQuality(findings);
-      progress.step("merge", "Merging and deduplicating sources", `${{findings.length}} unique sources`, "done");
-
-      const verificationQueries: string[] = [];
-      pushUnique(verificationQueries, `${{params.topic}} verify key facts`);
-      pushUnique(verificationQueries, `${{params.topic}} fact check`);
-      pushUnique(verificationQueries, `${{params.topic}} source reliability`);
-      pushUnique(verificationQueries, `${{params.topic}} conflicting evidence`);
-      for (const item of findings.slice(0, 8)) {{
-        pushUnique(verificationQueries, `${{item.title}} verification`);
-      }}
-      while (verificationQueries.length < 6) {{
-        pushUnique(verificationQueries, `${{params.topic}} recheck source ${{verificationQueries.length + 1}}`);
-      }}
-      const verificationJobs = hasProvider(providers, "web_search")
-        ? verificationQueries.slice(0, 6).map((query) => progress.track(
-          `verify:web_search:${{query}}`,
-          "Verifying with web_search",
-          query,
-          searchProvider("web_search", query, maxResults, signal)
-        ))
-        : [];
-      progress.step("verify-search", "Running verification searches", `${{verificationJobs.length}} web_search rechecks`);
-      const verificationSettled = await Promise.allSettled(verificationJobs);
-      const verificationFindings: any[] = [];
-      for (const result of verificationSettled) {{
-        if (result.status === "rejected") {{
-          searchErrors.push(String(result.reason));
-          continue;
-        }}
-        for (const item of result.value) {{
-          const key = String(item.url || `${{item.provider}}:${{item.title}}`).toLowerCase();
-          if (seenUrls.has(key)) continue;
-          seenUrls.add(key);
-          verificationFindings.push(item);
-          findings.push(item);
-        }}
-      }}
-      sortFindingsByQuality(findings);
-      progress.step("verify-search", "Running verification searches", `${{verificationFindings.length}} additional verification sources`, "done");
-
-      const urlsToFetch = findings
-        .map((item) => item.url)
-        .filter((url) => typeof url === "string" && /^https?:\\/\\//i.test(url))
-        .slice(0, fetchTopPages);
-      progress.step("fetch", "Fetching source pages", `${{urlsToFetch.length}} pages selected`);
-      const fetchedSettled = await Promise.allSettled(
-        urlsToFetch.map((url) =>
-          progress.track(
-            `fetch:${{url}}`,
-            "Fetching page evidence",
-            compactText(url, 120),
-            fetchPageEvidence(url, signal)
-          )
-        )
-      );
-      const fetchedPages = fetchedSettled
-        .filter((result): result is PromiseFulfilledResult<any> => result.status === "fulfilled" && Boolean(result.value))
-        .map((result) => result.value);
-      progress.step("fetch", "Fetching source pages", `${{fetchedPages.length}} pages fetched`, "done");
-      progress.step("brief", "Assembling evidence brief", "Formatting findings and source excerpts");
-
-      const sourceLines = findings.slice(0, 24).map((item, index) =>
-        `${{index + 1}}. [${{item.provider}}] ${{item.title}}\\n   URL: ${{item.url || "n/a"}}\\n   Query: ${{item.query}}\\n   Note: ${{item.snippet || "No snippet."}}`
-      );
-      const fetchedLines = fetchedPages.map((page, index) =>
-        `Fetched source ${{index + 1}}: ${{page.title}}\\nURL: ${{page.url}}\\nExcerpt: ${{page.content || "No extractable text."}}`
-      );
-      progress.step("brief", "Assembling evidence brief", "Ready for synthesis", "done");
-      const progressLines = progress.snapshot().map((step, index) =>
-        `${{index + 1}}. [${{step.state}}] ${{step.title}}${{step.detail ? ` - ${{step.detail}}` : ""}} (${{step.elapsed_seconds}}s)`
-      );
-      const text = [
-        `Deep research brief for: ${{params.topic}}`,
-        "",
-        "Work trace:",
-        progressLines.join("\\n") || "No progress events recorded.",
-        "",
-        `Primary queries planned: ${{baseQueries.join(" | ")}}`,
-        `Providers attempted: ${{providers.join(", ")}}`,
-        `SerpAPI search passes: ${{serpapiQueries.length}}`,
-        `Tavily search passes: ${{tavilyQueries.length}}`,
-        `Web verification searches: ${{verificationJobs.length}}`,
-        `Unique sources found: ${{findings.length}}`,
-        `Additional verification sources: ${{verificationFindings.length}}`,
-        `Fetched pages: ${{fetchedPages.length}}`,
-        searchErrors.length ? `Provider errors: ${{searchErrors.slice(0, 5).join(" | ")}}` : "",
-        "",
-        "Source quality policy:",
-        SOLID_SOURCE_GUIDE,
-        "",
-        `Preferred domains/examples: ${{PREFERRED_SOURCE_DOMAINS.slice(0, 36).join(", ")}}`,
-        "",
-        "Search findings:",
-        sourceLines.join("\\n\\n") || "No search findings returned.",
-        "",
-        "Fetched evidence:",
-        fetchedLines.join("\\n\\n") || "No pages fetched.",
-        "",
-        DEEP_RESEARCH_REPORT_INSTRUCTIONS,
-        "",
-        "Report template to follow:",
-        DEEP_RESEARCH_REPORT_TEMPLATE,
-        "",
-        "Instruction for Pi: synthesize the answer from the evidence above, cite URLs inline, call this tool again with narrower questions if important gaps remain.",
-      ].filter(Boolean).join("\\n");
-
-      return {{
-        content: [{{ type: "text", text }}],
-        details: {{
-          topic: params.topic,
-          progress: progress.snapshot(),
-          queries: baseQueries,
-          serpapi_queries: serpapiQueries,
-          tavily_queries: tavilyQueries,
-          web_verification_queries: verificationQueries.slice(0, 6),
-          providers,
-          findings,
-          verification_findings: verificationFindings,
-          fetched_pages: fetchedPages,
-          errors: searchErrors,
-        }},
-      }};
-    }},
-  }});
-
-  pi.registerTool({{
-    name: "deep_plan_agent",
-    label: "Deep Plan Agent",
-    description: "Start the staged llama bridge deep research workflow and return a session_id plus next steps.",
-    parameters: Type.Object({{
-      topic: Type.String({{ description: "Main research topic." }}),
-      query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
-      required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 4 }})),
-      include_images: Type.Optional(Type.Boolean({{ description: "Whether images may be useful later.", default: true }})),
-      query_count: Type.Optional(Type.Number({{ description: "Query fanout for the staged collectors. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
-      include_official_hunt: Type.Optional(Type.Boolean({{ description: "Whether to run an official-source pass.", default: true }})),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const result = await callBridgeTool("deep_plan_agent", {{
-        topic: params.topic,
-        query: params.query,
-        required_verified_sources: params.required_verified_sources ?? 4,
-        include_images: params.include_images ?? true,
-        query_count: params.query_count ?? 2,
-        include_official_hunt: params.include_official_hunt ?? true,
-      }}, signal);
-      return {{
-        content: [{{ type: "text", text: pretty(result) }}],
-        details: result,
-      }};
-    }},
-  }});
-
-  pi.registerTool({{
-    name: "deep_collect_agent",
-    label: "Deep Collect Agent",
-    description: "Stage 2 for staged deep research: first return single-agent MCP calls, then assemble their returned briefs.",
-    parameters: Type.Object({{
-      topic: Type.String({{ description: "Main research topic." }}),
-      query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
-      session_id: Type.Optional(Type.String({{ description: "Session id from deep_plan_agent." }})),
-      query_count: Type.Optional(Type.Number({{ description: "Query fanout for collection. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
-      include_official_hunt: Type.Optional(Type.Boolean({{ description: "Whether to run an official-source pass.", default: true }})),
-      subagent_briefs: Type.Optional(Type.Array(Type.Any({{ description: "Results from the individual collection agent MCP calls." }}))),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const result = await callBridgeTool("deep_collect_agent", {{
-        topic: params.topic,
-        query: params.query,
-        session_id: params.session_id,
-        query_count: params.query_count ?? 2,
-        include_official_hunt: params.include_official_hunt ?? true,
-        subagent_briefs: params.subagent_briefs,
-      }}, signal);
-      return {{
-        content: [{{ type: "text", text: pretty(result) }}],
-        details: result,
-      }};
-    }},
-  }});
-
-  pi.registerTool({{
-    name: "deep_review_agent",
-    label: "Deep Review Agent",
-    description: "Stage 3 for staged deep research: first return single verify MCP calls, then assemble their returned briefs.",
-    parameters: Type.Object({{
-      topic: Type.String({{ description: "Main research topic." }}),
-      query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
-      session_id: Type.Optional(Type.String({{ description: "Session id from deep_plan_agent/deep_collect_agent." }})),
-      required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 4 }})),
-      include_images: Type.Optional(Type.Boolean({{ description: "Whether images may be useful later.", default: true }})),
-      selected_urls: Type.Optional(Type.Array(Type.String({{ description: "Optional URL shortlist to review first." }}))),
-      verification_briefs: Type.Optional(Type.Array(Type.Any({{ description: "Results from individual deep_verify_agent MCP calls." }}))),
-      verify_timeout_seconds: Type.Optional(Type.Number({{ description: "Timeout budget for verification.", default: {verify_timeout} }})),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const result = await callBridgeTool("deep_review_agent", {{
-        topic: params.topic,
-        query: params.query,
-        session_id: params.session_id,
-        required_verified_sources: params.required_verified_sources ?? 4,
-        include_images: params.include_images ?? true,
-        selected_urls: params.selected_urls,
-        verification_briefs: params.verification_briefs,
-        verify_timeout_seconds: params.verify_timeout_seconds ?? {verify_timeout},
-      }}, signal);
-      return {{
-        content: [{{ type: "text", text: pretty(result) }}],
-        details: result,
-      }};
-    }},
-  }});
-
-  pi.registerTool({{
-    name: "deep_tavily_agent",
-    label: "Deep Tavily Agent",
-    description: "Compact Tavily specialist for extending a staged deep research session.",
-    parameters: Type.Object({{
-      topic: Type.String({{ description: "Main research topic." }}),
-      focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
-      agent_name: Type.Optional(Type.String({{ description: "Assigned name from deep_collect_agent agent_calls." }})),
-      query_count: Type.Optional(Type.Number({{ description: "Number of search variants. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const result = await callBridgeTool("deep_tavily_agent", {{
-        topic: params.topic,
-        focus: params.focus,
-        agent_name: params.agent_name,
-        query_count: params.query_count ?? 2,
-      }}, signal);
-      return {{
-        content: [{{ type: "text", text: pretty(result) }}],
-        details: result,
-      }};
-    }},
-  }});
-
-  pi.registerTool({{
-    name: "deep_serp_agent",
-    label: "Deep Serp Agent",
-    description: "Compact SerpAPI specialist for extending a staged deep research session.",
-    parameters: Type.Object({{
-      topic: Type.String({{ description: "Main research topic." }}),
-      focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
-      agent_name: Type.Optional(Type.String({{ description: "Assigned name from deep_collect_agent agent_calls." }})),
-      query_count: Type.Optional(Type.Number({{ description: "Number of search variants. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const result = await callBridgeTool("deep_serp_agent", {{
-        topic: params.topic,
-        focus: params.focus,
-        agent_name: params.agent_name,
-        query_count: params.query_count ?? 2,
-      }}, signal);
-      return {{
-        content: [{{ type: "text", text: pretty(result) }}],
-        details: result,
-      }};
-    }},
-  }});
-
-  pi.registerTool({{
-    name: "deep_wiki_agent",
-    label: "Deep Wiki Agent",
-    description: "Compact Wikipedia specialist for extending a staged deep research session.",
-    parameters: Type.Object({{
-      topic: Type.String({{ description: "Main research topic." }}),
-      focus: Type.Optional(Type.String({{ description: "Specialized angle for this subagent." }})),
-      agent_name: Type.Optional(Type.String({{ description: "Assigned name from deep_collect_agent agent_calls." }})),
-      query_count: Type.Optional(Type.Number({{ description: "Number of search variants. Use 2 for fuller collection; lower only if timeouts occur.", default: 2 }})),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const result = await callBridgeTool("deep_wiki_agent", {{
-        topic: params.topic,
-        focus: params.focus,
-        agent_name: params.agent_name,
-        query_count: params.query_count ?? 2,
-      }}, signal);
-      return {{
-        content: [{{ type: "text", text: pretty(result) }}],
-        details: result,
-      }};
-    }},
-  }});
-
-  pi.registerTool({{
-    name: "deep_verify_agent",
-    label: "Deep Verify Agent",
-    description: "Verify a shortlist of URLs from the staged deep research flow.",
-    parameters: Type.Object({{
-      claim: Type.String({{ description: "Claim or topic to verify." }}),
-      urls: Type.Array(Type.String({{ description: "URLs to verify." }})),
-      agent_name: Type.Optional(Type.String({{ description: "Assigned name from deep_review_agent agent_calls." }})),
-      required_verified_sources: Type.Optional(Type.Number({{ description: "Target number of verified sources.", default: 3 }})),
-      verify_timeout_seconds: Type.Optional(Type.Number({{ description: "Timeout budget for verification.", default: {verify_timeout} }})),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const result = await callBridgeTool("deep_verify_agent", {{
-        claim: params.claim,
-        urls: params.urls,
-        agent_name: params.agent_name,
-        required_verified_sources: params.required_verified_sources ?? 3,
-        verify_timeout_seconds: params.verify_timeout_seconds ?? {verify_timeout},
-      }}, signal);
-      return {{
-        content: [{{ type: "text", text: pretty(result) }}],
-        details: result,
-      }};
-    }},
-  }});
-
-  pi.registerTool({{
-    name: "deep_image_agent",
-    label: "Deep Image Agent",
-    description: "Find and download sourced image assets for a staged deep research report.",
-    parameters: Type.Object({{
-      topic: Type.String({{ description: "Main research topic." }}),
-      query: Type.Optional(Type.String({{ description: "Alias for topic." }})),
-      max_results: Type.Optional(Type.Number({{ description: "Maximum image assets to collect.", default: 3 }})),
-      output_dir: Type.Optional(Type.String({{ description: "Repo-relative output directory.", default: "report_assets/images" }})),
-    }}),
-    async execute(_toolCallId, params, signal) {{
-      const result = await callBridgeTool("deep_image_agent", {{
-        topic: params.topic,
-        query: params.query,
-        max_results: params.max_results ?? 3,
-        output_dir: params.output_dir ?? "report_assets/images",
-      }}, signal);
-      return {{
-        content: [{{ type: "text", text: pretty(result) }}],
-        details: result,
-      }};
-    }},
-  }});
-
-  async function startDeepResearch(args: string, ctx: any) {{
-    let topic = args.trim();
-    if (!topic) {{
-      const entered = await ctx.ui.input(
-        "Deep research topic",
-        "Ask the question or topic for report.md"
-      );
-      topic = String(entered ?? "").trim();
-      if (!topic) {{
-        ctx.ui.notify("Deep research cancelled: no topic entered.", "warning");
-        return;
-      }}
-    }}
-    const prompt = [
-      `Run deep research in normal mode on: ${{topic}}`,
-      "",
-      "Do not switch to Plan mode and do not create todos.",
-      "Every MCP tool call should return within the configured deep research timeout ({timeout_seconds:g}s by default). If a source call times out, keep its compact error and continue with the next small call.",
-      "Call deep_plan_agent first and save the returned session_id.",
-      "Call deep_collect_agent next with the same session_id to get agent_calls.",
-      "Call every returned deep_tavily_agent, deep_serp_agent, and deep_wiki_agent entry as its own separate MCP call, one by one.",
-      "Call deep_collect_agent again with the same session_id and subagent_briefs from those individual calls.",
-      "Use the returned temp_files for detailed checkpoints, and keep temp/ad.md only as the legacy compact checkpoint.",
-      "Call deep_review_agent with the same session_id to get verification agent_calls.",
-      "Call every returned deep_verify_agent entry as its own separate MCP call, one by one.",
-      "Call deep_review_agent again with the same session_id and verification_briefs, then overwrite temp/ad.md with the returned reviewed_markdown.",
-      "Call deep_image_agent to download sourced image files into report_assets/images and use the returned local_path values in report.md.",
-      "Call deep_master_review_agent with reviewed_markdown and final_handoff to get 8 master-review agent_calls.",
-      "Call every returned deep_master_* review agent entry as its own separate MCP call, one by one.",
-      "Call deep_master_review_agent again with master_review_briefs and apply final_llm_instructions before writing report.md.",
-      "For /deep, do not call image_research directly; use deep_image_agent for image downloads and report attachments.",
-      "Create report.md only after staged collection, source verification, and the 8-call master review are complete.",
-      "When writing the file, call the write tool with both required fields: {{\\\"path\\\": \\\"report.md\\\", \\\"content\\\": \\\"<full markdown report>\\\"}}. Never call write with content only.",
-    ].join("\\n");
-    if (ctx.isIdle()) {{
-      pi.sendUserMessage(prompt);
-    }} else {{
-      pi.sendUserMessage(prompt, {{ deliverAs: "followUp" }});
-      ctx.ui.notify("Deep research queued", "info");
-    }}
-  }}
-
-  pi.registerCommand("deep", {{
-    description: "Run staged deep research with llama bridge subagents",
-    handler: async (args, ctx) => startDeepResearch(args, ctx),
-  }});
-}}
-"""
 
 
 def _ensure_node_and_npm() -> None:
@@ -7768,15 +6400,6 @@ def _cli_targets(config) -> list[CliTarget]:
             uninstall_hint=f"npm uninstall -g {config.opencode.install_package}",
         ),
         CliTarget(
-            name="openclaw",
-            display_name="OpenClaw",
-            launcher_command="llama openclaw",
-            finder=find_openclaw_executable,
-            install_method="npm",
-            package=config.openclaw.install_package,
-            uninstall_hint=f"npm uninstall -g {config.openclaw.install_package}",
-        ),
-        CliTarget(
             name="poolside",
             display_name="Poolside",
             launcher_command="llama poolside",
@@ -8036,18 +6659,19 @@ def _server_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
 
-def _http_status(url: str, path: str = "/health") -> str:
+async def _http_status_async(url: str, path: str = "/health") -> str:
     try:
-        request = Request(f"{url.rstrip('/')}{path}", method="GET")
-        with urlopen(request, timeout=1) as response:
-            return f"ok ({response.status})"
-    except URLError as exc:
-        reason = getattr(exc, "reason", exc)
-        return f"unreachable ({reason})"
-    except TimeoutError:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            response = await client.get(f"{url.rstrip('/')}{path}")
+            return f"ok ({response.status_code})"
+    except httpx.TimeoutException:
         return "unreachable (timeout)"
-    except OSError as exc:
+    except httpx.RequestError as exc:
         return f"unreachable ({exc})"
+
+
+def _http_status(url: str, path: str = "/health") -> str:
+    return asyncio.run(_http_status_async(url, path))
 
 
 def _serve_command(
@@ -8074,154 +6698,6 @@ def _serve_command(
     if idle_after_file is not None:
         command.extend(["--idle-after-file", str(idle_after_file)])
     return command
-
-
-def _cmd_openwebui_gui(config_path: Path) -> None:
-    from .openwebui_gui import launch_gui
-    launch_gui(config_path)
-
-
-def _cmd_openwebui_start(config_path: Path, auth: str | None = None, web_search: str | None = None, provider: str | None = None) -> None:
-    import yaml
-    from .openwebui_launcher import start_bridge, start_openwebui
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    owui_raw = raw.setdefault("openwebui", {})
-
-    if auth is not None:
-        owui_raw["auth_enabled"] = auth == "on"
-        owui_raw["auto_login"] = auth != "on"
-    if web_search is not None:
-        owui_raw["web_search_enabled"] = web_search == "on"
-    if provider is not None:
-        owui_raw["web_search_provider"] = provider
-
-    write_config_data(config_path, raw)
-
-    _title("llama openwebui start")
-    _print_state("start", "Starting bridge and Open WebUI...", "36")
-
-    ok, msg = start_bridge(config_path)
-    _print_state("bridge" if ok else "fail", msg, "32" if ok else "31")
-
-    ok, msg = start_openwebui(config_path)
-    _print_state("owui" if ok else "fail", msg, "32" if ok else "31")
-
-    try:
-        cfg = load_config(config_path)
-        _kv_rows([
-            ("Open WebUI", f"http://{cfg.openwebui.host}:{cfg.openwebui.port}"),
-            ("LLM endpoint", f"http://{cfg.server.host}:{cfg.server.openwebui_port or 11534}/v1"),
-            ("Tools endpoint", f"http://{cfg.server.host}:{cfg.server.port}/v1"),
-            ("Auth", "on" if cfg.openwebui.auth_enabled else "off"),
-            ("Web search", cfg.openwebui.web_search_provider if cfg.openwebui.web_search_enabled else "off"),
-        ])
-    except Exception:
-        pass
-
-
-def _cmd_openwebui_stop(config_path: Path) -> None:
-    from .openwebui_launcher import stop_openwebui
-    _title("llama openwebui stop")
-    ok, msg = stop_openwebui()
-    _print_state("stop", msg, "33")
-
-
-def _cmd_openwebui_restart(config_path: Path) -> None:
-    from .openwebui_launcher import stop_openwebui, start_openwebui, start_bridge
-    _title("llama openwebui restart")
-    _print_state("stop", "Stopping Open WebUI...", "33")
-    stop_openwebui()
-    _print_state("start", "Starting bridge...", "36")
-    ok, msg = start_bridge(config_path)
-    _print_state("bridge" if ok else "fail", msg, "32" if ok else "31")
-    _print_state("start", "Starting Open WebUI...", "36")
-    ok, msg = start_openwebui(config_path)
-    _print_state("owui" if ok else "fail", msg, "32" if ok else "31")
-
-
-def _cmd_openwebui_status(config_path: Path) -> None:
-    from .openwebui_launcher import status as launcher_status
-    st = launcher_status(config_path)
-    _title("llama openwebui status")
-    rows: list[tuple[str, str | int]] = [
-        ("Bridge", _status_label(st["bridge"]["running"])),
-        ("Bridge PID", st["bridge"]["pid"] or "-"),
-        ("Open WebUI", _status_label(st["openwebui"]["running"])),
-        ("Open WebUI PID", st["openwebui"]["pid"] or "-"),
-        ("Open WebUI installed", str(st["openwebui"]["installed"])),
-        ("Auth", "on" if st["config"]["auth_enabled"] else "off"),
-        ("Web search", st["config"]["web_search_provider"] if st["config"]["web_search_enabled"] else "off"),
-    ]
-    _kv_rows(rows)
-    print()
-    _print_note("URLs:")
-    for label, url in st["urls"].items():
-        _print_note(f"  {label}: {url}")
-
-
-def _cmd_openwebui_logs(config_path: Path) -> None:
-    from .openwebui_launcher import OPENWEBUI_LOG_PATH, LLAMA_LOG_PATH, follow_log
-    _title("llama openwebui logs")
-    print(_style("=== Bridge Log ===", "1;36"))
-    for line in follow_log(LLAMA_LOG_PATH, 50):
-        print(_format_log_line(line))
-    print()
-    print(_style("=== Open WebUI Log ===", "1;36"))
-    for line in follow_log(OPENWEBUI_LOG_PATH, 50):
-        print(line)
-
-
-def _cmd_openwebui_test_search(config_path: Path, query: str) -> None:
-    from .openwebui_config import test_search_provider, load_openwebui_config
-    owui = load_openwebui_config(config_path)
-    provider = owui.web_search_provider
-    if provider == "disabled":
-        _print_state("warn", "Web search is disabled", "33")
-        return
-    pcfg = owui.web_search_providers.get(provider)
-    api_key = pcfg.api_key if pcfg else None
-    if not api_key or api_key.startswith("${"):
-        api_key = os.environ.get(f"{provider.upper()}_API_KEY")
-
-    _title(f"llama openwebui test-search ({provider})")
-    _print_note(f"Query: {query}")
-    ok, msg = test_search_provider(provider, api_key, query)
-    if ok:
-        _print_state("ok", msg, "32")
-    else:
-        _print_state("fail", msg, "31")
-
-
-def _cmd_openwebui_configure(config_path: Path) -> None:
-    import yaml
-    from .openwebui_config import VALID_SEARCH_PROVIDERS
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    owui_raw = raw.setdefault("openwebui", {})
-
-    _title("llama openwebui configure")
-
-    owui_raw["enabled"] = _prompt_yes_no("Enable Open WebUI?", default=bool(owui_raw.get("enabled", True)))
-    owui_raw["host"] = _prompt_text("Open WebUI host", str(owui_raw.get("host", "127.0.0.1")))
-    owui_raw["port"] = int(_prompt_text("Open WebUI port", str(owui_raw.get("port", 8080))))
-    owui_raw["auth_enabled"] = _prompt_yes_no("Enable authentication?", default=bool(owui_raw.get("auth_enabled", False)))
-    owui_raw["auto_login"] = not owui_raw["auth_enabled"]
-    owui_raw["web_search_enabled"] = _prompt_yes_no("Enable web search?", default=bool(owui_raw.get("web_search_enabled", True)))
-
-    if owui_raw["web_search_enabled"]:
-        current_provider = str(owui_raw.get("web_search_provider", "ollama"))
-        owui_raw["web_search_provider"] = _prompt_choice(
-            "Web search provider", list(VALID_SEARCH_PROVIDERS), current_provider
-        )
-
-    write_config_data(config_path, raw)
-    _print_state("ok", "Open WebUI configuration updated", "32")
-    _kv_rows([
-        ("host", owui_raw.get("host", "127.0.0.1")),
-        ("port", owui_raw.get("port", 8080)),
-        ("auth", "on" if owui_raw.get("auth_enabled") else "off"),
-        ("web search", owui_raw.get("web_search_provider", "ollama") if owui_raw.get("web_search_enabled") else "off"),
-        ("config", str(config_path)),
-    ])
 
 
 def _start_windows_background(

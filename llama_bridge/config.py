@@ -87,9 +87,6 @@ server:
   # Set to 0 to keep running until `llama stop`.
   idle_timeout_seconds: 180
 
-  # Optional second port without built-in tools (for Open Web UI etc.)
-  # openwebui_port: 8090
-
 
 # =============================================================================
 #                           NGROK CONFIG
@@ -111,9 +108,14 @@ ngrok:
 #
 #    openai | ollama_local | ollama_cloud | groq | gemini | cohere
 #    mistral | deepseek | openrouter | lm_studio | nvidia_nim
-#    openai_compatible | sarvamai | kilo | opencode
+#    openai_compatible | sarvamai | kilo | opencode | cline
 #
 #  Use ${VAR_NAME} for sensitive values (API keys, tokens).
+#
+#  Fallback API (optional):
+#    - fallback_url: Backup API endpoint (used when primary returns 429 rate limit)
+#    - fallback_api_key: API key for the fallback endpoint
+#    Server automatically switches to fallback when primary hits rate limit.
 # =============================================================================
 
 providers:
@@ -140,6 +142,8 @@ providers:
     type: ollama_cloud
     base_url: https://ollama.com
     api_key: ${OLLAMA_API_KEY}
+    fallback_url: null
+    fallback_api_key: ${OLLAMA_FALLBACK_API_KEY}
     supports_tools: true
     default_model: gemma4:31b
     usage_limits:
@@ -238,8 +242,17 @@ providers:
     type: opencode
     base_url: https://opencode.ai/zen
     api_key: ${OPENCODE_API_KEY}
+    fallback_url: null
+    fallback_api_key: ${OPENCODE_FALLBACK_API_KEY}
     supports_tools: true
     default_model: opencode/auto
+
+  cline:
+    type: cline
+    base_url: https://api.cline.bot
+    api_key: ${CLINE_API_KEY}
+    supports_tools: true
+    default_model: deepseek-v4-flash
 
 
 # =============================================================================
@@ -334,22 +347,6 @@ opencode:
   provider: ollama_cloud
   model: gemma4:31b
   install_package: "opencode-ai"
-
-
-# =============================================================================
-#                      INTEGRATION: OPENCLAW
-# =============================================================================
-#  Configuration for the OpenClaw sandboxed agent.
-# =============================================================================
-
-openclaw:
-  provider: ollama_cloud
-  model: gemma4:31b
-  config_path: ~/.openclaw/llama-openclaw.json
-  workspace: ~/.openclaw/llama-workspace
-  workspace_access: none
-  sandbox_backend: docker
-  install_package: "openclaw"
 
 
 # =============================================================================
@@ -569,6 +566,8 @@ class ProviderConfig:
     extra_body: dict[str, Any] = field(default_factory=dict)
     usage_limits: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_limits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    fallback_url: str | None = None
+    fallback_api_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -619,17 +618,6 @@ class OpenCodeConfig:
     output_tokens: int = 8192
     small_model: str | None = None
     write_project_config: bool = False
-
-
-@dataclass(slots=True)
-class OpenClawConfig:
-    provider: str = "ollama_cloud"
-    model: str | None = None
-    config_path: str = "~/.openclaw/llama-openclaw.json"
-    workspace: str = "~/.openclaw/llama-workspace"
-    workspace_access: str = "none"
-    sandbox_backend: str = "docker"
-    install_package: str = "openclaw"
 
 
 @dataclass(slots=True)
@@ -827,7 +815,6 @@ class BridgeConfig:
     codex: CodexConfig
     copilot_cli: CopilotCliConfig
     opencode: OpenCodeConfig
-    openclaw: OpenClawConfig
     poolside: PoolsideConfig
     telegram: TelegramBotConfig
     vs_copilot_models: list[VsCopilotModel]
@@ -983,43 +970,6 @@ def opencode_model_error(config: BridgeConfig, provider_name: str | None = None)
         f"Config: {config.source_path}. Provider: {selected_provider}. "
         "Set opencode.model, set that provider's default_model, configure a model "
         "alias for that provider, or pass `llama opencode --model ...`."
-    )
-
-
-def resolve_openclaw_model(
-    config: BridgeConfig,
-    provider_name: str | None = None,
-    model_override: str | None = None,
-) -> str | None:
-    selected_provider = provider_name or config.openclaw.provider
-    provider = config.providers[selected_provider]
-    if model_override:
-        return model_override
-    if config.openclaw.model:
-        return config.openclaw.model
-    if provider.default_model:
-        return provider.default_model
-
-    preferred_aliases = ("sonnet", "opus", "haiku")
-    for alias_name in preferred_aliases:
-        alias = config.anthropic_models.get(alias_name)
-        if alias and alias.provider == selected_provider and alias.model:
-            return alias.model
-
-    for alias in config.anthropic_models.values():
-        if alias.provider == selected_provider and alias.model:
-            return alias.model
-
-    return None
-
-
-def openclaw_model_error(config: BridgeConfig, provider_name: str | None = None) -> str:
-    selected_provider = provider_name or config.openclaw.provider
-    return (
-        "OpenClaw model is not configured. "
-        f"Config: {config.source_path}. Provider: {selected_provider}. "
-        "Set openclaw.model, set that provider's default_model, configure a model "
-        "alias for that provider, or pass `llama openclaw --model ...`."
     )
 
 
@@ -1452,6 +1402,8 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             extra_body=value.get("extra_body", {}) or {},
             usage_limits=value.get("usage_limits", {}) or {},
             model_limits=value.get("model_limits", {}) or {},
+            fallback_url=value.get("fallback_url"),
+            fallback_api_key=value.get("fallback_api_key"),
         )
 
     aliases: dict[str, ModelAlias] = {}
@@ -1541,21 +1493,6 @@ def load_config(path: Path | None = None) -> BridgeConfig:
     if opencode.provider not in providers:
         raise ValueError(
             f"Unknown provider referenced by opencode.provider: {opencode.provider}"
-        )
-
-    openclaw_raw = raw.get("openclaw", {}) or {}
-    openclaw = OpenClawConfig(
-        provider=openclaw_raw.get("provider", codex.provider),
-        model=openclaw_raw.get("model"),
-        config_path=openclaw_raw.get("config_path", "~/.openclaw/llama-openclaw.json"),
-        workspace=openclaw_raw.get("workspace", "~/.openclaw/llama-workspace"),
-        workspace_access=str(openclaw_raw.get("workspace_access", "none")),
-        sandbox_backend=str(openclaw_raw.get("sandbox_backend", "docker")),
-        install_package=openclaw_raw.get("install_package", "openclaw"),
-    )
-    if openclaw.provider not in providers:
-        raise ValueError(
-            f"Unknown provider referenced by openclaw.provider: {openclaw.provider}"
         )
 
     poolside_raw = raw.get("poolside", {}) or {}
@@ -1663,7 +1600,6 @@ def load_config(path: Path | None = None) -> BridgeConfig:
         codex=codex,
         copilot_cli=copilot_cli,
         opencode=opencode,
-        openclaw=openclaw,
         poolside=poolside,
         telegram=telegram,
         vs_copilot_models=vs_copilot_models,
