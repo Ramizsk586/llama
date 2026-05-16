@@ -458,12 +458,6 @@ def main() -> None:
             _cmd_endpoints()
             return
 
-        if args.tui:
-            from . import tui as tui_module
-            config_path = getattr(args, 'config', None)
-            tui_module.run_main_tui(_arg_path(config_path) if config_path else None)
-            return
-
         if args.command is None:
             _cmd_info(_default_config_path())
             return
@@ -528,25 +522,7 @@ def main() -> None:
                 0 if args.forever else _configured_idle_timeout_seconds(config),
             )
             return
-        if args.command == "logs":
-            if args.tui:
-                from . import tui as tui_module
-                config_path = _arg_path(args.config) if args.config else _default_config_path()
-                log_path = _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path)
-                tui_module.run_logs_tui(log_path=log_path, dev=args.dev, config_path=config_path)
-                return
-            config_path = _arg_path(args.config) if args.config else _default_config_path()
-            _cmd_logs(
-                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
-                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
-                args.follow,
-                args.clear,
-                args.dev,
-                config_path,
-                args.tail,
-                use_active=not args.config and not args.log_file and not args.pid_file,
-            )
-            return
+
         if args.command == "status":
             config_path = _arg_path(args.config)
             _cmd_status(
@@ -737,11 +713,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="show all HTTP endpoints supported by the bridge",
     )
-    parser.add_argument(
-        "--tui",
-        action="store_true",
-        help="open the Textual-based Terminal UI (main dashboard)",
-    )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
     init_cmd = subparsers.add_parser("init", help="write a default config file")
@@ -807,11 +778,6 @@ def _build_parser() -> argparse.ArgumentParser:
     logs_cmd.add_argument("--log-file")
     logs_cmd.add_argument("--pid-file")
     logs_cmd.add_argument(
-        "--tui",
-        action="store_true",
-        help="open the Textual-based Terminal UI for logs",
-    )
-    logs_cmd.add_argument(
         "--clear",
         action="store_true",
         help="clear the bridge log before showing it",
@@ -820,19 +786,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dev",
         action="store_true",
         help="show Pi request and model response developer logs",
-    )
-    logs_cmd.add_argument(
-        "-f",
-        "--follow",
-        action="store_true",
-        default=True,
-        help="keep printing new log lines (default)",
-    )
-    logs_cmd.add_argument(
-        "--no-follow",
-        dest="follow",
-        action="store_false",
-        help="show the current log and exit",
     )
     logs_cmd.add_argument(
         "--tail",

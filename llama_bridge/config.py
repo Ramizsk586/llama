@@ -108,7 +108,7 @@ ngrok:
 #
 #    openai | ollama_local | ollama_cloud | groq | gemini | cohere
 #    mistral | deepseek | openrouter | lm_studio | nvidia_nim
-#    openai_compatible | sarvamai | kilo | opencode
+#    openai_compatible | sarvamai | kilo | opencode | cline
 #
 #  Use ${VAR_NAME} for sensitive values (API keys, tokens).
 #
@@ -246,6 +246,13 @@ providers:
     fallback_api_key: ${OPENCODE_FALLBACK_API_KEY}
     supports_tools: true
     default_model: opencode/auto
+
+  cline:
+    type: cline
+    base_url: https://api.cline.bot
+    api_key: ${CLINE_API_KEY}
+    supports_tools: true
+    default_model: deepseek-v4-flash
 
 
 # =============================================================================
