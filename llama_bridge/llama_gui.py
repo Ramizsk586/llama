@@ -326,7 +326,6 @@ class LlamaControlCenter:
             ("port", "Port", str(server_raw.get("port", 8089))),
             ("auth_token", "Auth Token", str(server_raw.get("auth_token", ""))),
             ("idle_timeout", "Idle Timeout (s)", str(server_raw.get("idle_timeout_seconds", 180))),
-            ("openwebui_port", "Open WebUI Port", str(server_raw.get("openwebui_port", ""))),
         ]
         self._server_vars = {}
         for key, label, default in fields:
@@ -358,9 +357,6 @@ class LlamaControlCenter:
         if token:
             self._server_raw_ref["auth_token"] = token
         self._server_raw_ref["idle_timeout_seconds"] = int(self._server_vars["idle_timeout"].get())
-        ow = self._server_vars["openwebui_port"].get().strip()
-        if ow:
-            self._server_raw_ref["openwebui_port"] = int(ow)
         self.config_path.write_text(yaml.safe_dump(self._server_raw_top, sort_keys=False, allow_unicode=False), encoding="utf-8")
         self._on_config_saved()
 
@@ -1052,7 +1048,6 @@ class ServerConfigDialog:
             ("port", "Port", int),
             ("auth_token", "Auth Token", str),
             ("idle_timeout_seconds", "Idle Timeout (s)", int),
-            ("openwebui_port", "Open WebUI Port", str),
         ]
         self._vars: dict[str, ctk.StringVar] = {}
         row = 0
@@ -1082,12 +1077,6 @@ class ServerConfigDialog:
                     entry.configure(show="" if self.show_auth_var.get() else "*")
                 ctk.CTkCheckBox(auth_frame, text="Show", variable=self.show_auth_var,
                                 command=_toggle_auth, font=("Segoe UI", 10)).pack(side="left", padx=(6, 0))
-            elif key == "openwebui_port":
-                ow_port = self.server_raw.get(key)
-                var = ctk.StringVar(value=str(ow_port) if ow_port else "")
-                entry = ctk.CTkEntry(main, textvariable=var, width=120,
-                                     font=("Segoe UI", 10))
-                entry.grid(row=row, column=1, sticky="w", pady=(0, 10))
             else:
                 var = ctk.StringVar(value=str(self.server_raw.get(key, "127.0.0.1")))
                 entry = ctk.CTkEntry(main, textvariable=var, width=240,
@@ -1115,11 +1104,6 @@ class ServerConfigDialog:
         if token:
             self.server_raw["auth_token"] = token
         self.server_raw["idle_timeout_seconds"] = int(self._vars["idle_timeout_seconds"].get())
-        ow = self._vars["openwebui_port"].get().strip()
-        if ow:
-            self.server_raw["openwebui_port"] = int(ow)
-        else:
-            self.server_raw.pop("openwebui_port", None)
         self.config_path.write_text(
             yaml.safe_dump(self.raw, sort_keys=False, allow_unicode=False), encoding="utf-8")
         if self.on_save:
@@ -1619,8 +1603,6 @@ class DetailsDialog:
                                                "set" if (auth and auth != "change-me") else "change-me"))
         items.append(DetailsDialog._DetailItem("Idle timeout", f"{server_raw.get('idle_timeout_seconds', 180)}s",
                                                str(server_raw.get('idle_timeout_seconds', 180))))
-        items.append(DetailsDialog._DetailItem("OpenWebUI port", str(server_raw.get("openwebui_port", "none")),
-                                               str(server_raw.get("openwebui_port", "none"))))
         items.append(DetailsDialog._DetailItem("Providers", str(len(providers_raw)),
                                                ", ".join(providers_raw.keys()) if providers_raw else "none"))
         for name, prov in sorted(providers_raw.items()):

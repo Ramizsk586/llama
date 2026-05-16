@@ -21,14 +21,21 @@ class ResolvedModel:
 
 class OpenAICompatibleProvider:
     _TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-    _DEFAULT_MAX_PARALLEL_MODEL_REQUESTS = 2
+    _DEFAULT_MAX_PARALLEL_MODEL_REQUESTS = 10
 
     def __init__(self, config: ProviderConfig):
         self.config = config
-        self._request_semaphore = asyncio.Semaphore(self._configured_parallel_limit())
+        parallel_limit = self._configured_parallel_limit()
+        self._request_semaphore = asyncio.Semaphore(parallel_limit)
+        # Scale connection pool with parallel limit
+        max_connections = max(parallel_limit * 4, 100)
+        max_keepalive = max(parallel_limit * 2, 20)
         self._client = httpx.AsyncClient(
             timeout=config.timeout,
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive,
+            ),
         )
 
     async def aclose(self) -> None:
@@ -253,6 +260,7 @@ def build_provider(config: ProviderConfig) -> OpenAICompatibleProvider:
         "sarvamai",
         "kilo",
         "opencode",
+        "cline",
     }:
         raise ValueError(f"Unsupported provider type: {config.type}")
     if config.type == "opencode":
