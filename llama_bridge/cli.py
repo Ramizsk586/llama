@@ -458,6 +458,12 @@ def main() -> None:
             _cmd_endpoints()
             return
 
+        if args.tui:
+            from . import tui as tui_module
+            config_path = getattr(args, 'config', None)
+            tui_module.run_main_tui(_arg_path(config_path) if config_path else None)
+            return
+
         if args.command is None:
             _cmd_info(_default_config_path())
             return
@@ -523,6 +529,12 @@ def main() -> None:
             )
             return
         if args.command == "logs":
+            if args.tui:
+                from . import tui as tui_module
+                config_path = _arg_path(args.config) if args.config else _default_config_path()
+                log_path = _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path)
+                tui_module.run_logs_tui(log_path=log_path, dev=args.dev, config_path=config_path)
+                return
             config_path = _arg_path(args.config) if args.config else _default_config_path()
             _cmd_logs(
                 _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
@@ -666,17 +678,10 @@ def main() -> None:
                 remove_target=args.rm,
             )
             return
-        if args.command in ("gui", "control-center", "cc"):
-            config_path = _arg_path(args.config)
-            _cmd_llama_gui(config_path)
-            return
         if args.command == "bot":
             config_path = _arg_path(getattr(args, "bot_run_config", None) or args.config)
             if args.bot_command in {None, "setup"}:
                 _cmd_bot_setup(config_path)
-                return
-            if args.bot_command == "gui":
-                _cmd_bot_gui(config_path)
                 return
             if args.bot_command == "run":
                 from .teligram import run_teligram
@@ -731,6 +736,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--endpoints",
         action="store_true",
         help="show all HTTP endpoints supported by the bridge",
+    )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="open the Textual-based Terminal UI (main dashboard)",
     )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
@@ -796,6 +806,11 @@ def _build_parser() -> argparse.ArgumentParser:
     logs_cmd.add_argument("--config")
     logs_cmd.add_argument("--log-file")
     logs_cmd.add_argument("--pid-file")
+    logs_cmd.add_argument(
+        "--tui",
+        action="store_true",
+        help="open the Textual-based Terminal UI for logs",
+    )
     logs_cmd.add_argument(
         "--clear",
         action="store_true",
@@ -1126,11 +1141,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     bot_cmd = subparsers.add_parser(
         "bot",
-        help="Telegram bot setup and GUI",
+        help="Telegram bot setup",
     )
     bot_cmd.add_argument("--config")
     bot_subparsers = bot_cmd.add_subparsers(dest="bot_command")
-    bot_subparsers.add_parser("gui", help="launch the Telegram Bot Setup Center GUI")
     bot_subparsers.add_parser("setup", help="run the Telegram bot setup workflow")
     bot_run_cmd = bot_subparsers.add_parser("run", help="run the Teligram polling bot")
     bot_run_cmd.add_argument("--config", dest="bot_run_config", help="path to env.yml")
@@ -1144,13 +1158,6 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_send_ai.add_argument("message", nargs="+", help="prompt for the AI message")
     bot_subparsers.add_parser("test-token", help="test Telegram bot token via getMe")
     bot_subparsers.add_parser("logs", help="show last 50 lines of Telegram bot log")
-
-    gui_cmd = subparsers.add_parser(
-        "gui",
-        help="Llama Bridge Control Center - manage server, providers, CLI tools via compact GUI",
-        aliases=["control-center", "cc"],
-    )
-    gui_cmd.add_argument("--config")
 
     return parser
 
@@ -3236,36 +3243,6 @@ def _cmd_bot_logs(config_path: Path) -> None:
     _title("llama bot logs")
     for line in lines:
         print(line)
-
-
-def _cmd_bot_gui(config_path: Path) -> None:
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.kernel32.FreeConsole()
-        except Exception:
-            pass
-    from .telegram_setup_gui import HAS_TK as _HAS_TK
-    if not _HAS_TK:
-        raise SystemExit("Tkinter is not available. Install python-tk or python3-tk.")
-    from .telegram_setup_gui import TelegramSetupCenter
-    app = TelegramSetupCenter(config_path)
-    app.run()
-
-
-def _cmd_llama_gui(config_path: Path) -> None:
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.kernel32.FreeConsole()
-        except Exception:
-            pass
-    from .llama_gui import HAS_TK as _HAS_TK
-    if not _HAS_TK:
-        raise SystemExit("Tkinter is not available. Install python-tk or python3-tk.")
-    from .llama_gui import LlamaControlCenter
-    app = LlamaControlCenter(config_path)
-    app.run()
 
 
 def _render_api_limits_screen(config) -> None:

@@ -33,3 +33,5 @@ llama.ngrok.log
 llama.ngrok.pid
 generated
 .usage.json
+llama.usage.json
+=0.90.0
