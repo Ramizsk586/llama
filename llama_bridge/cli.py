@@ -531,6 +531,18 @@ def main() -> None:
                 _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
             )
             return
+        if args.command == "logs":
+            config_path = _arg_path(args.config)
+            _cmd_logs(
+                _arg_path(args.log_file, DEFAULT_LOG_PATH, config_path),
+                _arg_path(args.pid_file, DEFAULT_PID_PATH, config_path),
+                follow=args.follow,
+                clear=args.clear,
+                dev=args.dev,
+                config_path=config_path,
+                tail=args.tail,
+            )
+            return
         if args.command == "usage":
             _cmd_usage(_arg_path(args.config), args.watch, args.json)
             return
@@ -792,6 +804,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=200,
         help="number of existing log lines to show before following (default: 200, use 0 for all)",
+    )
+    logs_cmd.add_argument(
+        "--follow", "-f",
+        action="store_true",
+        default=True,
+        help="keep printing new log lines (default)",
+    )
+    logs_cmd.add_argument(
+        "--no-follow",
+        dest="follow",
+        action="store_false",
+        help="show the current log and exit",
     )
 
     status_cmd = subparsers.add_parser("status", help="show bridge status")
