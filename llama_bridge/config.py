@@ -449,7 +449,6 @@ telegram:
       - image_download
     require_admin_for:
       - shell.execute
-      - manim_render
     require_owner_for:
       - shell.execute
 
@@ -477,7 +476,6 @@ tools:
   include:
     - shell.execute
     - datetime_now
-    - manim_render
     - wikipedia_search
     - wikipedia_page
     - weather_current
@@ -653,7 +651,7 @@ class ToolPolicy:
         "weather_current", "wikipedia_search",
         "tavily_search", "ddg_image_download", "image_research", "image_download",
     ])
-    require_admin_for: list[str] = field(default_factory=lambda: ["shell.execute", "manim_render"])
+    require_admin_for: list[str] = field(default_factory=lambda: ["shell.execute"])
     require_owner_for: list[str] = field(default_factory=lambda: ["shell.execute"])
 
 

@@ -12,7 +12,6 @@ llama.spec
 llama_bridge.egg-info
 llama.telegram.json
 llama.poolside.closed
-manim_outputs
 test.py
 plugins
 llama_bridge_tools_claude

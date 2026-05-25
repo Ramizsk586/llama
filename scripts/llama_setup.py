@@ -3,6 +3,8 @@
 # - Replaced the dot spinner with step-aware progress bars and an in-place status panel.
 # - Added disk, admin, install-path, clone-integrity, lockfile, registry-length, and exe checks.
 # - Added dry-run support, rollback on failed installs, cleanup hardening, and a post-install smoke test.
+# - [NEW] Added guardrail checks: each safety assertion is labelled [GUARDRAIL] and logged step-by-step.
+# - [NEW] Restructured step output: every sub-action prints as a numbered bullet, not a paragraph blob.
 
 from __future__ import annotations
 
@@ -63,6 +65,9 @@ UNICODE_FALLBACKS = str.maketrans(
         "⚠": "!",
         "·": ".",
         "🦙": "LLAMA",
+        "🛡": "[G]",
+        "▶": ">",
+        "─": "-",
         "—": "-",
         "═": "=",
         "╔": "+",
@@ -110,8 +115,10 @@ class Log:
 
     @classmethod
     def step(cls, n: int, total: int, label: str) -> None:
-        """Log the start of a major numbered step."""
-        cls._emit(f"[{n}/{total}] {label}", cls.CYAN_BOLD)
+        """Log the start of a major numbered step with a separator line."""
+        bar = "─" * 50
+        cls._emit(bar, cls.DIM)
+        cls._emit(f"▶  STEP {n}/{total}  ·  {label}", cls.CYAN_BOLD)
 
     @classmethod
     def info(cls, msg: str) -> None:
@@ -138,6 +145,26 @@ class Log:
         """Log verbose diagnostic information."""
         if cls.verbose:
             cls._emit(msg, cls.DIM)
+
+    @classmethod
+    def substep(cls, n: int, total: int, msg: str) -> None:
+        """Log a numbered sub-action within a major step."""
+        cls._emit(f"  {n}/{total} · {msg}", cls.WHITE)
+
+    @classmethod
+    def guardrail(cls, msg: str) -> None:
+        """Log a guardrail safety check being performed."""
+        cls._emit(f"  🛡 [GUARDRAIL] {msg}", cls.YELLOW)
+
+    @classmethod
+    def guardrail_ok(cls, msg: str) -> None:
+        """Log a passed guardrail check."""
+        cls._emit(f"  🛡 [GUARDRAIL ✔] {msg}", cls.GREEN)
+
+    @classmethod
+    def guardrail_fail(cls, msg: str) -> None:
+        """Log a failed guardrail check before raising."""
+        cls._emit(f"  🛡 [GUARDRAIL ✖] {msg}", cls.RED)
 
     @classmethod
     def section(cls, title: str) -> None:
@@ -390,11 +417,17 @@ def main() -> int:
         lock_created = _acquire_lock(args.dry_run)
 
         step = steps.next("Checked prerequisites")
+        Log.substep(1, 6, "Locating Git")
         git = _ensure_git(args.dry_run)
+        Log.substep(2, 6, "Locating Python 3.11+")
         python = _ensure_python(args.dry_run)
+        Log.substep(3, 6, "Checking not running as Administrator")
         _refuse_admin()
+        Log.substep(4, 6, "Validating install directory")
         _validate_install_dir(install_dir)
+        Log.substep(5, 6, "Checking for existing Llama installation")
         _check_existing_llama_install(install_dir, args, install_state)
+        Log.substep(6, 6, "Checking available disk space")
         _check_disk_space(Path(tempfile.gettempdir()), install_dir)
         steps.complete(step)
         panel.render()
@@ -416,6 +449,7 @@ def main() -> int:
         agent_source_dir = temp_root / "agent"
 
         step = steps.next("Cloned repository")
+        Log.substep(1, 3, f"git clone --depth 1 {args.repo}")
         clone_command = [git, "clone", "--depth", "1"]
         if args.branch:
             clone_command.extend(["--branch", args.branch])
@@ -431,21 +465,31 @@ def main() -> int:
             _run([git, "clone", "--depth", "1", args.repo, str(source_dir)], "Cloning repository", panel, step)
             _run([git, "-C", str(source_dir), "fetch", "--depth", "1", "origin", args.branch], "Fetching requested ref", panel, step, finish_step=False)
             _run([git, "-C", str(source_dir), "checkout", args.branch], "Checking out requested ref", panel, step)
+        Log.substep(2, 3, "Verifying project file (pyproject.toml / setup.py)")
+        Log.substep(3, 3, "Verifying entry-point (llama_bridge/__main__.py)")
         _verify_clone_integrity(source_dir)
 
         step = steps.next("Created virtual environment")
+        Log.substep(1, 1, f"python -m venv {venv_dir}")
         _run([python, "-m", "venv", str(venv_dir)], "Creating build environment", panel, step)
         build_python = str(_venv_python(venv_dir))
 
         step = steps.next("Installed dependencies")
+        Log.substep(1, 3, "pip install --upgrade pip setuptools wheel pyinstaller fastapi httpx pydantic uvicorn pyyaml")
+        Log.substep(2, 3, "pip install -e . (llama project dependencies)")
+        Log.substep(3, 3, "Verify all required modules are importable")
         _install_build_dependencies(build_python, source_dir, panel, step)
 
         step = steps.next("Built llama.exe")
+        Log.substep(1, 4, "Running PyInstaller --onedir to produce llama.exe")
         _build_llama_exe(build_python, source_dir, panel, step)
         built_dir = source_dir / "dist" / APP_NAME
         built_exe = built_dir / f"{APP_NAME}.exe"
         if not built_exe.exists():
             raise RuntimeError(f"Build did not create {built_exe}")
+        Log.substep(2, 4, "Checking MZ header (valid Windows PE)")
+        Log.substep(3, 4, "Checking executable size ≥ 5 MB")
+        Log.substep(4, 4, "Verifying SHA256SUMS (if present)")
         _verify_exe(built_exe, source_dir)
 
         install_agent, agent_is_update = _choose_agent_install(args, install_dir)
@@ -459,16 +503,22 @@ def main() -> int:
             panel.render()
 
         step = steps.next("Copied runtime files")
+        Log.substep(1, 3, "Staging built files to temp/package")
         _copy_tree(built_dir, staging_dir, agent_source_dir if install_agent else None, args.dry_run)
+        Log.substep(2, 3, "Replacing install directory (with rollback backup)")
         _replace_install_dir(staging_dir, install_dir, install_state, args.dry_run)
+        Log.substep(3, 3, "Post-install smoke test: llama.exe --version")
         _smoke_test(install_dir, args.dry_run)
         steps.complete(step)
         panel.render()
 
         step = steps.next("Updated PATH & environment")
+        Log.substep(1, 3, "Adding install dir to user PATH (HKCU registry)")
         path_updated = _add_to_user_path(install_dir, panel, step, args.dry_run)
         if install_agent:
+            Log.substep(2, 3, "Setting LLAMA_AGENT_HOME environment variable")
             _set_user_env("LLAMA_AGENT_HOME", str(install_dir / "agent"), panel, step, args.dry_run, finish_step=False)
+        Log.substep(3, 3, "Setting LLAMA_HOME environment variable")
         _set_user_env("LLAMA_HOME", str(install_dir), panel, step, args.dry_run, finish_step=True)
 
         install_state.install_succeeded = True
@@ -1145,21 +1195,27 @@ def _rollback_install_dir(install_dir: Path, state: InstallState, dry_run: bool)
 def _validate_install_dir(install_dir: Path) -> None:
     """Reject unsafe install targets."""
     raw = str(install_dir)
-    if any(char in raw for char in SHELL_SPECIAL_CHARS):
-        raise RuntimeError(f"Refusing install path with unsafe characters: {install_dir}")
-    if len(raw) > MAX_INSTALL_PATH:
-        raise RuntimeError(f"Install path is too long ({len(raw)} chars, max {MAX_INSTALL_PATH}): {install_dir}")
-    if install_dir.anchor == raw:
-        raise RuntimeError("Refusing to install into a drive root.")
-    if install_dir.name.lower() in {"", "windows", "system32", "program files", "program files (x86)", "users"}:
-        raise RuntimeError(f"Refusing unsafe install directory: {install_dir}")
-    for prefix in {Path(sys.prefix).resolve(), Path(sys.exec_prefix).resolve()}:
-        if _is_parent_or_same(install_dir, prefix):
-            raise RuntimeError(f"Refusing to install into a parent of the active Python runtime: {install_dir}")
-    system_path = _read_system_env("PATH")
-    for part in [item for item in system_path.split(";") if item]:
-        if _same_path(Path(os.path.expandvars(part)).expanduser(), install_dir):
-            raise RuntimeError(f"Refusing install directory already present on the System PATH: {install_dir}")
+    with _guardrail("Install path contains no shell-special characters"):
+        if any(char in raw for char in SHELL_SPECIAL_CHARS):
+            raise RuntimeError(f"Refusing install path with unsafe characters: {install_dir}")
+    with _guardrail(f"Install path length ≤ {MAX_INSTALL_PATH} chars (currently {len(raw)})"):
+        if len(raw) > MAX_INSTALL_PATH:
+            raise RuntimeError(f"Install path is too long ({len(raw)} chars, max {MAX_INSTALL_PATH}): {install_dir}")
+    with _guardrail("Install path is not a drive root"):
+        if install_dir.anchor == raw:
+            raise RuntimeError("Refusing to install into a drive root.")
+    with _guardrail("Install path is not a protected system directory"):
+        if install_dir.name.lower() in {"", "windows", "system32", "program files", "program files (x86)", "users"}:
+            raise RuntimeError(f"Refusing unsafe install directory: {install_dir}")
+    with _guardrail("Install path does not shadow the active Python runtime"):
+        for prefix in {Path(sys.prefix).resolve(), Path(sys.exec_prefix).resolve()}:
+            if _is_parent_or_same(install_dir, prefix):
+                raise RuntimeError(f"Refusing to install into a parent of the active Python runtime: {install_dir}")
+    with _guardrail("Install path is not already on the System PATH"):
+        system_path = _read_system_env("PATH")
+        for part in [item for item in system_path.split(";") if item]:
+            if _same_path(Path(os.path.expandvars(part)).expanduser(), install_dir):
+                raise RuntimeError(f"Refusing install directory already present on the System PATH: {install_dir}")
     Log.ok("Install directory passed safety checks.")
 
 
@@ -1311,6 +1367,29 @@ def _run_without_panel(command: list[str], label: str) -> None:
     Log.ok(label)
 
 
+def _guardrail(label: str) -> "_GuardrailCtx":
+    """Return a context manager that logs a guardrail check with pass/fail markers."""
+    return _GuardrailCtx(label)
+
+
+class _GuardrailCtx:
+    """Context manager for a single guardrail assertion."""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    def __enter__(self) -> "_GuardrailCtx":
+        Log.guardrail(self._label)
+        return self
+
+    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object) -> bool:
+        if exc_val is None:
+            Log.guardrail_ok(self._label)
+        else:
+            Log.guardrail_fail(f"{self._label} — {exc_val}")
+        return False  # never suppress the exception
+
+
 def _cleanup_stale_temp_dirs(skip: Path | None, dry_run: bool) -> None:
     """Remove stale llama setup temporary directories."""
     temp_base = Path(tempfile.gettempdir())
@@ -1328,13 +1407,15 @@ def _cleanup_stale_temp_dirs(skip: Path | None, dry_run: bool) -> None:
 
 def _check_disk_space(temp_dir: Path, install_dir: Path) -> None:
     """Check free disk space for temp and install drives."""
-    temp_free = shutil.disk_usage(temp_dir).free
-    if temp_free < MIN_TEMP_FREE:
-        raise RuntimeError(f"Not enough disk space in temp dir: {temp_free // 1024**2} MB available, 2048 MB required.")
-    install_base = _existing_parent(install_dir)
-    install_free = shutil.disk_usage(install_base).free
-    if install_free < MIN_INSTALL_FREE:
-        raise RuntimeError(f"Not enough disk space for install dir: {install_free // 1024**2} MB available, 500 MB required.")
+    with _guardrail(f"Temp drive free space ≥ 2 GB ({temp_dir})"):
+        temp_free = shutil.disk_usage(temp_dir).free
+        if temp_free < MIN_TEMP_FREE:
+            raise RuntimeError(f"Not enough disk space in temp dir: {temp_free // 1024**2} MB available, 2048 MB required.")
+    with _guardrail(f"Install drive free space ≥ 500 MB ({install_dir})"):
+        install_base = _existing_parent(install_dir)
+        install_free = shutil.disk_usage(install_base).free
+        if install_free < MIN_INSTALL_FREE:
+            raise RuntimeError(f"Not enough disk space for install dir: {install_free // 1024**2} MB available, 500 MB required.")
     Log.ok("Disk space checks passed.")
 
 
@@ -1350,33 +1431,40 @@ def _refuse_admin() -> None:
     """Refuse to run the user-space installer as Administrator."""
     if os.name != "nt":
         return
-    try:
-        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:  # noqa: BLE001 - Windows API can fail in restricted shells.
-        is_admin = False
-    if is_admin:
-        raise RuntimeError("This installer must NOT be run as Administrator. Re-run as a normal user.")
+    with _guardrail("Must NOT run as Administrator"):
+        try:
+            is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:  # noqa: BLE001 - Windows API can fail in restricted shells.
+            is_admin = False
+        if is_admin:
+            raise RuntimeError("This installer must NOT be run as Administrator. Re-run as a normal user.")
     Log.ok("Installer is running as a normal user.")
 
 
 def _verify_clone_integrity(source_dir: Path) -> None:
     """Verify the cloned repository looks like a llama project."""
-    has_project_file = any((source_dir / name).exists() for name in ("pyproject.toml", "setup.py", "setup.cfg"))
-    has_entrypoint = (source_dir / "llama_bridge" / "__main__.py").exists()
-    if not has_project_file or not has_entrypoint:
-        raise RuntimeError("Cloned repository does not look like a valid llama project. Aborting.")
+    with _guardrail("Clone has pyproject.toml / setup.py / setup.cfg"):
+        has_project_file = any((source_dir / name).exists() for name in ("pyproject.toml", "setup.py", "setup.cfg"))
+        if not has_project_file:
+            raise RuntimeError("Cloned repository does not look like a valid llama project (no project file). Aborting.")
+    with _guardrail("Clone has llama_bridge/__main__.py entry-point"):
+        has_entrypoint = (source_dir / "llama_bridge" / "__main__.py").exists()
+        if not has_entrypoint:
+            raise RuntimeError("Cloned repository does not look like a valid llama project (no __main__.py). Aborting.")
     Log.ok("Cloned repository passed integrity checks.")
 
 
 def _verify_exe(path: Path, repo_root: Path) -> None:
     """Verify the built executable has expected basic integrity."""
-    with path.open("rb") as file:
-        magic = file.read(2)
-    if magic != b"MZ":
-        raise RuntimeError(f"Built file does not look like a Windows executable: {path}")
-    size = path.stat().st_size
-    if size < 5 * 1024 * 1024:
-        raise RuntimeError(f"Built executable is suspiciously small ({size} bytes). Build may have failed silently.")
+    with _guardrail(f"Built file has valid Windows MZ header: {path.name}"):
+        with path.open("rb") as file:
+            magic = file.read(2)
+        if magic != b"MZ":
+            raise RuntimeError(f"Built file does not look like a Windows executable: {path}")
+    with _guardrail(f"Built executable is at least 5 MB: {path.name}"):
+        size = path.stat().st_size
+        if size < 5 * 1024 * 1024:
+            raise RuntimeError(f"Built executable is suspiciously small ({size} bytes). Build may have failed silently.")
     _verify_optional_sha256(path, repo_root)
     Log.ok(f"Built executable verified ({size // 1024**2} MB).")
 
@@ -1386,18 +1474,19 @@ def _verify_optional_sha256(path: Path, repo_root: Path) -> None:
     sums = repo_root / "SHA256SUMS"
     if not sums.exists():
         return
-    digest = hashlib.sha256(path.read_bytes()).hexdigest().lower()
-    for line in sums.read_text(encoding="utf-8", errors="replace").splitlines():
-        parts = line.strip().split()
-        if len(parts) < 2:
-            continue
-        expected, filename = parts[0].lower(), parts[-1].lstrip("*")
-        normalized = filename.replace("\\", "/")
-        if Path(normalized).name == path.name:
-            if digest != expected:
-                raise RuntimeError(f"SHA256 mismatch for {path.name}.")
-            Log.ok("SHA256SUMS verification passed.")
-            return
+    with _guardrail(f"SHA256 checksum matches SHA256SUMS for {path.name}"):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest().lower()
+        for line in sums.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            expected, filename = parts[0].lower(), parts[-1].lstrip("*")
+            normalized = filename.replace("\\", "/")
+            if Path(normalized).name == path.name:
+                if digest != expected:
+                    raise RuntimeError(f"SHA256 mismatch for {path.name}.")
+                Log.ok("SHA256SUMS verification passed.")
+                return
     Log.debug("SHA256SUMS present but no llama.exe entry was found.")
 
 
@@ -1407,29 +1496,31 @@ def _smoke_test(install_dir: Path, dry_run: bool) -> None:
     if dry_run:
         Log.info(f"[DRY RUN] Would run smoke test: {exe} --version")
         return
-    for args, timeout in ((["--version"], 10), (["--help"], 5)):
-        try:
-            result = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=timeout, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            Log.warn(f"Post-install smoke test failed to run: {exc}")
-            return
-        if result.returncode == 0:
-            output = (result.stdout or result.stderr).strip().splitlines()
-            suffix = f": {output[0]}" if output else ""
-            Log.ok(f"Smoke test passed{suffix}")
-            return
-    Log.warn("Post-install smoke test failed — llama.exe ran but returned non-zero. Installation may be broken.")
+    with _guardrail(f"Post-install smoke test: {exe.name} --version / --help"):
+        for args, timeout in ((["--version"], 10), (["--help"], 5)):
+            try:
+                result = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=timeout, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                Log.warn(f"Post-install smoke test failed to run: {exc}")
+                return
+            if result.returncode == 0:
+                output = (result.stdout or result.stderr).strip().splitlines()
+                suffix = f": {output[0]}" if output else ""
+                Log.ok(f"Smoke test passed{suffix}")
+                return
+        raise RuntimeError("llama.exe ran but returned non-zero. Installation may be broken.")
 
 
 def _acquire_lock(dry_run: bool) -> bool:
     """Create the setup lock file unless another live setup owns it."""
-    if LOCK_PATH.exists():
-        text = LOCK_PATH.read_text(encoding="utf-8", errors="ignore").strip()
-        if text.isdigit() and _pid_is_running(int(text)):
-            raise RuntimeError(f"Another llama setup process is already running (PID {text}). Please wait for it to finish.")
-        Log.warn("Removing stale setup lock file.")
-        if not dry_run:
-            LOCK_PATH.unlink(missing_ok=True)
+    with _guardrail("No other llama setup process is already running"):
+        if LOCK_PATH.exists():
+            text = LOCK_PATH.read_text(encoding="utf-8", errors="ignore").strip()
+            if text.isdigit() and _pid_is_running(int(text)):
+                raise RuntimeError(f"Another llama setup process is already running (PID {text}). Please wait for it to finish.")
+            Log.warn("Removing stale setup lock file.")
+            if not dry_run:
+                LOCK_PATH.unlink(missing_ok=True)
     if dry_run:
         Log.info(f"[DRY RUN] Would create lock file: {LOCK_PATH}")
         return False

@@ -418,54 +418,7 @@ class ToolRegistry:
                 handler=self._datetime_now,
             )
         )
-        self._register(
-            ToolDefinition(
-                name="manim_render",
-                description=(
-                    "Generate a short educational animation video with the Python Manim Community library.\n"
-                    "USE WHEN: User types /manim or asks to turn text, concepts, math, diagrams, or explanations into an animated video.\n"
-                    "DO NOT USE: For ordinary image generation, web search, or long cinematic video. Requires the local `manim` Python package and its runtime dependencies.\n"
-                    "RESULT FORMAT: Generated Python scene path, rendered MP4 path, stdout/stderr excerpts, and install guidance if Manim is missing."
-                ),
-                parameters={
-                    "type": "object",
-                    "required": ["prompt"],
-                    "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "Text description of the animation to create, e.g. 'explain Pythagorean theorem with moving squares'.",
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "Optional title shown at the top of the animation.",
-                        },
-                        "quality": {
-                            "type": "string",
-                            "enum": ["low", "medium", "high"],
-                            "description": "Render quality. Low is fastest and maps to Manim -ql.",
-                            "default": "low",
-                        },
-                        "output_dir": {
-                            "type": "string",
-                            "description": "Directory for generated scene files and videos. Defaults to ./manim_outputs.",
-                        },
-                        "render": {
-                            "type": "boolean",
-                            "description": "Whether to render the video after writing the scene file.",
-                            "default": True,
-                        },
-                        "timeout_seconds": {
-                            "type": "integer",
-                            "description": "Maximum render time in seconds.",
-                            "default": 180,
-                            "minimum": 30,
-                            "maximum": 600,
-                        },
-                    },
-                },
-                handler=self._manim_render,
-            )
-        )
+
         self._register(
             ToolDefinition(
                 name="wikipedia_search",
@@ -989,8 +942,6 @@ class ToolRegistry:
             "utc": _time_payload(utc_now, "UTC"),
         }
 
-    async def _manim_render(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(render_manim_video, arguments)
 
     async def _wikipedia_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = _required_string(arguments, "query")
@@ -1906,168 +1857,6 @@ def _required_string(arguments: dict[str, Any], key: str) -> str:
     return value.strip()
 
 
-def render_manim_video(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    prompt = _required_string(arguments, "prompt")
-    title = str(arguments.get("title") or _manim_title(prompt)).strip()
-    quality = str(arguments.get("quality") or "low").lower()
-    quality_flag = {"low": "-ql", "medium": "-qm", "high": "-qh"}.get(quality, "-ql")
-    should_render = bool(arguments.get("render", True))
-    timeout_seconds = _bounded_int(arguments.get("timeout_seconds"), default=180, minimum=30, maximum=600)
-    base_dir = Path(cwd or Path.cwd())
-    output_dir = Path(str(arguments.get("output_dir") or base_dir / "manim_outputs")).expanduser()
-    if not output_dir.is_absolute():
-        output_dir = base_dir / output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    slug = _slugify(title or prompt, default="manim_scene")
-    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    scene_name = "GeneratedManimScene"
-    scene_path = output_dir / f"{slug}_{stamp}.py"
-    media_dir = output_dir / "media"
-    output_name = f"{slug}_{stamp}"
-    script = _manim_scene_script(prompt=prompt, title=title, scene_name=scene_name)
-    scene_path.write_text(script, encoding="utf-8")
-
-    result: dict[str, Any] = {
-        "ok": True,
-        "prompt": prompt,
-        "title": title,
-        "scene": scene_name,
-        "scene_path": str(scene_path),
-        "script": script,
-        "rendered": False,
-        "video_path": None,
-        "quality": quality,
-    }
-    if not should_render:
-        result["message"] = "Scene file created; render=false so no video was rendered."
-        return result
-
-    command = [
-        sys.executable,
-        "-m",
-        "manim",
-        quality_flag,
-        "--media_dir",
-        str(media_dir),
-        "--output_file",
-        output_name,
-        str(scene_path),
-        scene_name,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=str(output_dir),
-            text=True,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return {
-            **result,
-            "ok": False,
-            "rendered": False,
-            "command": command,
-            "error": f"Manim render timed out after {timeout_seconds} seconds.",
-            "stdout": _truncate_tool_output(exc.stdout or ""),
-            "stderr": _truncate_tool_output(exc.stderr or ""),
-        }
-
-    video_path = _find_manim_video(media_dir, output_name)
-    result.update(
-        {
-            "command": command,
-            "returncode": completed.returncode,
-            "stdout": _truncate_tool_output(completed.stdout),
-            "stderr": _truncate_tool_output(completed.stderr),
-            "video_path": str(video_path) if video_path else None,
-            "rendered": completed.returncode == 0 and video_path is not None,
-        }
-    )
-    if completed.returncode != 0:
-        result["ok"] = False
-        result["error"] = (
-            "Manim render failed. Install Manim Community and runtime dependencies, then retry. "
-            "Typical command: python -m pip install manim"
-        )
-    elif video_path is None:
-        result["ok"] = False
-        result["error"] = "Manim reported success but no MP4 output was found."
-    return result
-
-
-def _manim_scene_script(*, prompt: str, title: str, scene_name: str) -> str:
-    bullets = _manim_bullets(prompt)
-    bullet_lines = ",\n            ".join(json.dumps(item, ensure_ascii=False) for item in bullets)
-    return f'''from manim import *
-
-
-class {scene_name}(Scene):
-    def construct(self):
-        self.camera.background_color = "#0f172a"
-        title = Text({json.dumps(title, ensure_ascii=False)}, font_size=38, weight=BOLD, color=WHITE)
-        title.to_edge(UP)
-        underline = Line(LEFT * 3.2, RIGHT * 3.2, color=TEAL).next_to(title, DOWN, buff=0.18)
-        self.play(Write(title), Create(underline), run_time=1.2)
-
-        bullets = [
-            {bullet_lines}
-        ]
-        rows = VGroup()
-        palette = [BLUE, GREEN, YELLOW, ORANGE, PURPLE, TEAL]
-        for index, text in enumerate(bullets):
-            dot = Dot(color=palette[index % len(palette)])
-            label = Text(text, font_size=25, color=WHITE).scale_to_fit_width(9.8)
-            row = VGroup(dot, label).arrange(RIGHT, buff=0.22)
-            rows.add(row)
-        rows.arrange(DOWN, aligned_edge=LEFT, buff=0.36)
-        rows.next_to(underline, DOWN, buff=0.55)
-        rows.to_edge(LEFT, buff=1.0)
-
-        for row in rows:
-            self.play(FadeIn(row[0], scale=1.6), Write(row[1]), run_time=0.75)
-
-        frame = SurroundingRectangle(rows, color=BLUE_E, buff=0.35, corner_radius=0.12)
-        accent = Circle(radius=0.5, color=TEAL, fill_opacity=0.25).to_corner(DR)
-        self.play(Create(frame), GrowFromCenter(accent), run_time=1.0)
-        self.play(Rotate(accent, angle=TAU), run_time=2.0)
-        self.wait(1.0)
-'''
-
-
-def _manim_bullets(prompt: str) -> list[str]:
-    parts = [part.strip(" -:\t\r\n") for part in re.split(r"[.\n;]+", prompt) if part.strip(" -:\t\r\n")]
-    if len(parts) <= 1:
-        words = prompt.split()
-        parts = [" ".join(words[index:index + 9]) for index in range(0, min(len(words), 54), 9)]
-    bullets = [_compact_for_manim(part, 82) for part in parts[:6]]
-    return bullets or ["Visualize the idea", "Break it into clear steps", "Animate each step simply"]
-
-
-def _compact_for_manim(text: str, max_chars: int) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= max_chars else text[: max_chars - 3].rstrip() + "..."
-
-
-def _manim_title(prompt: str) -> str:
-    first = _manim_bullets(prompt)[0]
-    return _compact_for_manim(first, 54)
-
-
-def _find_manim_video(media_dir: Path, output_name: str) -> Path | None:
-    candidates = list(media_dir.rglob(f"{output_name}.mp4"))
-    if not candidates:
-        candidates = list(media_dir.rglob("*.mp4"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
-
-
-def _slugify(value: str, *, default: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
-    return (slug or default)[:60]
 
 
 def validate_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2087,17 +1876,7 @@ def validate_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, A
     if name == "ddg_image_download":
         if cleaned.get("output_dir") is not None and not isinstance(cleaned["output_dir"], str):
             cleaned["output_dir"] = str(cleaned["output_dir"])
-    if name == "manim_render":
-        _ensure_non_empty_string(cleaned, "prompt")
-        if cleaned.get("quality") is not None and cleaned["quality"] not in {"low", "medium", "high"}:
-            raise ToolValidationError("quality must be one of: low, medium, high.")
-        if "timeout_seconds" in cleaned and cleaned["timeout_seconds"] is not None:
-            cleaned["timeout_seconds"] = _bounded_int(
-                cleaned["timeout_seconds"],
-                default=180,
-                minimum=30,
-                maximum=600,
-            )
+
     if name == "telegram_create_job":
         _ensure_non_empty_string(cleaned, "schedule")
         _ensure_non_empty_string(cleaned, "task")
@@ -2606,8 +2385,7 @@ def _validate_tool_output(name: str, result: Any) -> dict[str, Any]:
         _require_output_keys(name, result, {"local_path", "absolute_path", "bytes"})
     elif name == "master_review":
         _require_output_keys(name, result, {"ok", "tool", "data", "metadata"})
-    elif name == "manim_render":
-        _require_output_keys(name, result, {"scene_path", "rendered", "video_path"})
+
     elif name == "telegram_create_job":
         _require_output_keys(name, result, {"id", "path", "message"})
 
@@ -2733,8 +2511,7 @@ def _tool_source(name: str) -> str:
         return "parallel-source-verifiers"
     if name == "master_review":
         return "master-review"
-    if name == "manim_render":
-        return "manim"
+
     if name == "telegram_create_job":
         return "telegram-runtime-jobs"
     if name == "datetime_now":
@@ -2805,10 +2582,7 @@ TOOL_KEYWORDS = {
         ],
         "weight": 4.0,
     },
-    "manim_render": {
-        "keywords": ["manim", "animation", "animated video", "video", "math animation", "visualize", "diagram"],
-        "weight": 4.0,
-    },
+
     "telegram_create_job": {
         "keywords": [
             "job", "jobs", "routine", "routines", "reminder",
@@ -2857,10 +2631,7 @@ def classify_query_intent(query: str) -> dict[str, float]:
             text,
             ("image", "images", "photo", "picture", "visual", "screenshot", "illustration"),
         ),
-        "animation": _phrase_score(
-            text,
-            ("manim", "/manim", "animation", "animated video", "math animation", "make a video", "generate video", "visualize"),
-        ),
+
         "schedule_job": _phrase_score(
             text,
             (
@@ -2931,7 +2702,7 @@ def score_tool_for_query(
         "master_review": {"review": 7.0, "verify": 2.5},
         "image_research": {"image": 7.0},
         "ddg_image_download": {"image": 8.5},
-        "manim_render": {"animation": 8.0, "image": 1.0},
+
         "telegram_create_job": {"schedule_job": 8.5},
     }
     for intent, weight in intent_weights.get(tool_name, {}).items():
@@ -3002,11 +2773,7 @@ def _forced_tool_bonus(tool_name: str, query_lower: str) -> float:
     )
     if any(phrase in query_lower for phrase in creative_or_code):
         return 0.0
-    if tool_name == "manim_render" and any(
-        phrase in query_lower
-        for phrase in ("manim", "/manim", "animation", "animated video", "make a video", "generate video")
-    ):
-        return 5.0
+
     if tool_name == "telegram_create_job" and _looks_like_job_request(query_lower):
         return 5.0
     if tool_name == "weather_current" and any(

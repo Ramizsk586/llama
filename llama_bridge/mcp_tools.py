@@ -169,8 +169,6 @@ class BridgeMcpServer:
             return deep.source_research_timeout_seconds
         if name in {"image_research", "deep_image_agent"}:
             return deep.image_research_timeout_seconds
-        if name == "manim_render":
-            return deep.manim_timeout_seconds
         return deep.tool_timeout_seconds
 
     def run(self) -> None:
@@ -276,8 +274,6 @@ class BridgeMcpServer:
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "deep":
             return _deep_research_handoff(arguments)
-        if name == "manim_render":
-            return _call_manim_render(self, arguments)
         if name == "subagent_spawn":
             return _call_subagent_spawn(arguments)
         if name == "subagent_kill":
@@ -619,22 +615,6 @@ def _virtual_tools() -> list[dict[str, Any]]:
         },
         *_deep_master_review_tool_schemas(),
         {
-            "name": "manim_render",
-            "description": "Generate a short Manim Community animation video from text and return the scene/video paths.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["prompt"],
-                "properties": {
-                    "prompt": {"type": "string", "description": "Animation request or explanation text."},
-                    "title": {"type": "string", "description": "Optional title shown in the video."},
-                    "quality": {"type": "string", "enum": ["low", "medium", "high"], "default": "low"},
-                    "output_dir": {"type": "string", "description": "Optional output directory. Defaults to ./manim_outputs."},
-                    "render": {"type": "boolean", "default": True},
-                    "timeout_seconds": {"type": "integer", "default": 180, "minimum": 30, "maximum": 600},
-                },
-            },
-        },
-        {
             "name": "deep_tavily_agent",
             "description": (
                 "Specialist sub-agent for /deep: run several Tavily searches and return only a compact evidence brief."
@@ -773,20 +753,6 @@ def _poolside_source_research_arguments(arguments: dict[str, Any]) -> dict[str, 
     return normalized
 
 
-def _call_manim_render(server: BridgeMcpServer, arguments: dict[str, Any]) -> dict[str, Any]:
-    try:
-        data = server._request(
-            "POST",
-            "/api/tools/manim_render",
-            arguments,
-            timeout_seconds=server._timeout_for_tool("manim_render"),
-        )
-    except Exception as exc:  # noqa: BLE001 - keep MCP tool responses under the timeout budget.
-        data = {"ok": False, "tool": "manim_render", "error": str(exc), "timeout_budget_seconds": server._timeout_for_tool("manim_render")}
-    payload = data.get("data") if isinstance(data.get("data"), dict) else data
-    is_error = bool(data.get("ok") is False or payload.get("ok") is False)
-    text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
-    return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
 def _default_subagent_names() -> list[str]:
@@ -3137,11 +3103,6 @@ def _prompt_definitions() -> list[dict[str, Any]]:
             "description": "Run a sourced research workflow with llama bridge tools.",
             "arguments": [{"name": "topic", "description": "Research topic", "required": True}],
         },
-        {
-            "name": "manim",
-            "description": "Generate a Manim animation video from text.",
-            "arguments": [{"name": "prompt", "description": "Animation prompt", "required": True}],
-        },
     ]
 
 
@@ -3158,7 +3119,6 @@ def _prompt_response(name: str, params: dict[str, Any]) -> dict[str, Any]:
         "image": "Ask the user for the image search topic, then use the llama bridge image_research MCP tool.",
         "wiki": "Ask the user for the Wikipedia search query, then use the llama bridge wikipedia_search MCP tool.",
         "deep": "Ask the user for the research topic, then run the llama bridge deep research workflow.",
-        "manim": "Ask the user what animation to create, then use the llama bridge manim_render MCP tool.",
     }
     if not text:
         if prompt_name not in missing_inputs:
@@ -3174,11 +3134,6 @@ def _prompt_response(name: str, params: dict[str, Any]) -> dict[str, Any]:
         "web": f"Use the llama bridge web or Tavily MCP search tool for this query: {text}",
         "image": f"Use the llama bridge image_research MCP tool and return compact sourced image candidates for: {text}",
         "wiki": f"Use the llama bridge wikipedia_search MCP tool for this query: {text}",
-        "manim": (
-            "Use the llama bridge manim_render MCP tool to create a short Manim Community animation video. "
-            "Pass the user's text as prompt, use quality='low' unless the user asks otherwise, and return "
-            f"the scene_path and video_path. Animation prompt: {text}"
-        ),
         "deep": (
             "Run deep research in normal mode. Do not switch to Plan mode and do not create todos. Use small "
             "steps: call llama_bridge_tools__deep or deep_plan_agent first. For /deep, only call tools whose names contain deep; "

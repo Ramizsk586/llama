@@ -3201,17 +3201,22 @@ def _chat_completion_to_gemini_response(data: dict[str, Any]) -> dict[str, Any]:
 def _available_model_ids(config: BridgeConfig) -> list[str]:
     pi_model = resolve_pi_model(config)
     codex_model = resolve_codex_model(config)
+    # Collect all model identifiers already covered by anthropic aliases
+    # (both the alias keys and the upstream model names they point to)
+    alias_covered = set(config.anthropic_models)
+    for model_alias in config.anthropic_models.values():
+        if model_alias.model:
+            alias_covered.add(model_alias.model)
     model_ids = (
         set(config.anthropic_models)
-        | {
-            model_alias.model
-            for model_alias in config.anthropic_models.values()
-            if model_alias.model
-        }
         | ({pi_model} if pi_model else set())
         | ({codex_model} if codex_model else set())
         | {model.name for model in config.vs_copilot_models}
-        | {model.model for model in config.vs_copilot_models if model.model}
+        | {
+            model.model
+            for model in config.vs_copilot_models
+            if model.model and model.model not in alias_covered
+        }
     )
     return sorted(model_ids)
 

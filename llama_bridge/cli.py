@@ -4320,20 +4320,11 @@ def _claude_bridge_commands() -> dict[str, tuple[str, str, str]]:
             "Use `mcp__llama_bridge_tools__image_research` to find 2-3 compact sourced image candidates for the user input.",
         ),
     )
-    manim = (
-        "Generate a short Manim animation video through the llama bridge.",
-        "[animation prompt]",
-        _bridge_command_body(
-            "animation prompt",
-            "Use `mcp__llama_bridge_tools__manim_render` to create a short Python Manim animation video and return the scene_path and video_path.",
-        ),
-    )
     return {
         "serp.md": serp,
         "web.md": web,
         "fetch.md": fetch,
         "image.md": image,
-        "manim.md": manim,
     }
 
 
@@ -5020,7 +5011,6 @@ def _poolside_bridge_available_commands() -> list[dict[str, Any]]:
         ("web", "Search the web through llama bridge.", "search query"),
         ("image", "Find sourced image candidates through llama bridge.", "image query"),
         ("wiki", "Search Wikipedia through llama bridge.", "Wikipedia query"),
-        ("manim", "Generate a short Manim animation video from text.", "animation prompt"),
     ]
     available_commands = []
     for name, description, hint in commands:
@@ -5172,7 +5162,7 @@ def _write_poolside_bridge_skill(config) -> Path:
 def _poolside_bridge_tools_skill() -> str:
     return """---
 name: llama-bridge-tools
-description: Use when Poolside needs llama bridge MCP tools for current web search, SerpAPI, Tavily, source verification, image search, Wikipedia, Manim animation videos, weather, or date/time lookups. Use when the user types shortcut-style prompts such as /serp, /tavily, /web, /image, /wiki, or /manim.
+description: Use when Poolside needs llama bridge MCP tools for current web search, SerpAPI, Tavily, source verification, image search, Wikipedia, weather, or date/time lookups. Use when the user types shortcut-style prompts such as /serp, /tavily, /web, /image, or /wiki.
 ---
 
 # Llama Bridge Tools
@@ -5191,16 +5181,12 @@ MCP tool:
 - `/image`: use `image_research`.
 - `/wiki`: use `wikipedia_search`; follow with `wikipedia_page` when a
   specific page is needed.
-- `/manim`: use `manim_render` to create a short Manim Community animation
-  video from the user's text. Return the generated scene path and video path.
-  If Manim is missing, show the install guidance returned by the tool.
 Prefer the highest-level bridge tool that fits the task:
 
 - `source_research` for cited factual research and evidence gathering.
 - `image_research` for compact sourced image candidates.
 - `tavily_search` or `serpapi_search` for current web results.
 - `wikipedia_search` and `wikipedia_page` for encyclopedia context.
-- `manim_render` for short Python Manim animation videos.
 - `weather_current` for live weather.
 - `datetime_now` for current time or timezone questions.
 
@@ -6085,17 +6071,7 @@ export default function (pi: ExtensionAPI) {{
       return {{ text: errorText || formatSearchResults(details.results || []) || pretty(details), details }};
     }},
   }});
-  registerToolCommand("manim", "Generate a Manim animation video through llama bridge", {{
-    title: "Manim animation prompt",
-    placeholder: "Explain a concept with a short animation",
-    emptyMessage: "Manim render cancelled: no animation prompt entered.",
-    execute: async (input, signal) => {{
-      const details = await callBridgeTool("manim_render", {{ prompt: input, quality: "low", render: true }}, signal);
-      const errorText = toolErrorText("manim_render", details);
-      const text = errorText || `Scene: ${{details.scene_path || "(missing)"}}\\nVideo: ${{details.video_path || "(not rendered)"}}\\n\\n${{pretty(details)}}`;
-      return {{ text, details }};
-    }},
-  }});
+
   registerToolCommand("weather", "Get current weather through llama bridge", {{
     title: "Weather location",
     placeholder: "City or place",
