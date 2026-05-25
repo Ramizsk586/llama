@@ -28,6 +28,7 @@ from pathlib import Path
 
 REPO_URL = "https://github.com/Ramizsk586/llama.git"
 AGENT_REPO_URL = "https://github.com/Ramizsk586/llama_agent.git"
+WEB_UI_REPO_URL = "https://github.com/Ramizsk586/web_ui.git"
 APP_NAME = "llama"
 MIN_PYTHON = (3, 11)
 MIN_NODE_MAJOR = 20
@@ -52,6 +53,7 @@ STEP_LABELS = (
     "Built llama.exe",
     "Installed llama agent",
     "Copied runtime files",
+    "Installed web UI dependencies",
     "Updated PATH & environment",
 )
 UNICODE_SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -404,7 +406,7 @@ def main() -> int:
 
     Log.configure(no_color=args.no_color, verbose=args.verbose)
     started = time.perf_counter()
-    steps = StepCounter(total=9, labels=STEP_LABELS)
+    steps = StepCounter(total=10, labels=STEP_LABELS)
     panel = StatusPanel(steps)
     temp_root: Path | None = None
     lock_created = False
@@ -511,6 +513,31 @@ def main() -> int:
         _smoke_test(install_dir, args.dry_run)
         steps.complete(step)
         panel.render()
+
+        step = steps.next("Installed web UI dependencies")
+        Log.substep(1, 3, "Cloning web UI repository")
+        webui_source_dir = temp_root / "web_ui"
+        npm = _ensure_npm(args.dry_run)
+        if args.dry_run:
+            Log.info(f"[DRY RUN] Would clone {WEB_UI_REPO_URL} into {webui_source_dir}")
+            Log.info(f"[DRY RUN] Would run npm install in {webui_source_dir}")
+            steps.complete(step)
+            panel.render()
+        else:
+            _run([git, "clone", "--depth", "1", WEB_UI_REPO_URL, str(webui_source_dir)], "Cloning web UI", panel, step, finish_step=False)
+            Log.substep(2, 3, "Installing npm dependencies for web UI")
+            _run([npm, "install"], "Installing web UI npm dependencies", panel, step, cwd=webui_source_dir, finish_step=False)
+            Log.substep(3, 3, "Copying web UI to install directory")
+            if args.dry_run:
+                Log.info(f"[DRY RUN] Would copy {webui_source_dir} to {install_dir / 'web_ui'}")
+            else:
+                webui_dest = install_dir / "web_ui"
+                if webui_dest.exists():
+                    shutil.rmtree(webui_dest)
+                shutil.copytree(webui_source_dir, webui_dest)
+                Log.ok(f"Web UI installed to {webui_dest}")
+            steps.complete(step)
+            panel.render()
 
         step = steps.next("Updated PATH & environment")
         Log.substep(1, 3, "Adding install dir to user PATH (HKCU registry)")

@@ -45,7 +45,6 @@ from .config import (
     write_default_config,
 )
 from .llamafetch import print_llamafetch
-from .master import MasterReviewer
 from .mcp_tools import main as mcp_tools_main
 from .tools import ToolRegistry, classify_query_intent, select_relevant_tools
 
@@ -474,6 +473,22 @@ def main() -> None:
         if args.command == "setup":
             _cmd_setup(_arg_path(args.config), install_system=not args.no_install_system)
             return
+
+        # --- llama online ---
+        if args.command == "online":
+            config_path = _arg_path(args.config)
+            if args.setup:
+                _cmd_online_setup(config_path)
+                return
+            parser.print_help()
+            return
+
+        # --- llama webui ---
+        if args.command == "webui":
+            config_path = _arg_path(args.config)
+            _cmd_webui(config_path, args.port)
+            return
+
         if args.command == "serve":
             config_path = _arg_path(args.config)
             _ensure_setup(config_path)
@@ -743,6 +758,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-install-system",
         action="store_true",
         help="skip installing missing system tools such as Ollama",
+    )
+
+    # --- llama online ---
+    online_cmd = subparsers.add_parser(
+        "online",
+        help="manage ngrok tunneling for the bridge",
+    )
+    online_cmd.add_argument("--config")
+    online_cmd.add_argument(
+        "--setup",
+        action="store_true",
+        help="interactive ngrok installation and auth token setup wizard",
+    )
+
+    # --- llama webui ---
+    webui_cmd = subparsers.add_parser(
+        "webui",
+        help="start the Lumina web UI server and open it in the browser",
+    )
+    webui_cmd.add_argument("--config")
+    webui_cmd.add_argument(
+        "--port", type=int, default=5173,
+        help="port for the web UI server (default: 5173)",
     )
 
     serve_cmd = subparsers.add_parser("serve", help="start the bridge in background")
@@ -1137,6 +1175,341 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_subparsers.add_parser("logs", help="show last 50 lines of Telegram bot log")
 
     return parser
+
+
+# =============================================================================
+#  Ngrok setup command
+# =============================================================================
+
+NGROK_DOWNLOAD_URL = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+
+
+def _cmd_online_setup(config_path: Path) -> None:
+    """Interactive wizard to install ngrok and configure its auth token."""
+    _title("llama online --setup")
+
+    _print_state("step", "Checking ngrok installation", "36")
+
+    ngrok_exe = shutil.which("ngrok")
+    if ngrok_exe:
+        _print_state("ok", f"ngrok found: {ngrok_exe}", "32")
+    else:
+        _print_state("warn", "ngrok is not installed", "33")
+        if _prompt_yes_no("Would you like to install ngrok automatically?", default=True):
+            _install_ngrok()
+            ngrok_exe = shutil.which("ngrok")
+            if not ngrok_exe:
+                _print_state("fail", "ngrok installation failed. Install ngrok manually from https://ngrok.com/download", "31")
+                return
+            _print_state("ok", "ngrok installed successfully", "32")
+        else:
+            _print_note("Install ngrok from https://ngrok.com/download, then run this command again.")
+            return
+
+    # Step 2: Check current config for auth token
+    _print_state("step", "Checking ngrok auth token configuration", "36")
+
+    import yaml
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    ngrok_section = raw.setdefault("ngrok", {}) if isinstance(raw, dict) else {}
+    current_token = str(ngrok_section.get("auth_token", "") or "").strip()
+
+    if current_token and not current_token.startswith("${"):
+        _print_state("ok", f"ngrok auth token is already configured in {config_path.name}", "32")
+        _print_note("Run `llama start --online` to start the bridge with ngrok tunneling.")
+        _test_ngrok_token(current_token)
+        return
+
+    if current_token.startswith("${"):
+        env_var = current_token.strip("${}")
+        env_value = os.environ.get(env_var, "")
+        if env_value:
+            _print_state("ok", f"ngrok auth token is set via environment variable ${env_var}", "32")
+            _test_ngrok_token(env_value)
+            return
+
+        _print_state("warn", f"ngrok.auth_token references ${env_var} which is not set", "33")
+
+    # Step 3: Prompt for auth token
+    _print_state("step", "Setting up ngrok auth token", "36")
+    _print_note("Create a free ngrok account at https://dashboard.ngrok.com/signup")
+    _print_note("Then get your auth token at https://dashboard.ngrok.com/get-started/your-authtoken")
+    print()
+
+    if not sys.stdin.isatty():
+        _print_state("fail", "No terminal available for interactive input. Set ngrok.auth_token manually in env.yml", "31")
+        return
+
+    token = input(f"{_style('?', '36')} Enter your ngrok auth token: ").strip()
+    if not token:
+        _print_state("stop", "No token provided. Setup canceled.", "33")
+        return
+
+    # Step 4: Validate the token
+    if not _test_ngrok_token(token):
+        _print_state("warn", "Token validation failed, but it may still work. Proceeding with save anyway.", "33")
+
+    # Step 5: Write to config
+    _write_ngrok_auth_token(config_path, token)
+
+    _print_state("step", "Configuring ngrok with auth token locally", "36")
+    _configure_ngrok_authtoken(ngrok_exe, token)
+
+    # Step 6: Success
+    _title("ngrok setup complete")
+    _print_state("ok", "ngrok is installed and configured", "32")
+    _print_state("next", "Run `llama start --online` to start the bridge with ngrok tunneling", "36")
+
+
+def _install_ngrok() -> None:
+    """Download and install ngrok on Windows."""
+    import io
+    import zipfile
+    import urllib.request
+
+    install_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "llama" / "bin"
+    install_dir.mkdir(parents=True, exist_ok=True)
+    ngrok_path = install_dir / "ngrok.exe"
+
+    if ngrok_path.exists():
+        _print_state("ok", f"ngrok already exists at {ngrok_path}, skipping download", "32")
+        _add_to_user_path(str(install_dir))
+        return
+
+    _print_state("download", "Downloading ngrok...", "36")
+    try:
+        req = urllib.request.Request(NGROK_DOWNLOAD_URL, headers={"User-Agent": "llama-bridge-setup/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            data = response.read()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to download ngrok: {exc}") from exc
+
+    _print_state("extract", "Extracting ngrok...", "36")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            zf.extract("ngrok.exe", str(install_dir))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to extract ngrok: {exc}") from exc
+
+    if not ngrok_path.exists():
+        raise RuntimeError(f"ngrok.exe was not found after extraction at {ngrok_path}")
+
+    _add_to_user_path(str(install_dir))
+    _print_state("ok", f"ngrok installed to {ngrok_path}", "32")
+
+
+def _add_to_user_path(install_dir: str) -> None:
+    """Add a directory to the user PATH if not already present."""
+    current_path = os.environ.get("PATH", "")
+    dirs = [d.strip() for d in current_path.split(os.pathsep) if d.strip()]
+    if install_dir in dirs:
+        return
+
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+            existing, _ = winreg.QueryValueEx(key, "PATH")
+            new_path = f"{existing};{install_dir}" if existing and not existing.endswith(";") else f"{existing}{install_dir}"
+            winreg.SetValueEx(key, "PATH", 0, winreg.REG_EXPAND_SZ, new_path)
+    except Exception:
+        _print_state("warn", f"Could not update system PATH. Add {install_dir} to your PATH manually.", "33")
+        return
+
+    # Broadcast environment change
+    try:
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        import ctypes
+        ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment")
+    except Exception:
+        pass
+
+    os.environ["PATH"] = f"{install_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    _print_state("ok", f"Added {install_dir} to PATH", "32")
+
+
+def _test_ngrok_token(token: str) -> bool:
+    """Validate an ngrok auth token by calling the ngrok API."""
+    _print_state("verify", "Validating ngrok auth token...", "36")
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            "https://api.ngrok.com/agent/version",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "llama-bridge-setup/1.0",
+                "Ngrok-Version": "2",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.status == 200:
+                _print_state("ok", "ngrok auth token is valid", "32")
+                return True
+            _print_state("fail", f"ngrok API returned status {response.status}", "31")
+            return False
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            _print_state("fail", "ngrok auth token is invalid (401 Unauthorized). Check your token.", "31")
+        else:
+            _print_state("fail", f"ngrok API error: {exc.code} {exc.reason}", "31")
+        return False
+    except Exception as exc:
+        _print_state("warn", f"Could not validate ngrok token (network issue): {exc}", "33")
+        return False
+
+
+def _write_ngrok_auth_token(config_path: Path, token: str) -> None:
+    """Write the ngrok auth token into the env.yml config file."""
+    import yaml
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    ngrok_section = raw.setdefault("ngrok", {})
+    ngrok_section["auth_token"] = token
+    write_config_data(config_path, raw)
+    _print_state("ok", f"ngrok.auth_token saved to {config_path.name}", "32")
+
+
+def _configure_ngrok_authtoken(ngrok_exe: str, token: str) -> None:
+    """Run `ngrok config add-authtoken <token>` to configure the local ngrok.yml."""
+    try:
+        result = subprocess.run(
+            [ngrok_exe, "config", "add-authtoken", token],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            _print_state("ok", "ngrok local config updated", "32")
+        else:
+            _print_state("warn", f"ngrok config command failed: {result.stderr.strip()}", "33")
+            _print_note("ngrok will use the auth_token from env.yml automatically when started via llama.")
+    except subprocess.TimeoutExpired:
+        _print_state("warn", "ngrok config command timed out. The token is saved in env.yml.", "33")
+    except FileNotFoundError:
+        _print_state("warn", "ngrok binary not found for local config. The token is saved in env.yml.", "33")
+
+
+# =============================================================================
+#  Web UI command
+# =============================================================================
+
+WEB_UI_PORT = 5173
+
+
+def _cmd_webui(config_path: Path, port: int = WEB_UI_PORT) -> None:
+    """Start the Lumina web UI server and open it in the browser."""
+    _ensure_setup(config_path)
+
+    webui_dir = Path(__file__).resolve().parent.parent / "web_ui"
+    if not webui_dir.exists():
+        _print_state("fail", f"web_ui directory not found at {webui_dir}", "31")
+        return
+
+    # Check for node_modules, install if missing
+    node_modules = webui_dir / "node_modules"
+    if not node_modules.exists() or not any(node_modules.iterdir()):
+        _print_state("step", "Installing web UI dependencies...", "36")
+        npm = _find_npm()
+        result = subprocess.run(
+            [npm, "install"],
+            cwd=webui_dir,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            _print_state("fail", f"npm install failed: {result.stderr.strip()[:200]}", "31")
+            return
+        _print_state("ok", "Web UI dependencies installed", "32")
+
+    # Start the bridge server if not running
+    config = load_config(config_path)
+    pid_path = config_path.parent / DEFAULT_PID_PATH.name
+    server_running, running_url = _server_is_running(config_path, pid_path)
+    if not server_running:
+        _print_state("step", "Starting llama bridge server...", "36")
+        _cmd_start(
+            config_path,
+            pid_path,
+            config_path.parent / DEFAULT_LOG_PATH.name,
+            _configured_idle_timeout_seconds(config),
+            verbose=False,
+        )
+        time.sleep(1)
+
+    _title("llama webui")
+    _print_state("ok", "Starting Lumina Web UI", "32")
+    _kv_rows([
+        ("port", port),
+        ("bridge", f"{_server_url(config.server.host, config.server.port)}"),
+        ("webui", str(webui_dir)),
+    ])
+
+    # Set env vars for the web UI to connect to the bridge
+    env = os.environ.copy()
+    env["NODE_ENV"] = "development"
+    env["LLAMA_BRIDGE_URL"] = _server_url(config.server.host, config.server.port)
+    env["LLAMA_BRIDGE_API_KEY"] = config.server.auth_token
+
+    npm = _find_npm()
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["start", "", "http://localhost:{}".format(port)],
+                check=False,
+                shell=True,
+            )
+        else:
+            import webbrowser
+            webbrowser.open(f"http://localhost:{port}")
+
+        result = subprocess.run(
+            [npm, "run", "dev:server", "--", "--port", str(port)],
+            cwd=webui_dir,
+            env=env,
+            check=False,
+        )
+        if result.returncode != 0:
+            _print_state("fail", f"Web UI server exited with code {result.returncode}", "31")
+    except KeyboardInterrupt:
+        _print_state("stop", "Web UI server stopped", "33")
+
+
+def _ensure_webui_deps(config_path: Path) -> list[str]:
+    """Check and install web UI dependencies during setup."""
+    notes: list[str] = []
+    webui_dir = Path(__file__).resolve().parent.parent / "web_ui"
+    if not webui_dir.exists():
+        notes.append("web_ui directory not found, skipping web UI setup")
+        return notes
+
+    node_modules = webui_dir / "node_modules"
+    if not node_modules.exists() or not any(node_modules.iterdir()):
+        try:
+            npm = _find_npm()
+            result = subprocess.run(
+                [npm, "install"],
+                cwd=webui_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                notes.append("web UI dependencies installed")
+            else:
+                notes.append(f"web UI npm install failed: {result.stderr.strip()[:100]}")
+        except Exception as exc:
+            notes.append(f"could not install web UI deps: {exc}")
+    else:
+        notes.append("web UI dependencies already installed")
+
+    return notes
 
 
 def _cmd_init(config_path: Path, force: bool) -> None:
@@ -1941,6 +2314,7 @@ def _wait_for_ngrok_url(timeout_seconds: float = 15.0) -> str | None:
 
 def _ngrok_public_url() -> str | None:
     try:
+        from urllib.request import Request, urlopen
         request = Request("http://127.0.0.1:4040/api/tunnels", method="GET")
         with urlopen(request, timeout=1) as response:
             payload = json.loads(response.read().decode("utf-8"))
