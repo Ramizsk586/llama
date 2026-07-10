@@ -360,6 +360,7 @@ def build_provider(config: ProviderConfig) -> OpenAICompatibleProvider:
         "openrouter",
         "sarvamai",
         "kilo",
+        "kimchi",
         "opencode",
         "cline",
     }:

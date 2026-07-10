@@ -570,6 +570,9 @@ def main() -> None:
                 return
             parser.print_help()
             return
+        if args.command == "models":
+            _cmd_models(_arg_path(args.config))
+            return
         if args.command == "tools":
             config_path = _arg_path(args.config)
             if args.tools_command in {None, "list"}:
@@ -1173,6 +1176,12 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_send_ai.add_argument("message", nargs="+", help="prompt for the AI message")
     bot_subparsers.add_parser("test-token", help="test Telegram bot token via getMe")
     bot_subparsers.add_parser("logs", help="show last 50 lines of Telegram bot log")
+
+    models_cmd = subparsers.add_parser(
+        "models",
+        help="show configured providers and their available models",
+    )
+    models_cmd.add_argument("--config")
 
     return parser
 
@@ -2958,6 +2967,56 @@ def _print_usage_table(data: dict[str, Any]) -> None:
     updated_at = data.get("updated_at", "")
     if updated_at:
         print(f"Updated: {updated_at}")
+
+
+def _cmd_models(config_path: Path) -> None:
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        _print_state("fail", f"could not load config: {exc}", "31")
+        return
+
+    _title("llama models")
+    _print_note(f"Providers configured in {config.source_path}")
+
+    headers = ["provider", "type", "default model"]
+    rows: list[list[str]] = []
+    for name in sorted(config.providers):
+        provider = config.providers[name]
+        rows.append([
+            name,
+            provider.type,
+            provider.default_model or "-",
+        ])
+
+    widths = [
+        max(len(headers[index]), max((len(row[index]) for row in rows), default=0))
+        for index in range(len(headers))
+    ]
+    print("  " + "  ".join(headers[index].ljust(widths[index]) for index in range(len(headers))))
+    print("  " + "  ".join("-" * widths[index] for index in range(len(headers))))
+    for row in rows:
+        print("  " + "  ".join(row[index].ljust(widths[index]) for index in range(len(headers))))
+
+    if config.anthropic_models:
+        print()
+        print(_style("Model aliases:", "1;35"))
+        alias_headers = ["alias", "provider", "model"]
+        alias_rows: list[list[str]] = []
+        for alias_name in sorted(config.anthropic_models):
+            alias = config.anthropic_models[alias_name]
+            provider = config.providers[alias.provider]
+            model = alias.model or provider.default_model or "-"
+            alias_rows.append([alias_name, alias.provider, model])
+
+        alias_widths = [
+            max(len(alias_headers[index]), max((len(row[index]) for row in alias_rows), default=0))
+            for index in range(len(alias_headers))
+        ]
+        print("  " + "  ".join(alias_headers[index].ljust(alias_widths[index]) for index in range(len(alias_headers))))
+        print("  " + "  ".join("-" * alias_widths[index] for index in range(len(alias_headers))))
+        for row in alias_rows:
+            print("  " + "  ".join(row[index].ljust(alias_widths[index]) for index in range(len(alias_headers))))
 
 
 def _cmd_info(config_path: Path) -> None:

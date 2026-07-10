@@ -54,7 +54,7 @@ ngrok:
 #
 #    openai | ollama_local | ollama_cloud | groq | gemini | cohere
 #    mistral | deepseek | openrouter | lm_studio | nvidia_nim
-#    openai_compatible | sarvamai | kilo | opencode | cline
+#    openai_compatible | sarvamai | kilo | kimchi | opencode | cline
 #
 #  Use ${VAR_NAME} for sensitive values (API keys, tokens).
 #
@@ -199,6 +199,13 @@ providers:
     api_key: ${CLINE_API_KEY}
     supports_tools: true
     default_model: deepseek-v4-flash
+
+  kimchi:
+    type: kimchi
+    base_url: https://llm.kimchi.dev/openai/v1
+    api_key: ${CASTAI_API_KEY}
+    supports_tools: true
+    default_model: kimi-k2.6
 
 
 # =============================================================================
