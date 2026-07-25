@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Llama Bridge Configuration Dashboard</title>
+    <!-- Modern typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <!-- Chart.js CDN for Analytics rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="glass-bg"></div>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo-icon">🦙</div>
+                <div class="logo-text">
+                    <h1>Llama Bridge</h1>
+                    <span class="logo-sub">DASHBOARD</span>
+                </div>
+            </div>
+            
+            <nav class="nav-menu">
+                <button class="nav-item active" data-tab="providers">
+                    <span class="nav-icon">🔌</span> Providers
+                </button>
+                <button class="nav-item" data-tab="aliases">
+                    <span class="nav-icon">🎭</span> Model Aliases
+                </button>
+                <button class="nav-item" data-tab="integrations">
+                    <span class="nav-icon">🧩</span> Integrations
+                </button>
+                <button class="nav-item" data-tab="settings">
+                    <span class="nav-icon">⚙️</span> Server Settings
+                </button>
+                <button class="nav-item" data-tab="usage">
+                    <span class="nav-icon">📊</span> Usage Stats
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="status-card">
+                    <div class="status-header">
+                        <span class="status-indicator" id="bridge-status-indicator"></span>
+                        <span class="status-label" id="bridge-status-text">Checking Bridge...</span>
+                    </div>
+                    <p class="status-url" id="bridge-url">http://127.0.0.1:8089</p>
+                </div>
+                <button class="btn btn-primary btn-block" id="btn-save-all">Save Changes</button>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <header class="content-header">
+                <h2 id="tab-title">Manage Providers</h2>
+                <p id="tab-subtitle">Configure connections to local and cloud LLM backends.</p>
+            </header>
+
+            <div class="content-body">
+                <!-- Tab: Providers -->
+                <section class="tab-pane active" id="tab-providers">
+                    <div class="action-bar">
+                        <h3>Configured Providers</h3>
+                        <button class="btn btn-secondary" id="btn-add-provider">+ Add Provider</button>
+                    </div>
+                    <div class="grid-layout" id="providers-list">
+                        <!-- Provider Cards populated by JS -->
+                    </div>
+                </section>
+
+                <!-- Tab: Model Aliases -->
+                <section class="tab-pane" id="tab-aliases">
+                    <div class="action-bar">
+                        <h3>Anthropic Model Mapping</h3>
+                        <button class="btn btn-secondary" id="btn-add-alias">+ Add Alias</button>
+                    </div>
+                    <p class="section-desc">Map Anthropic-style models (Haiku, Sonnet, Opus) to specific providers and underlying models.</p>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Alias Name</th>
+                                    <th>Target Provider</th>
+                                    <th>Target Model</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="aliases-table-body">
+                                <!-- Aliases populated by JS -->
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- Tab: Integrations -->
+                <section class="tab-pane" id="tab-integrations">
+                    <h3>Pi Coding Agent</h3>
+                    <div class="form-container">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="pi-provider">Pi Provider</label>
+                                <select id="pi-provider" class="form-control"></select>
+                            </div>
+                            <div class="form-group">
+                                <label for="pi-model">Pi Model</label>
+                                <input type="text" id="pi-model" class="form-control" placeholder="gemma4:31b">
+                            </div>
+                            <div class="form-group">
+                                <label for="pi-api">Pi API Protocol</label>
+                                <input type="text" id="pi-api" class="form-control" placeholder="openai-completions">
+                            </div>
+                            <div class="form-group checkbox-group">
+                                <input type="checkbox" id="pi-web-search">
+                                <label for="pi-web-search">Enable Web Search</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <h3 style="margin-top: 30px;">OpenAI Codex Integration</h3>
+                    <div class="form-container">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="codex-provider">Codex Provider</label>
+                                <select id="codex-provider" class="form-control"></select>
+                            </div>
+                            <div class="form-group">
+                                <label for="codex-model">Codex Model</label>
+                                <input type="text" id="codex-model" class="form-control" placeholder="gpt-5.1">
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Tab: Settings -->
+                <section class="tab-pane" id="tab-settings">
+                    <h3>FastAPI Server Configuration</h3>
+                    <div class="form-container">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="server-host">Listen Host</label>
+                                <input type="text" id="server-host" class="form-control" placeholder="127.0.0.1">
+                            </div>
+                            <div class="form-group">
+                                <label for="server-port">Listen Port</label>
+                                <input type="number" id="server-port" class="form-control" placeholder="8089">
+                            </div>
+                            <div class="form-group">
+                                <label for="server-auth-token">Bearer Auth Token</label>
+                                <input type="text" id="server-auth-token" class="form-control" placeholder="change-me">
+                            </div>
+                            <div class="form-group">
+                                <label for="server-idle-timeout">Idle Timeout (seconds)</label>
+                                <input type="number" id="server-idle-timeout" class="form-control" placeholder="180">
+                            </div>
+                        </div>
+                    </div>
+
+                    <h3 style="margin-top: 30px;">Ngrok Tunneling Settings</h3>
+                    <div class="form-container">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="ngrok-auth-token">Ngrok Auth Token</label>
+                                <input type="password" id="ngrok-auth-token" class="form-control" placeholder="${NGROK_AUTHTOKEN}">
+                            </div>
+                            <div class="form-group">
+                                <label for="ngrok-region">Ngrok Region</label>
+                                <input type="text" id="ngrok-region" class="form-control" placeholder="us">
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Tab: Usage Stats -->
+                <section class="tab-pane" id="tab-usage">
+                    <div class="time-range-bar">
+                        <h3>App usage</h3>
+                        <div class="time-range-tabs">
+                            <button class="btn-time-range active" data-range="7">Last 7 days</button>
+                            <button class="btn-time-range" data-range="30">Last 30 days</button>
+                        </div>
+                    </div>
+
+                    <!-- Top Summary Cards Grid -->
+                    <div class="stats-cards-grid">
+                        <div class="stat-value-card">
+                            <span class="card-icon">🔥</span>
+                            <div class="card-content">
+                                <span class="card-label">Token usage</span>
+                                <h2 id="usage-total-tokens">0</h2>
+                            </div>
+                        </div>
+                        <div class="stat-value-card">
+                            <span class="card-icon">💻</span>
+                            <div class="card-content">
+                                <span class="card-label">Sessions</span>
+                                <h2 id="usage-sessions">0</h2>
+                            </div>
+                        </div>
+                        <div class="stat-value-card">
+                            <span class="card-icon">💬</span>
+                            <div class="card-content">
+                                <span class="card-label">Messages</span>
+                                <h2 id="usage-messages">0</h2>
+                            </div>
+                        </div>
+                        <div class="stat-value-card">
+                            <span class="card-icon">📅</span>
+                            <div class="card-content">
+                                <span class="card-label">Active days</span>
+                                <h2 id="usage-active-days">0</h2>
+                            </div>
+                        </div>
+                        <div class="stat-value-card">
+                            <span class="card-icon">⚡</span>
+                            <div class="card-content">
+                                <span class="card-label">Current streak</span>
+                                <h2 id="usage-streak">0</h2>
+                            </div>
+                        </div>
+                        <div class="stat-value-card">
+                            <span class="card-icon">❤️</span>
+                            <div class="card-content">
+                                <span class="card-label">Favorite model</span>
+                                <h2 id="usage-fav-model" style="font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px;">None</h2>
+                                <span class="card-sublabel" id="usage-fav-model-share">0% share</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Activity Heatmap Section -->
+                    <div class="heatmap-section glass-card" style="margin-top: 24px;">
+                        <div class="heatmap-header">
+                            <h4>Activity heatmap</h4>
+                            <div class="heatmap-legend">
+                                <span>Less</span>
+                                <span class="legend-cell level-0"></span>
+                                <span class="legend-cell level-1"></span>
+                                <span class="legend-cell level-2"></span>
+                                <span class="legend-cell level-3"></span>
+                                <span class="legend-cell level-4"></span>
+                                <span>More</span>
+                            </div>
+                        </div>
+                        <div class="heatmap-grid" id="heatmap-grid-container">
+                            <!-- Heatmap cells dynamically populated -->
+                        </div>
+                    </div>
+
+                    <!-- Charts Row -->
+                    <div class="charts-row">
+                        <div class="chart-container-card glass-card">
+                            <h4>Tokens per day</h4>
+                            <div class="chart-wrapper">
+                                <canvas id="tokens-chart"></canvas>
+                            </div>
+                        </div>
+                        <div class="chart-container-card glass-card">
+                            <h4>Model usage</h4>
+                            <div class="chart-wrapper-donut">
+                                <div class="donut-canvas-container">
+                                    <canvas id="model-donut-chart"></canvas>
+                                </div>
+                                <div class="donut-legend" id="donut-legend-container">
+                                    <!-- Donut legend populated dynamically -->
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- Provider Edit Modal -->
+    <div class="modal" id="modal-provider">
+        <div class="modal-content glass-card">
+            <div class="modal-header">
+                <h3 id="modal-title">Edit Provider</h3>
+                <button class="btn-close" id="btn-close-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="edit-provider-key">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="edit-provider-name">Provider KeyName (Unique)</label>
+                        <input type="text" id="edit-provider-name" class="form-control" placeholder="e.g. openai">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-provider-type">Protocol Type</label>
+                        <select id="edit-provider-type" class="form-control">
+                            <option value="openai_compatible">openai_compatible</option>
+                            <option value="openai">openai</option>
+                            <option value="gemini">gemini</option>
+                            <option value="groq">groq</option>
+                            <option value="ollama_local">ollama_local</option>
+                            <option value="ollama_cloud">ollama_cloud</option>
+                            <option value="lm_studio">lm_studio</option>
+                            <option value="nvidia_nim">nvidia_nim</option>
+                            <option value="cohere">cohere</option>
+                            <option value="mistral">mistral</option>
+                            <option value="deepseek">deepseek</option>
+                            <option value="openrouter">openrouter</option>
+                            <option value="antigravity">antigravity</option>
+                            <option value="cline">cline</option>
+                        </select>
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label for="edit-provider-url">Base URL</label>
+                        <input type="text" id="edit-provider-url" class="form-control" placeholder="https://api.openai.com/v1">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-provider-key-val">API Key / Token</label>
+                        <input type="password" id="edit-provider-key-val" class="form-control" placeholder="Secret Key">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-provider-model">Default Model</label>
+                        <input type="text" id="edit-provider-model" class="form-control" placeholder="gpt-4o">
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="btn-test-provider">Test Connection</button>
+                <div style="flex-grow: 1;"></div>
+                <button class="btn btn-secondary" id="btn-cancel-provider">Cancel</button>
+                <button class="btn btn-primary" id="btn-save-provider">Save Provider</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Toast -->
+    <div id="toast" class="toast"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

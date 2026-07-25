@@ -573,6 +573,22 @@ def main() -> None:
         if args.command == "models":
             _cmd_models(_arg_path(args.config))
             return
+        if args.command == "login":
+            if args.login_provider == "antigravity":
+                _cmd_login_antigravity(_arg_path(args.config), args.port, args.account)
+                return
+            parser.print_help()
+            return
+        if args.command == "web":
+            config_path = _arg_path(args.config)
+            if args.web_command == "start":
+                _cmd_web_start(config_path, args.port)
+                return
+            if args.web_command == "stop":
+                _cmd_web_stop(config_path)
+                return
+            parser.print_help()
+            return
         if args.command == "tools":
             config_path = _arg_path(args.config)
             if args.tools_command in {None, "list"}:
@@ -1183,6 +1199,54 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     models_cmd.add_argument("--config")
 
+    login_cmd = subparsers.add_parser(
+        "login",
+        help="authenticate with providers",
+    )
+    login_cmd.add_argument("--config")
+    login_subparsers = login_cmd.add_subparsers(dest="login_provider")
+
+    antigravity_login_cmd = login_subparsers.add_parser(
+        "antigravity",
+        help="authenticate with Google Antigravity",
+    )
+    antigravity_login_cmd.add_argument("--config")
+    antigravity_login_cmd.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="port for local loopback callback server",
+    )
+    antigravity_login_cmd.add_argument(
+        "--account",
+        default="",
+        help="optional account name for multiple accounts support",
+    )
+
+    web_cmd = subparsers.add_parser(
+        "web",
+        help="manage the Llama Bridge visual dashboard",
+    )
+    web_cmd.add_argument("--config")
+    web_subparsers = web_cmd.add_subparsers(dest="web_command")
+
+    web_start_cmd = web_subparsers.add_parser(
+        "start",
+        help="start the Llama Bridge visual dashboard server",
+    )
+    web_start_cmd.add_argument("--config")
+    web_start_cmd.add_argument(
+        "--port",
+        type=int,
+        default=8090,
+        help="port for the dashboard server (default: 8090)",
+    )
+
+    web_stop_cmd = web_subparsers.add_parser(
+        "stop",
+        help="stop the Llama Bridge visual dashboard server",
+    )
+
     return parser
 
 
@@ -1562,6 +1626,358 @@ def _cmd_setup(config_path: Path, install_system: bool = False) -> None:
         _print_state("ok", "python packages: ok", "32")
     for note in result.notes:
         _print_note(note)
+
+
+def _cmd_web_start(config_path: Path, port: int = 8090) -> None:
+    _title("llama web start")
+    pid_path = config_path.parent / "llama_web.pid"
+
+    # Check if already running
+    if _is_running(pid_path):
+        _print_state("ok", f"Llama Bridge Web Dashboard is already running on http://127.0.0.1:{port}", "32")
+        import webbrowser
+        try:
+            webbrowser.open(f"http://127.0.0.1:{port}")
+        except Exception:
+            pass
+        return
+
+    _print_state("step", f"Starting Web Dashboard server on port {port}...", "36")
+
+    web_server_file = Path(__file__).resolve().parent / "web_server.py"
+    log_path = config_path.parent / "llama_web.log"
+
+    cmd = [
+        sys.executable,
+        "-m", "uvicorn",
+        "llama_bridge.web_server:app",
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--log-level", "warning"
+    ]
+
+    try:
+        log_file = open(log_path, "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            cwd=str(config_path.parent),
+            close_fds=True,
+            start_new_session=True
+        )
+
+        pid_path.write_text(str(proc.pid), encoding="utf-8")
+        time.sleep(1.5)
+
+        if proc.poll() is not None:
+            _print_state("fail", f"Web Dashboard server failed to start. See logs at {log_path}", "31")
+            pid_path.unlink(missing_ok=True)
+            return
+
+        _print_state("ok", "Web Dashboard server started successfully", "32")
+        _kv_rows([
+            ("url", f"http://127.0.0.1:{port}"),
+            ("pid", proc.pid),
+            ("log", str(log_path))
+        ])
+
+        import webbrowser
+        try:
+            webbrowser.open(f"http://127.0.0.1:{port}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        _print_state("fail", f"Failed to start Web Dashboard: {e}", "31")
+
+
+def _cmd_web_stop(config_path: Path) -> None:
+    _title("llama web stop")
+    pid_path = config_path.parent / "llama_web.pid"
+
+    if not pid_path.exists():
+        _print_state("stop", "Web Dashboard server is not running", "33")
+        return
+
+    pid = _read_pid(pid_path)
+    if pid is None:
+        _print_state("stop", "Web Dashboard server is not running (empty pid file)", "33")
+        pid_path.unlink(missing_ok=True)
+        return
+
+    _print_state("step", f"Stopping Web Dashboard server (PID: {pid})...", "36")
+
+    stopped = False
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+            stopped = True
+        else:
+            import signal
+            os.kill(pid, signal.SIGTERM)
+            stopped = True
+    except ProcessLookupError:
+        _print_state("warn", f"Process {pid} not found (already stopped)", "33")
+        stopped = True
+    except Exception as e:
+        _print_state("fail", f"Failed to stop process {pid}: {e}", "31")
+
+    if stopped:
+        pid_path.unlink(missing_ok=True)
+        _print_state("ok", "Web Dashboard server stopped", "32")
+
+
+def _cmd_login_antigravity(config_path: Path, port: int = 0, account: str = "") -> None:
+    import uuid
+    import urllib.parse
+    import webbrowser
+    import httpx
+    import yaml
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    _title("llama login antigravity")
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/callback":
+                query = urllib.parse.parse_qs(parsed.query)
+                code = query.get("code", [None])[0]
+                state = query.get("state", [None])[0]
+                error = query.get("error", [None])[0]
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+
+                if code:
+                    self.server.received_code = code
+                    self.server.received_state = state
+                    self.wfile.write(b"""
+                        <html>
+                        <head><title>Authorization Successful</title></head>
+                        <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background-color: #f7f9fb; color: #333;">
+                            <h1 style="color: #4caf50;">Authorization Successful!</h1>
+                            <p>Llama Bridge has successfully captured the login credentials.</p>
+                            <p>You can close this tab/window and return to your terminal.</p>
+                        </body>
+                        </html>
+                    """)
+                else:
+                    self.server.received_error = error or "no code"
+                    self.wfile.write(f"""
+                        <html>
+                        <head><title>Authorization Failed</title></head>
+                        <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background-color: #f7f9fb; color: #cc0000;">
+                            <h1>Authorization Failed!</h1>
+                            <p>Error: {error or 'No code returned'}</p>
+                        </body>
+                        </html>
+                    """.encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    # Start the callback server on a free port
+    try:
+        server = HTTPServer(("127.0.0.1", port), CallbackHandler)
+    except Exception as e:
+        _print_state("warn", f"Could not bind loopback server on port {port}: {e}. Retrying on random port.", "33")
+        server = HTTPServer(("127.0.0.1", 0), CallbackHandler)
+
+    server.received_code = None
+    server.received_state = None
+    server.received_error = None
+
+    actual_port = server.server_port
+    redirect_uri = f"http://127.0.0.1:{actual_port}/callback"
+    state = str(uuid.uuid4())
+
+    # Start the server in a background thread
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    mask = "omniroute-public-v1"
+    id_b = [94, 93, 89, 88, 66, 95, 67, 68, 83, 29, 69, 76, 83, 65, 29, 14, 69, 5, 66, 6, 3, 92, 1, 64, 94, 25, 23, 23, 72, 66, 70, 87, 26, 29, 12, 65, 25, 91, 7, 89, 9, 93, 66, 92, 16, 4, 75, 76, 0, 5, 17, 66, 14, 12, 66, 17, 93, 10, 24, 29, 12, 0, 12, 26, 26, 17, 72, 30, 1, 76, 15, 6, 14]
+    sec_b = [40, 34, 45, 58, 34, 55, 88, 63, 80, 21, 54, 34, 48, 88, 81, 85, 97, 18, 125, 37, 92, 3, 37, 48, 87, 6, 44, 38, 25, 10, 67, 19, 40, 40, 5]
+    client_id = "".join(chr(b ^ ord(mask[i % len(mask)])) for i, b in enumerate(id_b))
+    client_secret = "".join(chr(b ^ ord(mask[i % len(mask)])) for i, b in enumerate(sec_b))
+    scopes = [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/cclog",
+        "https://www.googleapis.com/auth/experimentsandconfigs",
+    ]
+
+    auth_params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(scopes),
+        "state": state,
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(auth_params)
+
+    _print_state("step", "Opening Google sign-in in browser...", "36")
+    print(f"\nOpen this URL to authorize (or it will open automatically):\n\n  {auth_url}\n")
+
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+
+    _print_state("step", "Waiting for Google to redirect back to local loopback...", "36")
+    print("If you are on a remote server/headless environment, or the browser doesn't open:")
+    print("1. Copy the above URL and open it in your local browser.")
+    print("2. Authenticate and authorize Google Antigravity.")
+    print("3. Copy the final redirected URL (even if it shows a 'site can't be reached' error) or the code, and paste it below.")
+    print()
+
+    manual_input = None
+    if sys.stdin.isatty():
+        try:
+            manual_input = input(f"{_style('?', '36')} Enter callback URL or authorization code (press Enter to cancel or if already authorized): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            pass
+
+    server.shutdown()
+    server.server_close()
+
+    code = None
+    if server.received_code:
+        if server.received_state == state:
+            code = server.received_code
+        else:
+            _print_state("fail", "State mismatch in callback (security warning)", "31")
+            return
+    elif manual_input:
+        if "code=" in manual_input:
+            parsed = urllib.parse.urlparse(manual_input)
+            query = urllib.parse.parse_qs(parsed.query)
+            code = query.get("code", [None])[0]
+        else:
+            code = manual_input
+
+    if not code:
+        if server.received_error:
+            _print_state("fail", f"Authorization failed: {server.received_error}", "31")
+        else:
+            _print_state("stop", "No authorization code received. Login canceled.", "33")
+        return
+
+    _print_state("step", "Exchanging authorization code for tokens...", "36")
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                "https://oauth2.googleapis.com/token",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                }
+            )
+            resp.raise_for_status()
+            tokens = resp.json()
+    except Exception as e:
+        _print_state("fail", f"Failed to exchange authorization code: {e}", "31")
+        return
+
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    if not access_token:
+        _print_state("fail", "Failed to retrieve access token.", "31")
+        return
+
+    _print_state("step", "Discovering Google Cloud Code project...", "36")
+    project_id = None
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "antigravity/ide/1.0.0 darwin/arm64",
+                    "Authorization": f"Bearer {access_token}"
+                },
+                json={"metadata": {"ideType": "ANTIGRAVITY"}}
+            )
+            resp.raise_for_status()
+            discovery_data = resp.json()
+            project_id = discovery_data.get("cloudaicompanionProject", {}).get("id")
+    except Exception as e:
+        _print_state("warn", f"Failed to discover project ID: {e}", "33")
+
+    if not project_id:
+        _print_state("warn", "No Google Cloud Code project was automatically discovered.", "33")
+        if sys.stdin.isatty():
+            project_id = input(f"{_style('?', '36')} Enter Google Cloud Project ID (leave blank for 'placeholder-project'): ").strip()
+        if not project_id:
+            project_id = "placeholder-project"
+
+    _print_state("step", "Onboarding Google Antigravity user...", "36")
+    tier_id = "legacy-tier"
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "antigravity/ide/1.0.0 darwin/arm64",
+                    "Authorization": f"Bearer {access_token}"
+                },
+                json={"tier_id": "legacy-tier", "metadata": {"ideType": "ANTIGRAVITY"}}
+            )
+            if resp.status_code == 200:
+                onboard_data = resp.json()
+                tier_id = onboard_data.get("tier_id", "legacy-tier")
+    except Exception as e:
+        _print_state("warn", f"Failed user onboarding: {e}", "33")
+
+    _print_state("step", f"Saving credentials to {config_path}...", "36")
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        providers = raw.setdefault("providers", {})
+        provider_name = f"antigravity_{account}" if account else "antigravity"
+        prov = providers.setdefault(provider_name, {})
+        prov["type"] = "antigravity"
+        prov["base_url"] = "https://cloudcode-pa.googleapis.com"
+        prov["api_key"] = access_token
+        if refresh_token:
+            prov["refresh_token"] = refresh_token
+        prov["project_id"] = project_id
+        prov["tier"] = tier_id
+        prov["default_model"] = "gemini-3.5-pro-agent"
+        prov["supports_tools"] = True
+
+        aliases = raw.setdefault("anthropic_models", {})
+        if _prompt_yes_no(f"Point Claude-style aliases (haiku/sonnet/opus) to Antigravity ({provider_name})?", default=True):
+            for alias_name in ("haiku", "sonnet", "opus"):
+                aliases[alias_name] = {"provider": provider_name, "model": "gemini-3.5-pro-agent"}
+
+        write_config_data(config_path, raw)
+        _print_state("ok", "Google Antigravity authentication successful", "32")
+        _kv_rows([
+            ("config", str(config_path)),
+            ("provider", provider_name),
+            ("project_id", project_id),
+            ("tier", tier_id),
+            ("default_model", "gemini-3.5-pro-agent")
+        ])
+    except Exception as e:
+        _print_state("fail", f"Failed to save credentials to env.yml: {e}", "31")
 
 
 def _cmd_configure(config_path: Path) -> None:

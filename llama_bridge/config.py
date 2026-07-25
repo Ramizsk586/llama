@@ -108,7 +108,7 @@ ngrok:
 #
 #    openai | ollama_local | ollama_cloud | groq | gemini | cohere
 #    mistral | deepseek | openrouter | lm_studio | nvidia_nim
-#    openai_compatible | sarvamai | kilo | kimchi | opencode | cline
+#    openai_compatible | sarvamai | kilo | kimchi | opencode | cline | antigravity
 #
 #  Use ${VAR_NAME} for sensitive values (API keys, tokens).
 #
@@ -573,6 +573,10 @@ class ProviderConfig:
     model_limits: dict[str, dict[str, Any]] = field(default_factory=dict)
     fallback_url: str | None = None
     fallback_api_key: str | None = None
+    refresh_token: str | None = None
+    project_id: str | None = None
+    tier: str | None = None
+
 
 
 @dataclass(slots=True)
@@ -1409,6 +1413,9 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             model_limits=value.get("model_limits", {}) or {},
             fallback_url=value.get("fallback_url"),
             fallback_api_key=value.get("fallback_api_key"),
+            refresh_token=value.get("refresh_token"),
+            project_id=value.get("project_id"),
+            tier=value.get("tier"),
         )
 
     aliases: dict[str, ModelAlias] = {}

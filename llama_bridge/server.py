@@ -119,6 +119,36 @@ async def _record_usage(
             entry["request_count"] += 1
             data["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
+            # Update daily history
+            import time
+            today_str = datetime.now(UTC).date().isoformat()
+            daily_history = data.setdefault("daily_history", {})
+            day_entry = daily_history.setdefault(today_str, {})
+            model_entry = day_entry.setdefault(model, {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "requests": 0
+            })
+            model_entry["input_tokens"] += input_tokens
+            model_entry["output_tokens"] += output_tokens
+            model_entry["requests"] += 1
+
+            # Session tracking using timestamps list
+            timestamps = day_entry.setdefault("timestamps", [])
+            timestamps.append(int(time.time()))
+            
+            # Prune timestamps older than 24 hours to keep file size bounded
+            cutoff = int(time.time()) - 86400
+            day_entry["timestamps"] = [ts for ts in timestamps if ts > cutoff]
+            
+            # Count sessions based on 30 min inactivity gaps
+            sorted_ts = sorted(day_entry["timestamps"])
+            sessions = 1
+            for i in range(1, len(sorted_ts)):
+                if sorted_ts[i] - sorted_ts[i-1] > 1800:
+                    sessions += 1
+            day_entry["sessions"] = sessions
+
             tmp = path.with_suffix(".usage.tmp")
             tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, path)
