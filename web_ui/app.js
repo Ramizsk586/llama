@@ -4,6 +4,7 @@ let activeTab = 'providers';
 let tokensChartInstance = null;
 let modelChartInstance = null;
 let timeRange = 30;
+let currentSubpageProvider = null;
 
 // Selectors
 const navItems = document.querySelectorAll('.nav-item');
@@ -92,9 +93,22 @@ function renderActiveTab() {
 
     // Update Titles
     if (activeTab === 'providers') {
-        tabTitle.textContent = "Manage Providers";
-        tabSubtitle.textContent = "Configure connections to local and cloud LLM backends.";
-        renderProviders();
+        const overviewEl = document.getElementById('providers-overview-view');
+        const detailEl = document.getElementById('providers-detail-view');
+        
+        if (currentSubpageProvider) {
+            overviewEl.style.display = 'none';
+            detailEl.style.display = 'block';
+            tabTitle.textContent = `${currentSubpageProvider} Settings`;
+            tabSubtitle.textContent = `Configure accounts and model visibility for ${currentSubpageProvider}.`;
+            renderProviderSubpage(currentSubpageProvider);
+        } else {
+            overviewEl.style.display = 'block';
+            detailEl.style.display = 'none';
+            tabTitle.textContent = "Manage Providers";
+            tabSubtitle.textContent = "Configure connections to local and cloud LLM backends.";
+            renderProviders();
+        }
     } else if (activeTab === 'aliases') {
         tabTitle.textContent = "Model Aliases";
         tabSubtitle.textContent = "Map Anthropic-style models (Haiku, Sonnet, Opus) to specific providers/models.";
@@ -117,57 +131,75 @@ function renderActiveTab() {
 // ----------------------------------------------------
 // Tab: Providers Logic
 // ----------------------------------------------------
+const PROVIDER_TYPES = [
+    { type: 'antigravity', label: 'Google Antigravity', category: 'OAuth' },
+    { type: 'openai', label: 'OpenAI (Official)', category: 'API Key' },
+    { type: 'openai_compatible', label: 'OpenAI Compatible', category: 'API Key' },
+    { type: 'gemini', label: 'Google Gemini (Official)', category: 'API Key' },
+    { type: 'groq', label: 'Groq Cloud', category: 'API Key' },
+    { type: 'ollama_local', label: 'Ollama Local', category: 'Local' },
+    { type: 'ollama_cloud', label: 'Ollama Cloud', category: 'Local' },
+    { type: 'lm_studio', label: 'LM Studio', category: 'Local' },
+    { type: 'nvidia_nim', label: 'NVIDIA NIM', category: 'API Key' },
+    { type: 'cohere', label: 'Cohere', category: 'API Key' },
+    { type: 'mistral', label: 'Mistral AI', category: 'API Key' },
+    { type: 'deepseek', label: 'DeepSeek', category: 'API Key' },
+    { type: 'openrouter', label: 'OpenRouter', category: 'API Key' },
+    { type: 'cline', label: 'Cline', category: 'Local' }
+];
+
 function renderProviders() {
     providersList.innerHTML = '';
     const providers = config.providers || {};
     
-    Object.keys(providers).forEach(key => {
-        const p = providers[key];
+    // Ensure all active types are represented
+    const activeTypes = new Set(PROVIDER_TYPES.map(t => t.type));
+    Object.values(providers).forEach(p => {
+        if (p.type && !activeTypes.has(p.type)) {
+            PROVIDER_TYPES.push({ type: p.type, label: p.type, category: 'API Key' });
+            activeTypes.add(p.type);
+        }
+    });
+
+    PROVIDER_TYPES.forEach(t => {
+        // Find connections of this type
+        const connections = Object.keys(providers).filter(k => providers[k].type === t.type);
+        const count = connections.length;
+        
         const card = document.createElement('div');
         card.className = 'glass-card';
+        card.style.cursor = 'pointer';
         card.innerHTML = `
-            <div class="card-header">
+            <div class="card-header" style="pointer-events: none;">
                 <div class="provider-info">
-                    <h4>${key}</h4>
-                    <span class="badge">${p.type}</span>
-                </div>
-                <div class="card-actions">
-                    <button class="btn-icon btn-models" data-key="${key}" title="Manage Models">👁️</button>
-                    <button class="btn-icon btn-edit" data-key="${key}" title="Edit Provider">✏️</button>
-                    <button class="btn-icon btn-delete" data-key="${key}" title="Delete Provider">🗑️</button>
+                    <h4>${t.label}</h4>
+                    <span class="badge">${t.category}</span>
                 </div>
             </div>
-            <div class="card-body">
+            <div class="card-body" style="pointer-events: none;">
                 <div class="card-row">
-                    <span>Base URL</span>
-                    <span>${p.base_url || 'None'}</span>
+                    <span>Connections</span>
+                    <span style="font-weight: 600; color: ${count > 0 ? 'hsl(var(--green))' : 'hsl(var(--text-muted))'}">
+                        ${count > 0 ? `🟢 ${count} Connected` : '⚪ No connections'}
+                    </span>
                 </div>
                 <div class="card-row">
-                    <span>Default Model</span>
-                    <span>${p.default_model || 'None'}</span>
-                </div>
-                <div class="card-row">
-                    <span>Tools Support</span>
-                    <span>${p.supports_tools !== false ? '✅ Enabled' : '❌ Disabled'}</span>
+                    <span>Type Key</span>
+                    <span>${t.type}</span>
                 </div>
             </div>
         `;
+        
+        card.onclick = () => {
+            currentSubpageProvider = t.type;
+            renderActiveTab();
+        };
+        
         providersList.appendChild(card);
-    });
-
-    // Attach actions
-    document.querySelectorAll('.btn-edit').forEach(b => {
-        b.onclick = () => openProviderModal(b.dataset.key);
-    });
-    document.querySelectorAll('.btn-delete').forEach(b => {
-        b.onclick = () => deleteProvider(b.dataset.key);
-    });
-    document.querySelectorAll('.btn-models').forEach(b => {
-        b.onclick = () => openModelsModal(b.dataset.key);
     });
 }
 
-function openProviderModal(key = '') {
+function openProviderModal(key = '', defaultType = '') {
     const isNew = key === '';
     editProviderKey.value = key;
     editProviderName.disabled = !isNew;
@@ -175,10 +207,15 @@ function openProviderModal(key = '') {
     if (isNew) {
         modalTitle.textContent = "Add Provider";
         editProviderName.value = '';
-        editProviderType.value = 'openai_compatible';
-        editProviderUrl.value = '';
+        editProviderType.value = defaultType || 'openai_compatible';
+        if (defaultType === 'antigravity') {
+            editProviderUrl.value = 'https://cloudcode-pa.googleapis.com';
+            editProviderModel.value = 'gemini-3.5-pro-agent';
+        } else {
+            editProviderUrl.value = '';
+            editProviderModel.value = '';
+        }
         editProviderKeyVal.value = '';
-        editProviderModel.value = '';
     } else {
         modalTitle.textContent = `Edit Provider: ${key}`;
         const p = config.providers[key];
@@ -824,6 +861,248 @@ document.getElementById('btn-save-models').onclick = async () => {
     } finally {
         saveBtn.textContent = oldText;
         saveBtn.disabled = false;
+    }
+};
+
+
+// ----------------------------------------------------
+// Provider Subpage Logic
+// ----------------------------------------------------
+let subpageModels = [];
+let modelSearchQuery = "";
+
+async function renderProviderSubpage(providerType) {
+    const typeInfo = PROVIDER_TYPES.find(t => t.type === providerType) || { label: providerType };
+    document.getElementById('detail-provider-name-breadcrumb').textContent = typeInfo.label;
+    document.getElementById('detail-provider-title').textContent = typeInfo.label;
+
+    const providers = config.providers || {};
+    const connections = Object.keys(providers).filter(k => providers[k].type === providerType);
+    document.getElementById('detail-provider-connections-count').textContent = `${connections.length} connections`;
+
+    // Render connection profiles
+    const connListContainer = document.getElementById('detail-connections-list');
+    connListContainer.innerHTML = '';
+
+    if (connections.length === 0) {
+        connListContainer.innerHTML = '<p style="color: hsl(var(--text-muted)); font-style: italic;">No accounts configured. Click "+ Add Account" to configure one.</p>';
+    } else {
+        connections.forEach(connKey => {
+            const p = providers[connKey];
+            const row = document.createElement('div');
+            row.className = 'connection-row';
+            row.innerHTML = `
+                <div class="connection-name-group">
+                    <span style="font-size: 20px;">👤</span>
+                    <div>
+                        <strong style="color: hsl(var(--text-main));">${connKey}</strong>
+                        <div style="font-size: 12px; color: hsl(var(--text-muted));">${p.base_url || 'Default Endpoint'}</div>
+                    </div>
+                </div>
+                <div class="connection-actions">
+                    <button class="btn btn-secondary btn-sm btn-retest-conn" data-key="${connKey}">Retest</button>
+                    <button class="btn-icon btn-edit-conn" data-key="${connKey}">✏️</button>
+                    <button class="btn-icon btn-delete-conn" data-key="${connKey}">🗑️</button>
+                </div>
+            `;
+            connListContainer.appendChild(row);
+        });
+    }
+
+    // Attach connection row actions
+    document.querySelectorAll('.btn-retest-conn').forEach(b => {
+        b.onclick = () => retestConnection(b.dataset.key);
+    });
+    document.querySelectorAll('.btn-edit-conn').forEach(b => {
+        b.onclick = () => openProviderModal(b.dataset.key);
+    });
+    document.querySelectorAll('.btn-delete-conn').forEach(b => {
+        b.onclick = () => {
+            deleteProvider(b.dataset.key);
+            // Re-render subpage after deletion
+            setTimeout(() => renderProviderSubpage(providerType), 300);
+        };
+    });
+
+    // Wire buttons
+    document.getElementById('btn-add-connection').onclick = () => {
+        openProviderModal('', providerType);
+    };
+
+    document.getElementById('btn-back-to-providers').onclick = () => {
+        currentSubpageProvider = null;
+        renderActiveTab();
+    };
+
+    // Fetch and render models
+    const modelsGrid = document.getElementById('detail-models-grid');
+    if (connections.length === 0) {
+        modelsGrid.innerHTML = '<p style="color: hsl(var(--text-muted)); font-style: italic; grid-column: span 3;">Configure at least one connection profile above to view available models.</p>';
+        subpageModels = [];
+        return;
+    }
+
+    const activeConn = connections[0];
+    modelsGrid.innerHTML = '<p style="color: hsl(var(--text-muted)); font-style: italic; grid-column: span 3;">Loading models from provider endpoint...</p>';
+
+    try {
+        const res = await fetch(`/api/provider/${activeConn}/models`);
+        if (!res.ok) throw new Error(await res.text());
+        subpageModels = await res.json();
+        filterAndRenderModels();
+    } catch (e) {
+        modelsGrid.innerHTML = `<p style="color: hsl(var(--red)); grid-column: span 3;">Failed to load models list: ${e.message}</p>`;
+    }
+}
+
+function filterAndRenderModels() {
+    const modelsGrid = document.getElementById('detail-models-grid');
+    modelsGrid.innerHTML = '';
+
+    const filtered = subpageModels.filter(m => m.id.toLowerCase().includes(modelSearchQuery.toLowerCase()));
+
+    if (filtered.length === 0) {
+        modelsGrid.innerHTML = '<p style="color: hsl(var(--text-muted)); font-style: italic; grid-column: span 3;">No matching models found.</p>';
+        return;
+    }
+
+    filtered.forEach(m => {
+        const card = document.createElement('div');
+        card.className = 'model-grid-card';
+        card.innerHTML = `
+            <div class="model-card-header">
+                <span class="model-card-title" title="${m.id}">${m.id}</span>
+                <div class="model-card-actions">
+                    <button class="btn-icon btn-toggle-vis" data-id="${m.id}" title="${m.visible ? 'Hide Model' : 'Show Model'}">
+                        ${m.visible ? '👁️' : '🕶️'}
+                    </button>
+                </div>
+            </div>
+            <div class="model-card-footer">
+                <span class="model-badge-tag">BUILT-IN</span>
+                <span style="font-weight: 500;">${m.visible ? '🟢 Active' : '⚪ Hidden'}</span>
+            </div>
+        `;
+
+        // Wire visibility toggle click
+        card.querySelector('.btn-toggle-vis').onclick = () => toggleModelVisibility(m.id);
+
+        modelsGrid.appendChild(card);
+    });
+}
+
+async function toggleModelVisibility(modelId) {
+    const model = subpageModels.find(m => m.id === modelId);
+    if (!model) return;
+
+    model.visible = !model.visible;
+    filterAndRenderModels();
+
+    // Save visibility changes to ALL connection profiles of this provider type
+    const providers = config.providers || {};
+    const connections = Object.keys(providers).filter(k => providers[k].type === currentSubpageProvider);
+
+    // Calculate disabled models
+    const disabledModels = subpageModels.filter(m => !m.visible).map(m => m.id);
+
+    try {
+        // Send save requests in parallel
+        await Promise.all(connections.map(connKey => {
+            return fetch(`/api/provider/${connKey}/models`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(disabledModels)
+            });
+        }));
+
+        showToast(`Model '${modelId}' visibility updated!`, "success");
+    } catch (e) {
+        showToast(`Failed to save model visibility: ${e.message}`, "error");
+    }
+}
+
+async function retestConnection(connKey) {
+    const providers = config.providers || {};
+    const p = providers[connKey];
+    if (!p) return;
+
+    showToast(`Testing connection '${connKey}'...`, "success");
+
+    try {
+        const res = await fetch('/api/test-provider', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                type: p.type,
+                base_url: p.base_url,
+                api_key: p.api_key,
+                default_model: p.default_model
+            })
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        
+        if (data.success) {
+            showToast(`Connection '${connKey}' successful!`, "success");
+        } else {
+            showToast(`Connection '${connKey}' failed: ${data.message}`, "error");
+        }
+    } catch (e) {
+        showToast(`Failed to test connection: ${e.message}`, "error");
+    }
+}
+
+// Wire search input & batch select
+document.getElementById('model-filter-input').oninput = (e) => {
+    modelSearchQuery = e.target.value;
+    filterAndRenderModels();
+};
+
+document.getElementById('btn-select-all-visible').onclick = async () => {
+    // Enable all visible models currently rendered
+    const filtered = subpageModels.filter(m => m.id.toLowerCase().includes(modelSearchQuery.toLowerCase()));
+    filtered.forEach(m => m.visible = true);
+    filterAndRenderModels();
+
+    const providers = config.providers || {};
+    const connections = Object.keys(providers).filter(k => providers[k].type === currentSubpageProvider);
+    const disabledModels = subpageModels.filter(m => !m.visible).map(m => m.id);
+
+    try {
+        await Promise.all(connections.map(connKey => {
+            return fetch(`/api/provider/${connKey}/models`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(disabledModels)
+            });
+        }));
+        showToast("All visible models enabled!", "success");
+    } catch (e) {
+        showToast(e.message, "error");
+    }
+};
+
+document.getElementById('btn-clear-all-visible').onclick = async () => {
+    // Disable all visible models currently rendered
+    const filtered = subpageModels.filter(m => m.id.toLowerCase().includes(modelSearchQuery.toLowerCase()));
+    filtered.forEach(m => m.visible = false);
+    filterAndRenderModels();
+
+    const providers = config.providers || {};
+    const connections = Object.keys(providers).filter(k => providers[k].type === currentSubpageProvider);
+    const disabledModels = subpageModels.filter(m => !m.visible).map(m => m.id);
+
+    try {
+        await Promise.all(connections.map(connKey => {
+            return fetch(`/api/provider/${connKey}/models`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(disabledModels)
+            });
+        }));
+        showToast("All visible models disabled!", "success");
+    } catch (e) {
+        showToast(e.message, "error");
     }
 };
 

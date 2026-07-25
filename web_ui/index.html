@@ -65,12 +65,58 @@
             <div class="content-body">
                 <!-- Tab: Providers -->
                 <section class="tab-pane active" id="tab-providers">
-                    <div class="action-bar">
-                        <h3>Configured Providers</h3>
-                        <button class="btn btn-secondary" id="btn-add-provider">+ Add Provider</button>
+                    <!-- Overview View -->
+                    <div id="providers-overview-view">
+                        <div class="action-bar">
+                            <h3>Configured Providers</h3>
+                            <button class="btn btn-secondary" id="btn-add-provider">+ Add Provider</button>
+                        </div>
+                        <div class="grid-layout" id="providers-list">
+                            <!-- Provider Cards populated by JS -->
+                        </div>
                     </div>
-                    <div class="grid-layout" id="providers-list">
-                        <!-- Provider Cards populated by JS -->
+
+                    <!-- Detailed Drill-down View -->
+                    <div id="providers-detail-view" style="display: none;">
+                        <!-- Breadcrumb & Back Button -->
+                        <div class="detail-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 12px;">
+                            <button class="btn btn-secondary btn-sm" id="btn-back-to-providers">← Back to Providers</button>
+                            <div class="breadcrumb" style="font-size: 14px; color: hsl(var(--text-muted)); font-weight: 500;">
+                                <span>Dashboard</span> &nbsp;/&nbsp; <span>Providers</span> &nbsp;/&nbsp; <span id="detail-provider-name-breadcrumb" style="color: hsl(var(--text-main)); font-weight: 600;">Antigravity</span>
+                            </div>
+                        </div>
+
+                        <!-- Provider Title -->
+                        <div class="provider-title-row" style="margin: 20px 0; display: flex; align-items: baseline; gap: 12px;">
+                            <h2 id="detail-provider-title" style="font-size: 26px; font-family: 'Space Grotesk', sans-serif;">Antigravity</h2>
+                            <span class="badge" id="detail-provider-connections-count" style="font-size: 11px;">0 connections</span>
+                        </div>
+
+                        <!-- Connections list (multiple accounts) -->
+                        <div class="connections-section glass-card" style="margin-bottom: 24px;">
+                            <div class="section-header-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                                <h4 style="font-size: 16px; font-weight: 600;">Connections</h4>
+                                <button class="btn btn-primary btn-sm" id="btn-add-connection">+ Add Account</button>
+                            </div>
+                            <div class="connections-list" id="detail-connections-list" style="display: flex; flex-direction: column; gap: 12px;">
+                                <!-- Account rows populated by JS -->
+                            </div>
+                        </div>
+
+                        <!-- Available Models Grid -->
+                        <div class="models-grid-section glass-card">
+                            <div class="section-header-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
+                                <h4 style="font-size: 16px; font-weight: 600;">Available Models</h4>
+                                <div class="models-filter-bar" style="display: flex; gap: 8px; align-items: center;">
+                                    <input type="text" id="model-filter-input" class="form-control" placeholder="Filter models..." style="max-width: 200px; padding: 6px 12px; font-size: 13px;">
+                                    <button class="btn btn-secondary btn-sm" id="btn-select-all-visible">Select All</button>
+                                    <button class="btn btn-secondary btn-sm" id="btn-clear-all-visible">Clear All</button>
+                                </div>
+                            </div>
+                            <div class="models-grid" id="detail-models-grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px;">
+                                <!-- Model cards populated by JS -->
+                            </div>
+                        </div>
                     </div>
                 </section>
 

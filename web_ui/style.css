@@ -809,3 +809,99 @@ body {
     font-weight: 600;
     color: hsl(var(--text-muted));
 }
+
+/* Provider Detail view styling */
+.connection-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background-color: hsla(var(--border) / 0.2);
+    border: 1px solid hsl(var(--border));
+    border-radius: 12px;
+    padding: 12px 20px;
+    transition: all 0.2s ease;
+}
+
+.connection-row:hover {
+    border-color: hsla(var(--primary) / 0.2);
+    background-color: hsla(var(--border) / 0.3);
+}
+
+.connection-name-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.connection-status-pill {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: hsl(var(--green));
+    background-color: hsla(var(--green) / 0.1);
+    border: 1px solid hsla(var(--green) / 0.2);
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+.connection-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+/* Model cards inside detail subpage */
+.model-grid-card {
+    background-color: hsla(var(--card-bg) / 0.4);
+    border: 1px solid hsl(var(--border));
+    border-radius: 12px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 12px;
+    transition: all 0.3s ease;
+}
+
+.model-grid-card:hover {
+    transform: translateY(-2px);
+    border-color: hsla(var(--primary) / 0.3);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+.model-card-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.model-card-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: hsl(var(--text-main));
+    word-break: break-all;
+    flex-grow: 1;
+}
+
+.model-card-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.model-card-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    color: hsl(var(--text-muted));
+}
+
+.model-badge-tag {
+    font-weight: 600;
+    color: hsl(var(--primary));
+    background-color: hsla(var(--primary) / 0.1);
+    padding: 2px 6px;
+    border-radius: 4px;
+}
