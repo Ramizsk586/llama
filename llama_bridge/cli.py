@@ -581,10 +581,12 @@ def main() -> None:
             return
         if args.command == "web":
             config_path = _arg_path(args.config)
-            if args.web_command == "start":
-                _cmd_web_start(config_path, args.port)
+            web_action = args.web_command or "start"
+            if web_action == "start":
+                port = getattr(args, "port", None) or 8090
+                _cmd_web_start(config_path, port)
                 return
-            if args.web_command == "stop":
+            if web_action == "stop":
                 _cmd_web_stop(config_path)
                 return
             parser.print_help()
@@ -1228,6 +1230,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="manage the Llama Bridge visual dashboard",
     )
     web_cmd.add_argument("--config")
+    web_cmd.add_argument(
+        "--port",
+        type=int,
+        default=8090,
+        help="port for the dashboard server (default: 8090)",
+    )
     web_subparsers = web_cmd.add_subparsers(dest="web_command")
 
     web_start_cmd = web_subparsers.add_parser(
