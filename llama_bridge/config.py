@@ -576,6 +576,7 @@ class ProviderConfig:
     refresh_token: str | None = None
     project_id: str | None = None
     tier: str | None = None
+    disabled_models: list[str] = field(default_factory=list)
 
 
 
@@ -1416,6 +1417,7 @@ def load_config(path: Path | None = None) -> BridgeConfig:
             refresh_token=value.get("refresh_token"),
             project_id=value.get("project_id"),
             tier=value.get("tier"),
+            disabled_models=value.get("disabled_models", []) or [],
         )
 
     aliases: dict[str, ModelAlias] = {}

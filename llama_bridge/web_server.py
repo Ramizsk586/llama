@@ -225,6 +225,92 @@ def get_usage_stats():
     except Exception as e:
         return stats
 
+@app.get("/api/provider/{provider_key}/models")
+async def get_provider_models(provider_key: str):
+    if not CONFIG_PATH.exists():
+        raise HTTPException(status_code=404, detail="env.yml not found")
+
+    try:
+        raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        providers = raw.get("providers", {})
+        if provider_key not in providers:
+            raise HTTPException(status_code=404, detail=f"Provider '{provider_key}' not found.")
+
+        p = providers[provider_key]
+        p_type = p.get("type", "openai_compatible")
+        base_url = p.get("base_url", "")
+        api_key = p.get("api_key")
+        disabled_models = p.get("disabled_models", []) or []
+
+        models = []
+
+        if p_type == "antigravity":
+            models = ["gemini-3.5-pro-agent", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.0-pro"]
+        elif p_type == "ollama_local":
+            url = f"{base_url.rstrip('/')}/api/tags"
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m.get("name") for m in data.get("models", []) if m.get("name")]
+            except Exception:
+                pass
+        else:
+            url = f"{base_url.rstrip('/')}/models"
+            headers = {}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, dict) and "data" in data:
+                            models = [m.get("id") for m in data["data"] if m.get("id")]
+                        elif isinstance(data, list):
+                            models = [m.get("id") if isinstance(m, dict) else str(m) for m in data]
+            except Exception:
+                pass
+
+        default_model = p.get("default_model")
+        all_unique = set(models)
+        if default_model:
+            all_unique.add(default_model)
+        for m in disabled_models:
+            all_unique.add(m)
+
+        result = []
+        for m in sorted(all_unique):
+            result.append({
+                "id": m,
+                "visible": m not in disabled_models
+            })
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/provider/{provider_key}/models")
+async def save_provider_models(provider_key: str, disabled_models: list[str]):
+    if not CONFIG_PATH.exists():
+        raise HTTPException(status_code=404, detail="env.yml not found")
+
+    try:
+        raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        providers = raw.setdefault("providers", {})
+        if provider_key not in providers:
+            raise HTTPException(status_code=404, detail=f"Provider '{provider_key}' not found.")
+
+        providers[provider_key]["disabled_models"] = disabled_models
+        write_config_data(CONFIG_PATH, raw)
+        return {"status": "ok", "message": "Model visibility settings saved successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Serve frontend static assets
 if WEB_UI_DIR.exists():
     app.mount("/", StaticFiles(directory=str(WEB_UI_DIR), html=True), name="static")

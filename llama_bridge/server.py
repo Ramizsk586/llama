@@ -2774,6 +2774,14 @@ def _json_object_from_any(value: Any) -> dict[str, Any]:
 
 
 def _resolve_bridge_model(requested_model: str, config: BridgeConfig) -> ResolvedModel:
+    res = _resolve_bridge_model_inner(requested_model, config)
+    disabled = getattr(res.provider, "disabled_models", []) or []
+    if res.upstream_model in disabled or res.alias in disabled:
+        raise KeyError(f"Model '{requested_model}' is disabled/hidden for provider '{res.provider.name}'.")
+    return res
+
+
+def _resolve_bridge_model_inner(requested_model: str, config: BridgeConfig) -> ResolvedModel:
     try:
         copilot_model, upstream_model = resolve_vs_copilot_model(config, requested_model)
         return ResolvedModel(
@@ -3248,7 +3256,17 @@ def _available_model_ids(config: BridgeConfig) -> list[str]:
             if model.model and model.model not in alias_covered
         }
     )
-    return sorted(model_ids)
+    filtered = []
+    for model_id in model_ids:
+        try:
+            res = _resolve_bridge_model_inner(model_id, config)
+            disabled = getattr(res.provider, "disabled_models", []) or []
+            if res.upstream_model in disabled or res.alias in disabled or model_id in disabled:
+                continue
+        except Exception:
+            pass
+        filtered.append(model_id)
+    return sorted(filtered)
 
 
 def _poolside_agent_records(config: BridgeConfig) -> list[dict[str, Any]]:

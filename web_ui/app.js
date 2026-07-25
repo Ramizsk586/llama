@@ -132,6 +132,7 @@ function renderProviders() {
                     <span class="badge">${p.type}</span>
                 </div>
                 <div class="card-actions">
+                    <button class="btn-icon btn-models" data-key="${key}" title="Manage Models">👁️</button>
                     <button class="btn-icon btn-edit" data-key="${key}" title="Edit Provider">✏️</button>
                     <button class="btn-icon btn-delete" data-key="${key}" title="Delete Provider">🗑️</button>
                 </div>
@@ -160,6 +161,9 @@ function renderProviders() {
     });
     document.querySelectorAll('.btn-delete').forEach(b => {
         b.onclick = () => deleteProvider(b.dataset.key);
+    });
+    document.querySelectorAll('.btn-models').forEach(b => {
+        b.onclick = () => openModelsModal(b.dataset.key);
     });
 }
 
@@ -709,6 +713,119 @@ function setupTimeRangeButtons() {
         };
     });
 }
+
+
+// ----------------------------------------------------
+// Models Visibility Logic
+// ----------------------------------------------------
+const modalModels = document.getElementById('modal-models');
+const modelsProviderKey = document.getElementById('models-provider-key');
+const modelsCheckboxList = document.getElementById('models-checkbox-list');
+
+async function openModelsModal(providerKey) {
+    modelsProviderKey.value = providerKey;
+    document.getElementById('models-modal-title').textContent = `Manage Models: ${providerKey}`;
+    modelsCheckboxList.innerHTML = '<p style="color: hsl(var(--text-muted)); font-style: italic;">Fetching models from provider...</p>';
+    modalModels.classList.add('active');
+
+    try {
+        const res = await fetch(`/api/provider/${providerKey}/models`);
+        if (!res.ok) throw new Error(await res.text());
+        const models = await res.json();
+        
+        modelsCheckboxList.innerHTML = '';
+        if (models.length === 0) {
+            modelsCheckboxList.innerHTML = '<p style="color: hsl(var(--red));">No models found or provider connection timed out.</p>';
+            return;
+        }
+
+        models.forEach(m => {
+            const row = document.createElement('div');
+            row.style.display = 'flex';
+            row.style.alignItems = 'center';
+            row.style.gap = '10px';
+            row.style.padding = '8px 12px';
+            row.style.backgroundColor = 'rgba(255,255,255,0.02)';
+            row.style.borderRadius = '6px';
+            row.style.border = '1px solid rgba(255,255,255,0.05)';
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.id = `model-vis-${m.id}`;
+            checkbox.className = 'model-vis-chk';
+            checkbox.value = m.id;
+            checkbox.checked = m.visible;
+            checkbox.style.width = '16px';
+            checkbox.style.height = '16px';
+            checkbox.style.accentColor = 'hsl(var(--primary))';
+
+            const label = document.createElement('label');
+            label.htmlFor = `model-vis-${m.id}`;
+            label.textContent = m.id;
+            label.style.fontSize = '14px';
+            label.style.fontWeight = '500';
+            label.style.cursor = 'pointer';
+            label.style.flexGrow = '1';
+
+            row.appendChild(checkbox);
+            row.appendChild(label);
+            modelsCheckboxList.appendChild(row);
+        });
+
+    } catch (e) {
+        modelsCheckboxList.innerHTML = `<p style="color: hsl(var(--red));">Failed to fetch models: ${e.message}</p>`;
+    }
+}
+
+// Select All / Deselect All
+document.getElementById('btn-select-all-models').onclick = () => {
+    document.querySelectorAll('.model-vis-chk').forEach(chk => chk.checked = true);
+};
+
+document.getElementById('btn-deselect-all-models').onclick = () => {
+    document.querySelectorAll('.model-vis-chk').forEach(chk => chk.checked = false);
+};
+
+// Cancel
+const closeModelsModal = () => modalModels.classList.remove('active');
+document.getElementById('btn-close-models-modal').onclick = closeModelsModal;
+document.getElementById('btn-cancel-models').onclick = closeModelsModal;
+
+// Save visibility
+document.getElementById('btn-save-models').onclick = async () => {
+    const key = modelsProviderKey.value;
+    const chks = document.querySelectorAll('.model-vis-chk');
+    
+    const disabledModels = [];
+    chks.forEach(chk => {
+        if (!chk.checked) {
+            disabledModels.push(chk.value);
+        }
+    });
+
+    const saveBtn = document.getElementById('btn-save-models');
+    const oldText = saveBtn.textContent;
+    saveBtn.textContent = 'Saving...';
+    saveBtn.disabled = true;
+
+    try {
+        const res = await fetch(`/api/provider/${key}/models`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(disabledModels)
+        });
+        if (!res.ok) throw new Error(await res.text());
+        
+        showToast("Model visibility saved successfully!", "success");
+        closeModelsModal();
+        await fetchConfig();
+    } catch (e) {
+        showToast(`Failed to save model visibility: ${e.message}`, "error");
+    } finally {
+        saveBtn.textContent = oldText;
+        saveBtn.disabled = false;
+    }
+};
 
 
 // Initial Setup
